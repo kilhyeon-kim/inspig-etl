@@ -1,0 +1,19 @@
+# InsightPig ETL 설정 파일 예시
+# 이 파일을 config.ini로 복사하여 실제 값을 입력하세요.
+# config.ini는 .gitignore에 포함되어 Git에 커밋되지 않습니다.
+
+[database]
+# Oracle RDS 접속 정보
+user = pksu
+password = YOUR_PASSWORD_HERE
+dsn = pigclouddb.c8ks4denaq5l.ap-northeast-2.rds.amazonaws.com:1521/pigplan
+
+[processing]
+# 병렬 처리 스레드 수
+parallel = 4
+# 테스트 모드 (Y: 금주 데이터만, N: 전주 데이터)
+test_mode = N
+
+[logging]
+# 로그 파일 경로 (미지정 시 ./logs)
+log_path = /data/etl/inspig-weekly/logs

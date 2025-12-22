@@ -1,0 +1,17 @@
+# InsightPig ETL 의존성
+# pip install -r requirements.txt
+
+# Oracle Database 연결
+# 운영 서버 (Oracle Instant Client 설치됨): cx_Oracle
+# 로컬 개발 (Thin 모드): oracledb
+cx_Oracle>=8.3.0
+oracledb>=2.0.0
+
+# 스케줄링 (선택)
+APScheduler>=3.10.0
+
+# 데이터 처리 (선택)
+pandas>=2.0.0
+
+# 환경 변수 관리 (로컬 개발용)
+python-dotenv>=1.0.0
