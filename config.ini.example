@@ -16,4 +16,14 @@ test_mode = N
 
 [logging]
 # 로그 파일 경로 (미지정 시 ./logs)
-log_path = /data/etl/inspig-weekly/logs
+log_path = /data/etl/inspig/logs
+
+[api]
+# 생산성 데이터 API (10.4.35.10 서버)
+productivity_base_url = http://10.4.35.10:11000
+productivity_timeout = 60
+
+[weather]
+# 기상청 API 설정
+api_key = YOUR_WEATHER_API_KEY
+base_url = https://apis.data.go.kr/1360000/VilageFcstInfoService_2.0

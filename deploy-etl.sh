@@ -1,76 +1,109 @@
 #!/bin/bash
 # InsightPig ETL 배포 스크립트
-# 사용법: ./deploy-etl.sh
+# 로컬 → 운영 서버 (10.4.35.10) 배포
 
 set -e
 
 # ========================================
 # 설정
 # ========================================
-ETL_SERVER="10.4.35.10"
-ETL_USER="pigplan"
+REMOTE_HOST="10.4.35.10"
+REMOTE_USER="pigplan"
+REMOTE_PATH="/data/etl/inspig"
 SSH_KEY="E:/ssh key/sshkey/aws/ProdPigplanKey.pem"
-REMOTE_PATH="/data/etl/inspig-weekly"
 
-# 로컬 스크립트 경로
+# 색상
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
+
+echo -e "${GREEN}========================================${NC}"
+echo -e "${GREEN}InsightPig ETL 배포 시작${NC}"
+echo -e "${GREEN}========================================${NC}"
+
+# 스크립트 디렉토리
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
+
+echo -e "${YELLOW}1. 배포 대상 파일 확인${NC}"
+echo "   소스: $SCRIPT_DIR"
+echo "   대상: $REMOTE_USER@$REMOTE_HOST:$REMOTE_PATH"
 
 # 배포할 파일 목록
-DEPLOY_FILES=(
-    "weekly_report_etl.py"
+FILES=(
+    "run_etl.py"
     "run_weekly.sh"
     "requirements.txt"
+    "config.ini.example"
+    "README.md"
 )
 
-# ========================================
-# 배포 시작
-# ========================================
-echo "========================================"
-echo "InsightPig ETL 배포"
-echo "========================================"
-echo "서버: $ETL_USER@$ETL_SERVER"
-echo "경로: $REMOTE_PATH"
+DIRS=(
+    "src"
+)
+
 echo ""
+echo -e "${YELLOW}2. SSH 연결 테스트${NC}"
+ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$REMOTE_USER@$REMOTE_HOST" "echo '연결 성공'"
 
-# SSH 연결 테스트
-echo "[1/4] SSH 연결 테스트..."
-ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$ETL_USER@$ETL_SERVER" "echo '연결 성공'"
+echo ""
+echo -e "${YELLOW}3. 원격 디렉토리 생성${NC}"
+ssh -i "$SSH_KEY" "$REMOTE_USER@$REMOTE_HOST" "mkdir -p $REMOTE_PATH/logs"
 
-# 원격 디렉토리 생성
-echo "[2/4] 원격 디렉토리 확인..."
-ssh -i "$SSH_KEY" "$ETL_USER@$ETL_SERVER" "mkdir -p $REMOTE_PATH/logs"
+echo ""
+echo -e "${YELLOW}4. 파일 전송${NC}"
 
-# 파일 배포
-echo "[3/4] 파일 배포..."
-for file in "${DEPLOY_FILES[@]}"; do
-    if [ -f "$SCRIPT_DIR/$file" ]; then
-        echo "  - $file"
-        scp -i "$SSH_KEY" "$SCRIPT_DIR/$file" "$ETL_USER@$ETL_SERVER:$REMOTE_PATH/"
+# 개별 파일 전송
+for file in "${FILES[@]}"; do
+    if [ -f "$file" ]; then
+        echo "   $file"
+        scp -i "$SSH_KEY" "$file" "$REMOTE_USER@$REMOTE_HOST:$REMOTE_PATH/"
     else
-        echo "  - $file (없음, 건너뜀)"
+        echo "   $file (없음, 건너뜀)"
     fi
 done
 
-# 실행 권한 부여
-echo "[4/4] 실행 권한 설정..."
-ssh -i "$SSH_KEY" "$ETL_USER@$ETL_SERVER" "chmod +x $REMOTE_PATH/run_weekly.sh"
+# 디렉토리 전송
+for dir in "${DIRS[@]}"; do
+    if [ -d "$dir" ]; then
+        echo "   $dir/"
+        scp -i "$SSH_KEY" -r "$dir" "$REMOTE_USER@$REMOTE_HOST:$REMOTE_PATH/"
+    fi
+done
 
 echo ""
-echo "========================================"
-echo "배포 완료!"
-echo "========================================"
+echo -e "${YELLOW}5. 실행 권한 설정${NC}"
+ssh -i "$SSH_KEY" "$REMOTE_USER@$REMOTE_HOST" "chmod +x $REMOTE_PATH/run_weekly.sh $REMOTE_PATH/run_etl.py"
+
 echo ""
-echo "다음 단계:"
-echo "1. config.ini 설정 (최초 1회):"
-echo "   ssh -i \"$SSH_KEY\" $ETL_USER@$ETL_SERVER"
-echo "   cp $REMOTE_PATH/config.ini.example $REMOTE_PATH/config.ini"
-echo "   vi $REMOTE_PATH/config.ini"
+echo -e "${YELLOW}6. 배포 확인${NC}"
+ssh -i "$SSH_KEY" "$REMOTE_USER@$REMOTE_HOST" "ls -la $REMOTE_PATH/"
+
 echo ""
-echo "2. 테스트 실행:"
-echo "   ssh -i \"$SSH_KEY\" $ETL_USER@$ETL_SERVER"
+echo -e "${GREEN}========================================${NC}"
+echo -e "${GREEN}배포 완료!${NC}"
+echo -e "${GREEN}========================================${NC}"
+
+echo ""
+echo -e "${YELLOW}다음 단계:${NC}"
+echo "1. 서버 접속:"
+echo "   ssh -i \"$SSH_KEY\" $REMOTE_USER@$REMOTE_HOST"
+echo ""
+echo "2. config.ini 설정:"
 echo "   cd $REMOTE_PATH"
-echo "   conda activate inspig-weekly-etl"
-echo "   python weekly_report_etl.py --test --dry-run"
+echo "   cp config.ini.example config.ini"
+echo "   vi config.ini  # DB 패스워드, API 키 입력"
 echo ""
-echo "3. Crontab 등록 (최초 1회):"
+echo "3. Conda 환경 설정:"
+echo "   conda create -n inspig-etl python=3.8"
+echo "   conda activate inspig-etl"
+echo "   pip install -r requirements.txt"
+echo ""
+echo "4. 테스트 실행:"
+echo "   python run_etl.py --dry-run"
+echo "   python run_etl.py --test"
+echo ""
+echo "5. Crontab 등록:"
+echo "   crontab -e"
 echo "   0 2 * * 1 $REMOTE_PATH/run_weekly.sh"
