@@ -268,8 +268,8 @@ class WeeklyReportOrchestrator:
                 national_price = self._get_national_price(cursor, dt_from, dt_to)
                 self.logger.info(f"전국 탕박 평균 단가: {national_price}원")
 
-                # 2. 기존 테스트 데이터 삭제 (동일 연도/주차)
-                self._delete_existing_master(cursor, year, week_no, farm_list)
+                # 2. 기존 테스트 데이터 삭제 (테스트 모드: 전체 삭제, 일반 모드: 동일 연도/주차만)
+                self._delete_existing_master(cursor, year, week_no, farm_list, test_mode)
                 conn.commit()
 
                 # 3. 마스터 레코드 생성
@@ -375,8 +375,8 @@ class WeeklyReportOrchestrator:
                 national_price = self._get_national_price(cursor, dt_from, dt_to)
                 self.logger.info(f"전국 탕박 평균 단가: {national_price}원")
 
-                # 2. 기존 테스트 데이터 삭제 (동일 연도/주차)
-                self._delete_existing_master(cursor, year, week_no, farm_list)
+                # 2. 기존 테스트 데이터 삭제 (테스트 모드: 전체 삭제, 일반 모드: 동일 연도/주차만)
+                self._delete_existing_master(cursor, year, week_no, farm_list, test_mode)
                 conn.commit()
 
                 # 3. 마스터 레코드 생성
@@ -497,22 +497,59 @@ class WeeklyReportOrchestrator:
         result = cursor.fetchone()
         return result[0] if result and result[0] else 0
 
+    def _delete_all_test_data(self, cursor) -> dict:
+        """테스트 모드: 전체 테스트 데이터 삭제
+
+        테스트 시 깨끗한 상태에서 시작하기 위해 전체 데이터를 삭제합니다.
+        삭제 순서: TS_INS_WEEK_SUB → TS_INS_JOB_LOG → TS_INS_WEEK → TS_INS_MASTER
+
+        Returns:
+            삭제된 건수 딕셔너리
+        """
+        deleted = {'master': 0, 'week': 0, 'week_sub': 0, 'job_log': 0}
+
+        # 1. TS_INS_WEEK_SUB 전체 삭제
+        cursor.execute("DELETE FROM TS_INS_WEEK_SUB")
+        deleted['week_sub'] = cursor.rowcount
+
+        # 2. TS_INS_JOB_LOG 전체 삭제
+        cursor.execute("DELETE FROM TS_INS_JOB_LOG")
+        deleted['job_log'] = cursor.rowcount
+
+        # 3. TS_INS_WEEK 전체 삭제
+        cursor.execute("DELETE FROM TS_INS_WEEK")
+        deleted['week'] = cursor.rowcount
+
+        # 4. TS_INS_MASTER 전체 삭제
+        cursor.execute("DELETE FROM TS_INS_MASTER")
+        deleted['master'] = cursor.rowcount
+
+        self.logger.info(f"테스트 데이터 전체 삭제 완료: {deleted}")
+        return deleted
+
     def _delete_existing_master(
-        self, cursor, year: int, week_no: int, farm_list: Optional[str] = None
+        self, cursor, year: int, week_no: int, farm_list: Optional[str] = None,
+        test_mode: bool = False
     ) -> dict:
         """기존 테스트 데이터 삭제 (동일 연도/주차)
 
         테스트 시 중복 오류 방지를 위해 기존 데이터를 삭제합니다.
+        test_mode=True이면 전체 데이터를 삭제합니다.
 
         Args:
             cursor: DB 커서
             year: 연도
             week_no: 주차
             farm_list: 농장 목록 (콤마 구분, None이면 전체)
+            test_mode: 테스트 모드 여부 (True이면 전체 삭제)
 
         Returns:
             삭제된 건수 딕셔너리
         """
+        # 테스트 모드이면 전체 삭제
+        if test_mode:
+            return self._delete_all_test_data(cursor)
+
         deleted = {'master': 0, 'week': 0, 'week_sub': 0, 'job_log': 0}
 
         # 1. 해당 연도/주차의 마스터 SEQ 조회

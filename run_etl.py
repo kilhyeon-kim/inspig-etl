@@ -16,7 +16,7 @@ InsightPig ETL 메인 실행 스크립트
 
 import argparse
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # 프로젝트 루트를 path에 추가
 from pathlib import Path
@@ -43,6 +43,10 @@ def parse_args():
   python run_etl.py --init             # 테스트 데이터 초기화 후 배치 실행
   python run_etl.py --init --dry-run   # 초기화 설정만 확인
   python run_etl.py --init --farm-list "1387,2807"  # 특정 농장만 테스트
+
+날짜 범위 배치 실행 (주간 단위):
+  python run_etl.py --date-from 2025-11-10 --date-to 2025-12-22 --test
+  # 2025-11-10부터 7일 간격으로 2025-12-22까지 순차 실행
 
 수동 실행 (웹시스템에서 호출):
   python run_etl.py --manual --farm-no 12345
@@ -118,6 +122,19 @@ def parse_args():
         '--dt-to',
         type=str,
         help='리포트 종료일 (YYYYMMDD, --manual과 함께 사용)'
+    )
+
+    # 배치 날짜 범위 실행 (주간 단위)
+    parser.add_argument(
+        '--date-from',
+        type=str,
+        help='배치 시작일 (YYYY-MM-DD) - +7일씩 증가하며 date-to까지 실행'
+    )
+
+    parser.add_argument(
+        '--date-to',
+        type=str,
+        help='배치 종료일 (YYYY-MM-DD)'
     )
 
     return parser.parse_args()
@@ -201,6 +218,76 @@ def main():
             print("\n" + "=" * 60)
             print("테스트 초기화 완료")
             print("=" * 60)
+            sys.exit(0)
+
+        # ========================================
+        # 배치 날짜 범위 실행 모드 (date-from ~ date-to)
+        # ========================================
+        if args.date_from and args.date_to:
+            try:
+                start_date = datetime.strptime(args.date_from, '%Y-%m-%d')
+                end_date = datetime.strptime(args.date_to, '%Y-%m-%d')
+            except ValueError as e:
+                print(f"ERROR: 잘못된 날짜 형식: {e}")
+                print("       YYYY-MM-DD 형식으로 입력하세요.")
+                sys.exit(1)
+
+            if start_date > end_date:
+                print("ERROR: date-from이 date-to보다 클 수 없습니다.")
+                sys.exit(1)
+
+            # 날짜 목록 생성 (+7일씩)
+            date_list = []
+            current_date = start_date
+            while current_date <= end_date:
+                date_list.append(current_date.strftime('%Y%m%d'))
+                current_date += timedelta(days=7)
+
+            print("=" * 60)
+            print("배치 날짜 범위 실행 모드")
+            print("=" * 60)
+            print(f"시작일: {args.date_from}")
+            print(f"종료일: {args.date_to}")
+            print(f"실행 날짜 목록: {', '.join(date_list)}")
+            print(f"총 {len(date_list)}회 실행 예정")
+            print()
+
+            if args.dry_run:
+                print("DRY-RUN: 실제 실행 없이 설정만 확인")
+                sys.exit(0)
+
+            orchestrator = WeeklyReportOrchestrator(config)
+            results = []
+
+            for i, run_date in enumerate(date_list, 1):
+                print("-" * 40)
+                print(f"[{i}/{len(date_list)}] 기준일: {run_date}")
+                print("-" * 40)
+
+                result = orchestrator.run(
+                    base_date=run_date,
+                    test_mode=args.test,
+                    skip_productivity=True,
+                    skip_weather=True,  # 배치에서는 기상청 스킵
+                    dry_run=False,
+                )
+                results.append({
+                    'date': run_date,
+                    'status': result.get('status', 'unknown'),
+                    'week_no': result.get('week_no'),
+                })
+                print(f"결과: {result.get('status')}")
+                print()
+
+            # 결과 요약
+            print("=" * 60)
+            print("배치 실행 완료")
+            print("=" * 60)
+            success_cnt = sum(1 for r in results if r['status'] == 'success')
+            print(f"성공: {success_cnt}/{len(results)}")
+            for r in results:
+                status_icon = "✓" if r['status'] == 'success' else "✗"
+                print(f"  {status_icon} {r['date']} (Week {r['week_no']})")
             sys.exit(0)
 
         if args.command == 'all' or args.command == 'weekly':
