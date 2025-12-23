@@ -584,6 +584,7 @@ class FarmDataLoader:
           AND T.WK_DT < TO_DATE(:dt_to, 'YYYYMMDD') + 1
           AND SUBSTR(T.ACCOUNT_CD, 1, 3) = '511'
           AND T.TOTAL_KG > 0
+          AND T.TOTAL_PRICE > 0
         ORDER BY T.WK_DT
         """
         self._data['etc_trade'] = self._fetch_all(sql, {
