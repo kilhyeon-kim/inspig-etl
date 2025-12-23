@@ -340,13 +340,14 @@ class ShipmentProcessor(BaseProcessor):
         """
 
         for sort_no, row in enumerate(lpd_scatter, start=1):
+            # SQL 결과: ROUND(NET_KG), ROUND(BACK_DEPTH), COUNT(*)
             self.execute(sql_ins, {
                 'master_seq': self.master_seq,
                 'farm_no': self.farm_no,
                 'sort_no': sort_no,
-                'val_1': row.get('NET_KG_GRP'),
-                'val_2': row.get('BACK_GRP'),
-                'cnt_1': row.get('CNT'),
+                'val_1': row[0],  # NET_KG_GRP
+                'val_2': row[1],  # BACK_GRP
+                'cnt_1': row[2],  # CNT
             })
             insert_count += 1
 
