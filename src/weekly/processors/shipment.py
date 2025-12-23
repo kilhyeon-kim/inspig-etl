@@ -57,26 +57,24 @@ class ShipmentProcessor(BaseProcessor):
         # 1. 기존 데이터 삭제
         self._delete_existing()
 
-        # 2. 로드된 데이터 가져오기
+        # 2. 로드된 요약 데이터 가져오기 (data_loader에서 SQL로 집계됨)
         loaded_data = self.get_loaded_data()
-        lpd_data = loaded_data.get('lpd', [])
+        lpd_daily = loaded_data.get('lpd_daily', [])        # 일별 요약 (7행)
+        lpd_scatter = loaded_data.get('lpd_scatter', [])    # 산점도용 GROUP BY
+        lpd_year_stats = loaded_data.get('lpd_year_stats', {})  # 연간 누계
+        lpd_week_avg = loaded_data.get('lpd_week_avg', {})  # 주간 전체 평균
 
-        # 3. 기간별 데이터 필터링
-        week_lpd = self._filter_lpd_by_period(lpd_data, dt_from, dt_to)
-        year_start = dt_to[:4] + '0101'
-        year_lpd = self._filter_lpd_by_period(lpd_data, year_start, dt_to)
+        # 3. 출하 ROW 크로스탭 INSERT (13행 × 7일) - lpd_daily 사용
+        row_cnt = self._calculate_and_insert_row(lpd_daily, lpd_week_avg, dt_from, dt_to)
 
-        # 4. 출하 통계 계산 및 INSERT
-        stats = self._calculate_and_insert_stats(week_lpd, year_lpd, national_price, dt_from, dt_to)
+        # 4. 출하 통계 INSERT (ROW 데이터 기반) - Oracle SP와 동일 순서
+        stats = self._calculate_and_insert_stats(lpd_year_stats, national_price, dt_from, dt_to)
 
-        # 5. 출하 ROW 크로스탭 INSERT (13행 × 7일)
-        row_cnt = self._calculate_and_insert_row(week_lpd, dt_from, dt_to)
+        # 5. 출하 차트 INSERT (일자별 7행) - lpd_daily 사용
+        chart_cnt = self._calculate_and_insert_chart(lpd_daily)
 
-        # 6. 출하 차트 INSERT (일자별 7행)
-        chart_cnt = self._calculate_and_insert_chart(week_lpd, dt_from)
-
-        # 7. 출하 산점도 INSERT (규격도수 × 중량도수)
-        scatter_cnt = self._calculate_and_insert_scatter(week_lpd)
+        # 6. 출하 산점도 INSERT - lpd_scatter 사용 (이미 GROUP BY 됨)
+        scatter_cnt = self._calculate_and_insert_scatter(lpd_scatter)
 
         # 8. TS_INS_WEEK 업데이트
         self._update_week(stats)
@@ -99,51 +97,27 @@ class ShipmentProcessor(BaseProcessor):
         """
         self.execute(sql, {'master_seq': self.master_seq, 'farm_no': self.farm_no})
 
-    def _filter_lpd_by_period(self, lpd_data: List[Dict], dt_from: str, dt_to: str) -> List[Dict]:
-        """기간으로 LPD 데이터 필터링
+    def _calculate_and_insert_stats(self, lpd_year_stats: Dict,
+                                     national_price: int, dt_from: str, dt_to: str) -> Dict[str, Any]:
+        """출하 통계 INSERT (Oracle SP와 동일: ROW INSERT 후 STAT INSERT)
 
-        LPD 데이터의 날짜 필드가 DOCHUK_DT (YYYY-MM-DD 형식) 또는 MEAS_DT일 수 있음
-        """
-        result = []
-        for lpd in lpd_data:
-            # DOCHUK_DT 또는 MEAS_DT 필드 확인
-            dt_value = lpd.get('DOCHUK_DT') or lpd.get('MEAS_DT', '')
-            if not dt_value:
-                continue
-
-            # 날짜 형식 통일 (YYYYMMDD)
-            dt_str = str(dt_value).replace('-', '')[:8]
-
-            if dt_from <= dt_str <= dt_to:
-                result.append(lpd)
-
-        return result
-
-    def _calculate_and_insert_stats(self, week_lpd: List[Dict], year_lpd: List[Dict],
-                                     national_price: int, dt_from: str = '', dt_to: str = '') -> Dict[str, Any]:
-        """출하 통계 계산 및 INSERT
-
-        Oracle SP_INS_WEEK_SHIP_POPUP 프로시저와 동일한 컬럼 매핑:
+        Oracle SP_INS_WEEK_SHIP_POPUP 프로시저와 동일:
+        - SHIP/ROW에서 합계/평균 값을 읽어서 STAT INSERT
         - CNT_1: 출하두수, CNT_2: 당해년도누계, CNT_3: 1등급+두수
-        - CNT_4: 기준출하일령 (V_SHIP_DAY), CNT_5: 평균포유기간 (V_WEAN_PERIOD)
-        - CNT_6: 역산일 (V_EU_DAYS = V_SHIP_DAY - V_WEAN_PERIOD)
+        - CNT_4: 기준출하일령, CNT_5: 평균포유기간, CNT_6: 역산일
         - VAL_1: 1등급+율, VAL_2: 평균도체중, VAL_3: 평균등지방
         - VAL_4: 내농장단가, VAL_5: 전국탕박평균단가
         - STR_1: 이유일 FROM, STR_2: 이유일 TO
 
         Args:
-            week_lpd: 주간 LPD 데이터
-            year_lpd: 연간 LPD 데이터
+            lpd_year_stats: 연간 누계 통계 {'CNT': N, 'AVG_NET': N.N}
             national_price: 전국 평균 단가
             dt_from: 시작일 (YYYYMMDD)
             dt_to: 종료일 (YYYYMMDD)
-
-        Returns:
-            통계 딕셔너리
         """
         # 설정값 조회 (CONFIG에서)
-        ship_day = 180  # 기준출하일령
-        wean_period = 21  # 평균포유기간
+        ship_day = 180
+        wean_period = 21
         try:
             sql_config = """
                 SELECT NVL(CNT_3, 180), NVL(CNT_2, 21)
@@ -156,64 +130,51 @@ class ShipmentProcessor(BaseProcessor):
                 wean_period = result[1] or 21
         except Exception:
             pass
-        eu_days = ship_day - wean_period  # 역산일
+        eu_days = ship_day - wean_period
 
-        # 주간 통계
-        ship_cnt = len(week_lpd)
+        # SHIP/ROW에서 값 추출 (Oracle SP와 동일)
+        sql_row = """
+            SELECT NVL(MAX(CASE WHEN CODE_1 = 'BUT_CNT' THEN VAL_1 END), 0),
+                   NVL(MAX(CASE WHEN CODE_1 = 'Q_11' THEN VAL_1 END), 0) +
+                   NVL(MAX(CASE WHEN CODE_1 = 'Q_1' THEN VAL_1 END), 0),
+                   NVL(MAX(CASE WHEN CODE_1 = 'AVG_NET' THEN VAL_3 END), 0),
+                   NVL(MAX(CASE WHEN CODE_1 = 'AVG_BACK' THEN VAL_3 END), 0)
+            FROM TS_INS_WEEK_SUB
+            WHERE MASTER_SEQ = :master_seq AND FARM_NO = :farm_no
+              AND GUBUN = 'SHIP' AND SUB_GUBUN = 'ROW'
+        """
+        row_result = self.fetch_one(sql_row, {'master_seq': self.master_seq, 'farm_no': self.farm_no})
+        ship_cnt = int(row_result[0] or 0) if row_result else 0
+        grade1_cnt = int(row_result[1] or 0) if row_result else 0
+        avg_kg = float(row_result[2] or 0) if row_result else 0
+        avg_backfat = float(row_result[3] or 0) if row_result else 0
 
-        # 평균 도체중 (NET_KG) - Oracle ROUND()와 동일
-        kg_values = [lpd.get('NET_KG') or lpd.get('DOCHUK_KG') or lpd.get('LPD_VAL', 0) or 0 for lpd in week_lpd]
-        avg_kg = oracle_round(sum(kg_values) / len(kg_values), 1) if kg_values else 0
-
-        # 평균 등지방 - Oracle: BACK_DEPTH > 0 조건
-        backfat_values = [lpd.get('BACK_DEPTH', 0) or 0 for lpd in week_lpd if lpd.get('BACK_DEPTH') and lpd.get('BACK_DEPTH') > 0]
-        avg_backfat = oracle_round(sum(backfat_values) / len(backfat_values), 1) if backfat_values else 0
-
-        # 1등급+ 두수 및 비율 (MEAT_QUALITY = '1+' 또는 '1')
-        grade1_cnt = sum(1 for lpd in week_lpd if str(lpd.get('MEAT_QUALITY', '')).strip() in ('1+', '1'))
+        # 1등급+ 합격율 계산
         grade1_rate = oracle_round(grade1_cnt / ship_cnt * 100, 1) if ship_cnt > 0 else 0
 
-        # 연간 누적 통계
-        sum_cnt = len(year_lpd)
-        year_kg_values = [lpd.get('NET_KG') or lpd.get('DOCHUK_KG') or lpd.get('LPD_VAL', 0) or 0 for lpd in year_lpd]
-        sum_avg_kg = oracle_round(sum(year_kg_values) / len(year_kg_values), 1) if year_kg_values else 0
+        # 연간 누계
+        sum_cnt = int(lpd_year_stats.get('CNT') or 0)
+        sum_avg_kg = float(lpd_year_stats.get('AVG_NET') or 0)
 
-        # 이유일 계산 (출하일 - 역산일)
-        str_1 = ''  # 이유일 FROM
-        str_2 = ''  # 이유일 TO
-        if dt_from and dt_to:
-            try:
-                from_date = datetime.strptime(dt_from, '%Y%m%d') - timedelta(days=eu_days)
-                to_date = datetime.strptime(dt_to, '%Y%m%d') - timedelta(days=eu_days)
-                str_1 = from_date.strftime('%y.%m.%d')
-                str_2 = to_date.strftime('%y.%m.%d')
-            except Exception:
-                pass
+        # 이유일 계산
+        str_1 = ''
+        str_2 = ''
+        try:
+            from_date = datetime.strptime(dt_from, '%Y%m%d') - timedelta(days=eu_days)
+            to_date = datetime.strptime(dt_to, '%Y%m%d') - timedelta(days=eu_days)
+            str_1 = from_date.strftime('%y.%m.%d')
+            str_2 = to_date.strftime('%y.%m.%d')
+        except Exception:
+            pass
 
-        stats = {
-            'ship_cnt': ship_cnt,
-            'avg_kg': avg_kg,
-            'avg_backfat': avg_backfat,
-            'grade1_cnt': grade1_cnt,
-            'grade1_rate': grade1_rate,
-            'sum_cnt': sum_cnt,
-            'sum_avg_kg': sum_avg_kg,
-            'national_price': national_price,
-            'ship_day': ship_day,
-            'wean_period': wean_period,
-            'eu_days': eu_days,
-        }
-
-        # 내농장 단가 계산 (data_loader의 get_farm_price 사용)
+        # 내농장 단가
         farm_price = 0
         try:
             farm_price = self.data_loader.get_farm_price(dt_from, dt_to)
         except Exception as e:
             self.logger.warning(f"내농장 단가 조회 실패: {e}")
 
-        stats['farm_price'] = farm_price
-
-        # INSERT - Oracle과 동일한 컬럼 매핑
+        # INSERT
         sql_ins = """
         INSERT INTO TS_INS_WEEK_SUB (
             MASTER_SEQ, FARM_NO, GUBUN, SUB_GUBUN, SORT_NO,
@@ -230,25 +191,38 @@ class ShipmentProcessor(BaseProcessor):
         self.execute(sql_ins, {
             'master_seq': self.master_seq,
             'farm_no': self.farm_no,
-            'cnt_1': ship_cnt,        # 출하두수
-            'cnt_2': sum_cnt,         # 당해년도 누계
-            'cnt_3': grade1_cnt,      # 1등급+ 두수
-            'cnt_4': ship_day,        # 기준출하일령
-            'cnt_5': wean_period,     # 평균포유기간
-            'cnt_6': eu_days,         # 역산일
-            'val_1': grade1_rate,     # 1등급+율(%)
-            'val_2': avg_kg,          # 평균도체중
-            'val_3': avg_backfat,     # 평균등지방
-            'val_4': farm_price,      # 내농장단가 (TM_ETC_TRADE)
-            'val_5': national_price,  # 전국탕박평균단가
-            'str_1': str_1,           # 이유일 FROM
-            'str_2': str_2,           # 이유일 TO
+            'cnt_1': ship_cnt,
+            'cnt_2': sum_cnt,
+            'cnt_3': grade1_cnt,
+            'cnt_4': ship_day,
+            'cnt_5': wean_period,
+            'cnt_6': eu_days,
+            'val_1': grade1_rate,
+            'val_2': avg_kg,
+            'val_3': avg_backfat,
+            'val_4': farm_price,
+            'val_5': national_price,
+            'str_1': str_1,
+            'str_2': str_2,
         })
 
-        return stats
+        return {
+            'ship_cnt': ship_cnt,
+            'avg_kg': avg_kg,
+            'avg_backfat': avg_backfat,
+            'grade1_cnt': grade1_cnt,
+            'grade1_rate': grade1_rate,
+            'sum_cnt': sum_cnt,
+            'sum_avg_kg': sum_avg_kg,
+            'national_price': national_price,
+            'farm_price': farm_price,
+            'ship_day': ship_day,
+            'wean_period': wean_period,
+            'eu_days': eu_days,
+        }
 
-    def _calculate_and_insert_chart(self, week_lpd: List[Dict], dt_from: str) -> int:
-        """출하 차트 계산 및 INSERT (일자별 7행)
+    def _calculate_and_insert_chart(self, lpd_daily: List[Dict]) -> int:
+        """출하 차트 INSERT (일자별 7행)
 
         Oracle SP_INS_WEEK_SHIP_POPUP과 동일:
         - 7일 모두 INSERT (데이터 없는 날은 NULL)
@@ -258,35 +232,11 @@ class ShipmentProcessor(BaseProcessor):
         - VAL_2: 평균 BACK_DEPTH (없으면 NULL)
 
         Args:
-            week_lpd: 주간 LPD 데이터
-            dt_from: 시작일 (YYYYMMDD)
+            lpd_daily: data_loader에서 조회된 일별 요약 데이터 (7행)
 
         Returns:
             INSERT된 레코드 수 (항상 7)
         """
-        # 7일간의 날짜 리스트 생성
-        start_date = datetime.strptime(dt_from, '%Y%m%d')
-        date_list = [(start_date + timedelta(days=i)).strftime('%Y-%m-%d') for i in range(7)]
-        date_disp = [(start_date + timedelta(days=i)).strftime('%m.%d') for i in range(7)]
-
-        # 일자별 그룹핑
-        daily_data: Dict[str, List[Dict]] = {dt: [] for dt in date_list}
-        for lpd in week_lpd:
-            dt_value = lpd.get('DOCHUK_DT') or lpd.get('MEAS_DT', '')
-            if not dt_value:
-                continue
-
-            # YYYY-MM-DD 형식으로 통일
-            dt_str = str(dt_value)
-            if len(dt_str) == 8:  # YYYYMMDD
-                dt_str = f"{dt_str[:4]}-{dt_str[4:6]}-{dt_str[6:8]}"
-            else:
-                dt_str = dt_str[:10]  # YYYY-MM-DD
-
-            if dt_str in daily_data:
-                daily_data[dt_str].append(lpd)
-
-        # 7일 모두 INSERT (Oracle과 동일)
         insert_count = 0
         sql_ins = """
         INSERT INTO TS_INS_WEEK_SUB (
@@ -296,121 +246,95 @@ class ShipmentProcessor(BaseProcessor):
         )
         """
 
-        for day_no in range(7):
-            dt_str = date_list[day_no]
-            day_lpd = daily_data[dt_str]
+        for day_data in lpd_daily:
+            day_no = day_data.get('DAY_NO', 0)
+            day_cnt = day_data.get('CNT') or 0
 
-            if len(day_lpd) > 0:
-                # 데이터 있음
-                day_cnt = len(day_lpd)
-                kg_values = [lpd.get('NET_KG') or 0 for lpd in day_lpd if lpd.get('NET_KG')]
-                back_values = [lpd.get('BACK_DEPTH') or 0 for lpd in day_lpd if lpd.get('BACK_DEPTH')]
-                avg_kg = oracle_round(sum(kg_values) / len(kg_values), 1) if kg_values else None
-                avg_back = oracle_round(sum(back_values) / len(back_values), 1) if back_values else None
+            # 데이터 없는 날은 NULL (Oracle과 동일)
+            if day_cnt > 0:
+                cnt_1 = day_cnt
+                val_1 = day_data.get('AVG_NET')
+                val_2 = day_data.get('AVG_BACK')
             else:
-                # 데이터 없음 - NULL 저장 (Oracle과 동일)
-                day_cnt = None
-                avg_kg = None
-                avg_back = None
+                cnt_1 = None
+                val_1 = None
+                val_2 = None
 
             self.execute(sql_ins, {
                 'master_seq': self.master_seq,
                 'farm_no': self.farm_no,
-                'sort_no': day_no + 1,
-                'str_1': date_disp[day_no],
-                'cnt_1': day_cnt,
-                'val_1': avg_kg,
-                'val_2': avg_back,
+                'sort_no': day_no,
+                'str_1': day_data.get('DT_DISP', ''),
+                'cnt_1': cnt_1,
+                'val_1': val_1,
+                'val_2': val_2,
             })
             insert_count += 1
 
         return insert_count
 
-    def _calculate_and_insert_scatter(self, week_lpd: List[Dict]) -> int:
-        """출하 산점도 계산 및 INSERT
+    def _calculate_and_insert_scatter(self, lpd_scatter: List[Dict]) -> int:
+        """출하 산점도 INSERT
 
         Oracle SP_INS_WEEK_SHIP_POPUP과 동일:
-        - ROUND(NET_KG), ROUND(BACK_DEPTH) 단위로 GROUP BY
+        - ROUND(NET_KG), ROUND(BACK_DEPTH) 단위로 GROUP BY (SQL에서 이미 처리됨)
         - VAL_1: ROUND(NET_KG)
         - VAL_2: ROUND(BACK_DEPTH)
         - CNT_1: 건수
-        - NET_KG, BACK_DEPTH 둘 다 NOT NULL인 데이터만
 
         Args:
-            week_lpd: 주간 LPD 데이터
+            lpd_scatter: data_loader에서 조회된 산점도 데이터 (이미 GROUP BY됨)
 
         Returns:
             INSERT된 레코드 수
         """
-        if not week_lpd:
+        if not lpd_scatter:
             return 0
 
-        # ROUND(NET_KG), ROUND(BACK_DEPTH) 그룹핑 (Oracle과 동일)
-        scatter_data: Dict[tuple, int] = {}
-
-        for lpd in week_lpd:
-            net_kg = lpd.get('NET_KG')
-            back_depth = lpd.get('BACK_DEPTH')
-
-            # Oracle: NET_KG IS NOT NULL AND BACK_DEPTH IS NOT NULL
-            if net_kg is None or back_depth is None:
-                continue
-
-            # Oracle: ROUND(NET_KG), ROUND(BACK_DEPTH)
-            net_kg_grp = round(net_kg)
-            back_grp = round(back_depth)
-
-            key = (net_kg_grp, back_grp)
-            scatter_data[key] = scatter_data.get(key, 0) + 1
-
-        # 정렬 (NET_KG, BACK_DEPTH 순) 및 INSERT
         insert_count = 0
-        sort_no = 1
-        for (net_kg_grp, back_grp), cnt in sorted(scatter_data.items()):
-            self.execute("""
-                INSERT INTO TS_INS_WEEK_SUB (
-                    MASTER_SEQ, FARM_NO, GUBUN, SUB_GUBUN, SORT_NO,
-                    VAL_1, VAL_2, CNT_1
-                ) VALUES (
-                    :master_seq, :farm_no, 'SHIP', 'SCATTER', :sort_no,
-                    :val_1, :val_2, :cnt_1
-                )
-            """, {
+        sql_ins = """
+            INSERT INTO TS_INS_WEEK_SUB (
+                MASTER_SEQ, FARM_NO, GUBUN, SUB_GUBUN, SORT_NO,
+                VAL_1, VAL_2, CNT_1
+            ) VALUES (
+                :master_seq, :farm_no, 'SHIP', 'SCATTER', :sort_no,
+                :val_1, :val_2, :cnt_1
+            )
+        """
+
+        for sort_no, row in enumerate(lpd_scatter, start=1):
+            self.execute(sql_ins, {
                 'master_seq': self.master_seq,
                 'farm_no': self.farm_no,
                 'sort_no': sort_no,
-                'val_1': net_kg_grp,
-                'val_2': back_grp,
-                'cnt_1': cnt,
+                'val_1': row.get('NET_KG_GRP'),
+                'val_2': row.get('BACK_GRP'),
+                'cnt_1': row.get('CNT'),
             })
             insert_count += 1
-            sort_no += 1
 
         return insert_count
 
-    def _calculate_and_insert_row(self, week_lpd: List[Dict], dt_from: str, dt_to: str) -> int:
-        """출하 ROW 크로스탭 계산 및 INSERT (13행 × 7일)
+    def _calculate_and_insert_row(self, lpd_daily: List[Dict], lpd_week_avg: Dict,
+                                     dt_from: str, dt_to: str) -> int:
+        """출하 ROW 크로스탭 INSERT (13행 × 7일)
 
-        Oracle SP_INS_WEEK_SHIP_POPUP의 ROW 로직 Python 전환:
+        Oracle SP_INS_WEEK_SHIP_POPUP의 ROW 로직:
         - 13개 행: BUT_CNT, EU_DUSU, EU_RATIO, ONE_RATIO, Q_11, Q_1, Q_2, FEMALE, MALE, ETC, TNET_KG, AVG_NET, AVG_BACK
         - 각 행: D1~D7 (일별), VAL_1 (합계), VAL_2 (비율%), VAL_3 (평균)
 
         Args:
-            week_lpd: 주간 LPD 데이터
+            lpd_daily: data_loader에서 조회된 일별 요약 데이터 (7행)
+            lpd_week_avg: 주간 전체 평균 {'TOTAL_AVG_NET': N.N, 'TOTAL_AVG_BACK': N.N}
             dt_from: 시작일 (YYYYMMDD)
             dt_to: 종료일 (YYYYMMDD)
 
         Returns:
             INSERT된 레코드 수 (13)
         """
-        # 1. 7일간의 날짜 리스트 생성
-        start_date = datetime.strptime(dt_from, '%Y%m%d')
-        date_list = [(start_date + timedelta(days=i)).strftime('%Y-%m-%d') for i in range(7)]
-        date_disp = [(start_date + timedelta(days=i)).strftime('%m.%d') for i in range(7)]
-
-        # 2. 설정값 조회 (역산일 계산용)
-        ship_day = 180  # 기준출하일령
-        wean_period = 21  # 평균포유기간
+        # 1. 설정값 조회 (역산일 계산용)
+        ship_day = 180
+        wean_period = 21
         try:
             sql_config = """
                 SELECT NVL(CNT_3, 180), NVL(CNT_2, 21)
@@ -423,27 +347,13 @@ class ShipmentProcessor(BaseProcessor):
                 wean_period = result[1] or 21
         except Exception:
             pass
-        eu_days = ship_day - wean_period  # 역산일
+        eu_days = ship_day - wean_period
 
-        # 3. 일별 LPD 데이터 그룹핑
-        daily_lpd: Dict[int, List[Dict]] = {i: [] for i in range(7)}  # DAY_NO 0~6
-        for lpd in week_lpd:
-            dt_value = lpd.get('DOCHUK_DT') or lpd.get('MEAS_DT', '')
-            if not dt_value:
-                continue
-            dt_str = str(dt_value)
-            if len(dt_str) == 8:  # YYYYMMDD
-                dt_str = f"{dt_str[:4]}-{dt_str[4:6]}-{dt_str[6:8]}"
-            else:
-                dt_str = dt_str[:10]  # YYYY-MM-DD
-            if dt_str in date_list:
-                day_no = date_list.index(dt_str)
-                daily_lpd[day_no].append(lpd)
-
-        # 4. 일별 이유두수 조회 (TB_EU - 역산일 기준)
-        daily_eu: Dict[int, int] = {i: 0 for i in range(7)}
-        for day_no in range(7):
-            eu_date = (start_date + timedelta(days=day_no) - timedelta(days=eu_days)).strftime('%Y%m%d')
+        # 2. 일별 이유두수 조회 (TB_EU - 역산일 기준)
+        start_date = datetime.strptime(dt_from, '%Y%m%d')
+        daily_eu: Dict[int, int] = {}
+        for day_no in range(1, 8):  # DAY_NO 1~7
+            eu_date = (start_date + timedelta(days=day_no - 1) - timedelta(days=eu_days)).strftime('%Y%m%d')
             try:
                 sql_eu = """
                     SELECT NVL(SUM(NVL(DUSU, 0) + NVL(DUSU_SU, 0)), 0)
@@ -451,22 +361,22 @@ class ShipmentProcessor(BaseProcessor):
                     WHERE FARM_NO = :farm_no AND WK_DT = :wk_dt
                 """
                 result = self.fetch_one(sql_eu, {'farm_no': self.farm_no, 'wk_dt': eu_date})
-                if result and result[0]:
-                    daily_eu[day_no] = int(result[0])
+                daily_eu[day_no] = int(result[0]) if result and result[0] else 0
             except Exception:
-                pass
+                daily_eu[day_no] = 0
 
-        # 5. 일별 통계 계산
+        # 3. 일별 통계 변환 (lpd_daily 데이터 사용)
         daily_stats: List[Dict] = []
-        for day_no in range(7):
-            day_data = daily_lpd[day_no]
-            day_cnt = len(day_data)
+        for day_data in lpd_daily:
+            day_no = day_data.get('DAY_NO', 0)
+            day_cnt = day_data.get('CNT') or 0
+            eu_dusu = daily_eu.get(day_no, 0)
 
             if day_cnt == 0:
                 # 출하 데이터 없음 - NULL로 처리 (Oracle과 동일)
                 daily_stats.append({
                     'day_no': day_no,
-                    'dt_disp': date_disp[day_no],
+                    'dt_disp': day_data.get('DT_DISP', ''),
                     'but_cnt': None,
                     'tot_net': None,
                     'avg_net': None,
@@ -477,55 +387,36 @@ class ShipmentProcessor(BaseProcessor):
                     'female': None,
                     'male': None,
                     'etc': None,
-                    'eu_dusu': daily_eu[day_no],  # 이유는 출하와 별개
+                    'eu_dusu': eu_dusu,
                     'one_ratio': None,
                     'eu_ratio': None,
                 })
             else:
-                # 출하 데이터 있음
-                kg_values = [lpd.get('NET_KG') or lpd.get('DOCHUK_KG') or 0 for lpd in day_data if lpd.get('NET_KG') or lpd.get('DOCHUK_KG')]
-                back_values = [lpd.get('BACK_DEPTH') or 0 for lpd in day_data if lpd.get('BACK_DEPTH') and lpd.get('BACK_DEPTH') > 0]
-
-                tot_net = sum(kg_values) if kg_values else 0
-                avg_net = oracle_round(sum(kg_values) / len(kg_values), 1) if kg_values else None
-                avg_back = oracle_round(sum(back_values) / len(back_values), 1) if back_values else None
-
-                # 등급별 두수
-                q_11 = sum(1 for lpd in day_data if str(lpd.get('MEAT_QUALITY', '')).strip() == '1+')
-                q_1 = sum(1 for lpd in day_data if str(lpd.get('MEAT_QUALITY', '')).strip() == '1')
-                q_2 = sum(1 for lpd in day_data if str(lpd.get('MEAT_QUALITY', '')).strip() == '2')
-
-                # 성별 두수
-                female = sum(1 for lpd in day_data if str(lpd.get('SEX_GUBUN', '')).strip() == '암')
-                male = sum(1 for lpd in day_data if str(lpd.get('SEX_GUBUN', '')).strip() == '수')
-                sex_val = [str(lpd.get('SEX_GUBUN', '') or '').strip() for lpd in day_data]
-                etc = sum(1 for s in sex_val if s == '거세' or s not in ('암', '수'))
-
-                # 비율 계산
+                # 출하 데이터 있음 (lpd_daily에서 이미 계산됨)
+                q_11 = day_data.get('Q_11') or 0
+                q_1 = day_data.get('Q_1') or 0
                 one_ratio = oracle_round((q_11 + q_1) / day_cnt * 100, 1) if day_cnt > 0 else None
-                eu_dusu = daily_eu[day_no]
                 eu_ratio = oracle_round(day_cnt / eu_dusu * 100, 1) if eu_dusu > 0 else None
 
                 daily_stats.append({
                     'day_no': day_no,
-                    'dt_disp': date_disp[day_no],
+                    'dt_disp': day_data.get('DT_DISP', ''),
                     'but_cnt': day_cnt,
-                    'tot_net': tot_net,
-                    'avg_net': avg_net,
-                    'avg_back': avg_back,
+                    'tot_net': day_data.get('TOT_NET'),
+                    'avg_net': day_data.get('AVG_NET'),
+                    'avg_back': day_data.get('AVG_BACK'),
                     'q_11': q_11,
                     'q_1': q_1,
-                    'q_2': q_2,
-                    'female': female,
-                    'male': male,
-                    'etc': etc,
+                    'q_2': day_data.get('Q_2') or 0,
+                    'female': day_data.get('FEMALE') or 0,
+                    'male': day_data.get('MALE') or 0,
+                    'etc': day_data.get('ETC') or 0,
                     'eu_dusu': eu_dusu,
                     'one_ratio': one_ratio,
                     'eu_ratio': eu_ratio,
                 })
 
-        # 6. 합계/평균 계산
-        # 합계 (데이터 있는 날만)
+        # 4. 합계/평균 계산
         s_but = sum(d['but_cnt'] or 0 for d in daily_stats)
         s_eu = sum(d['eu_dusu'] or 0 for d in daily_stats)
         s_net = sum(d['tot_net'] or 0 for d in daily_stats)
@@ -561,11 +452,11 @@ class ShipmentProcessor(BaseProcessor):
         a_back = oracle_round(sum(valid_avg_back) / len(valid_avg_back), 1) if valid_avg_back else None
         a_one_ratio = oracle_round(sum(valid_one_ratio) / len(valid_one_ratio), 1) if valid_one_ratio else None
 
-        # 전체 평균 (가중평균) - 원본 데이터에서 직접 계산
-        all_kg = [lpd.get('NET_KG') or lpd.get('DOCHUK_KG') or 0 for lpd in week_lpd if lpd.get('NET_KG') or lpd.get('DOCHUK_KG')]
-        total_avg_net = oracle_round(sum(all_kg) / len(all_kg), 1) if all_kg else None
+        # 전체 평균 (가중평균) - lpd_week_avg에서 가져옴 (Oracle AVG_TBL과 동일)
+        total_avg_net = lpd_week_avg.get('TOTAL_AVG_NET')
+        total_avg_back = lpd_week_avg.get('TOTAL_AVG_BACK')
 
-        # 7. ROW 정의 (13행)
+        # 5. ROW 정의 (13행)
         row_defs = [
             # (RN, CODE, get_daily_val, val_1, val_2, val_3)
             (1, 'BUT_CNT', lambda d: d['but_cnt'], s_but, None, a_but),
@@ -579,11 +470,11 @@ class ShipmentProcessor(BaseProcessor):
             (9, 'MALE', lambda d: d['male'], s_male, oracle_round(s_male / s_but * 100, 1) if s_but > 0 else 0, a_male),
             (10, 'ETC', lambda d: d['etc'], s_etc, oracle_round(s_etc / s_but * 100, 1) if s_but > 0 else 0, a_etc),
             (11, 'TNET_KG', lambda d: d['tot_net'], s_net, None, a_tot_net),
-            (12, 'AVG_NET', lambda d: d['avg_net'], None, None, total_avg_net),  # 가중평균
-            (13, 'AVG_BACK', lambda d: d['avg_back'], None, None, a_back),
+            (12, 'AVG_NET', lambda d: d['avg_net'], None, None, total_avg_net),  # 가중평균 (Oracle AVG_TBL)
+            (13, 'AVG_BACK', lambda d: d['avg_back'], None, None, a_back),  # 일별 평균의 평균
         ]
 
-        # 8. INSERT 실행
+        # 6. INSERT 실행
         insert_count = 0
         sql_ins = """
             INSERT INTO TS_INS_WEEK_SUB (
@@ -599,9 +490,17 @@ class ShipmentProcessor(BaseProcessor):
             )
         """
 
+        # 날짜 표시용 (lpd_daily에서 추출)
+        date_disp = [d['dt_disp'] for d in daily_stats]
+        if len(date_disp) < 7:
+            # 데이터 부족시 빈 문자열로 채움
+            date_disp.extend([''] * (7 - len(date_disp)))
+
         for rn, code, get_val, val_1, val_2, val_3 in row_defs:
             # 일별 값 추출
             daily_vals = [get_val(d) for d in daily_stats]
+            if len(daily_vals) < 7:
+                daily_vals.extend([None] * (7 - len(daily_vals)))
 
             self.execute(sql_ins, {
                 'master_seq': self.master_seq,

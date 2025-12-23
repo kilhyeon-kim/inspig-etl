@@ -485,34 +485,119 @@ class FarmDataLoader:
         self.logger.debug(f"교배 상세: TB_GYOBAE에 통합됨")
 
     def _load_lpd(self) -> None:
-        """TM_LPD_DATA 출하 데이터 로드
+        """TM_LPD_DATA 출하 데이터 로드 (일별 요약)
 
-        컬럼: FARM_NO, DOCHUK_DT, DOCHUK_NO, FACTORY_CD, SEX_GUBUN, NET_KG,
-              BACK_DEPTH, MEAT_QUALITY, AU_PRICE, USE_YN
+        Oracle SP_INS_WEEK_SHIP_POPUP의 DAILY CTE와 동일한 로직으로
+        일별 요약 데이터를 조회하여 Python 가공 최소화
 
-        조회 조건: dt_from(지난주 시작일) 해당년도 1.1일 이후 데이터만 조회
-        예: dt_from이 20251216이면 2025-01-01 이후 데이터만 조회
+        조회 결과:
+        - lpd_daily: 7일간 일별 요약 (ROW, CHART용)
+        - lpd_scatter: 산점도용 GROUP BY (ROUND(NET_KG), ROUND(BACK_DEPTH))
+        - lpd_year_stats: 연간 누계 (CNT, AVG)
 
         주의: DOCHUK_DT는 VARCHAR2(10) 형식 'YYYY-MM-DD'
         """
-        # dt_from 해당년도 1.1일 계산 (DOCHUK_DT는 'YYYY-MM-DD' 형식)
-        year_start = f"{self.dt_from[:4]}-01-01"
+        # 날짜 형식 변환
+        dt_from_str = f"{self.dt_from[:4]}-{self.dt_from[4:6]}-{self.dt_from[6:8]}"
+        dt_to_str = f"{self.dt_to[:4]}-{self.dt_to[4:6]}-{self.dt_to[6:8]}"
+        year_start = f"{self.dt_to[:4]}-01-01"
 
-        sql = """
-        SELECT L.SEQ, L.FARM_NO, L.DOCHUK_DT, L.DOCHUK_NO,
-               L.NET_KG, L.BACK_DEPTH, L.MEAT_QUALITY,
-               L.AU_PRICE, L.SEX_GUBUN, L.USE_YN
-        FROM TM_LPD_DATA L
-        WHERE L.FARM_NO = :farm_no
-          AND L.USE_YN = 'Y'
-          AND L.DOCHUK_DT >= :year_start
-        ORDER BY L.DOCHUK_DT
+        # 1. 일별 요약 데이터 (Oracle SP DAILY CTE와 동일)
+        sql_daily = """
+        WITH DATE_LIST AS (
+            SELECT TO_DATE(:dt_from, 'YYYYMMDD') + LEVEL - 1 AS DT,
+                   TO_CHAR(TO_DATE(:dt_from, 'YYYYMMDD') + LEVEL - 1, 'YYYY-MM-DD') AS DT_STR,
+                   LEVEL AS DAY_NO
+            FROM DUAL CONNECT BY LEVEL <= 7
+        ),
+        SHIP_DATA AS (
+            SELECT D.DAY_NO, D.DT, L.NET_KG, L.BACK_DEPTH,
+                   L.MEAT_QUALITY, L.SEX_GUBUN
+            FROM TM_LPD_DATA L
+            JOIN DATE_LIST D ON L.DOCHUK_DT = D.DT_STR
+            WHERE L.FARM_NO = :farm_no AND L.USE_YN = 'Y'
+        )
+        SELECT D.DAY_NO, TO_CHAR(D.DT, 'YYYY-MM-DD') AS DT_STR, TO_CHAR(D.DT, 'MM.DD') AS DT_DISP,
+               NVL(S.CNT, 0) AS CNT,
+               S.TOT_NET, S.AVG_NET, S.AVG_BACK,
+               NVL(S.Q_11, 0) AS Q_11, NVL(S.Q_1, 0) AS Q_1, NVL(S.Q_2, 0) AS Q_2,
+               NVL(S.FEMALE, 0) AS FEMALE, NVL(S.MALE, 0) AS MALE, NVL(S.ETC, 0) AS ETC
+        FROM DATE_LIST D
+        LEFT JOIN (
+            SELECT DAY_NO,
+                   COUNT(*) AS CNT,
+                   SUM(NET_KG) AS TOT_NET,
+                   ROUND(AVG(CASE WHEN NET_KG > 0 THEN NET_KG END), 1) AS AVG_NET,
+                   ROUND(AVG(CASE WHEN BACK_DEPTH > 0 THEN BACK_DEPTH END), 1) AS AVG_BACK,
+                   SUM(CASE WHEN MEAT_QUALITY = '1+' THEN 1 ELSE 0 END) AS Q_11,
+                   SUM(CASE WHEN MEAT_QUALITY = '1' THEN 1 ELSE 0 END) AS Q_1,
+                   SUM(CASE WHEN MEAT_QUALITY = '2' THEN 1 ELSE 0 END) AS Q_2,
+                   SUM(CASE WHEN SEX_GUBUN = '암' THEN 1 ELSE 0 END) AS FEMALE,
+                   SUM(CASE WHEN SEX_GUBUN = '수' THEN 1 ELSE 0 END) AS MALE,
+                   SUM(CASE WHEN SEX_GUBUN = '거세' OR SEX_GUBUN NOT IN ('암', '수') OR SEX_GUBUN IS NULL THEN 1 ELSE 0 END) AS ETC
+            FROM SHIP_DATA
+            GROUP BY DAY_NO
+        ) S ON S.DAY_NO = D.DAY_NO
+        ORDER BY D.DAY_NO
         """
-        self._data['lpd'] = self._fetch_all(sql, {
+        self._data['lpd_daily'] = self._fetch_all(sql_daily, {
+            'farm_no': self.farm_no,
+            'dt_from': self.dt_from,
+        })
+
+        # 2. 산점도용 데이터 (Oracle SP SCATTER INSERT와 동일)
+        sql_scatter = """
+        SELECT ROUND(NET_KG) AS NET_KG_GRP, ROUND(BACK_DEPTH) AS BACK_GRP, COUNT(*) AS CNT
+        FROM TM_LPD_DATA
+        WHERE FARM_NO = :farm_no AND USE_YN = 'Y'
+          AND DOCHUK_DT >= :dt_from_str AND DOCHUK_DT <= :dt_to_str
+          AND NET_KG IS NOT NULL AND BACK_DEPTH IS NOT NULL
+        GROUP BY ROUND(NET_KG), ROUND(BACK_DEPTH)
+        ORDER BY 1, 2
+        """
+        self._data['lpd_scatter'] = self._fetch_all(sql_scatter, {
+            'farm_no': self.farm_no,
+            'dt_from_str': dt_from_str,
+            'dt_to_str': dt_to_str,
+        })
+
+        # 3. 연간 누계 (Oracle SP V_YEAR_CNT, V_YEAR_AVG와 동일)
+        sql_year = """
+        SELECT COUNT(*) AS CNT, ROUND(AVG(NET_KG), 1) AS AVG_NET
+        FROM TM_LPD_DATA
+        WHERE FARM_NO = :farm_no AND USE_YN = 'Y'
+          AND DOCHUK_DT >= :year_start AND DOCHUK_DT <= :dt_to_str
+        """
+        year_rows = self._fetch_all(sql_year, {
             'farm_no': self.farm_no,
             'year_start': year_start,
+            'dt_to_str': dt_to_str,
         })
-        self.logger.debug(f"LPD 로드: {len(self._data['lpd'])}건 (연초: {year_start})")
+        self._data['lpd_year_stats'] = year_rows[0] if year_rows else {'CNT': 0, 'AVG_NET': 0}
+
+        # 4. 전체 평균 (Oracle SP AVG_TBL CTE와 동일)
+        sql_avg = """
+        SELECT ROUND(AVG(NET_KG), 1) AS TOTAL_AVG_NET,
+               ROUND(AVG(CASE WHEN BACK_DEPTH > 0 THEN BACK_DEPTH END), 1) AS TOTAL_AVG_BACK
+        FROM TM_LPD_DATA
+        WHERE FARM_NO = :farm_no AND USE_YN = 'Y'
+          AND DOCHUK_DT >= :dt_from_str AND DOCHUK_DT <= :dt_to_str
+        """
+        avg_rows = self._fetch_all(sql_avg, {
+            'farm_no': self.farm_no,
+            'dt_from_str': dt_from_str,
+            'dt_to_str': dt_to_str,
+        })
+        self._data['lpd_week_avg'] = avg_rows[0] if avg_rows else {'TOTAL_AVG_NET': 0, 'TOTAL_AVG_BACK': 0}
+
+        # 기존 lpd (빈 리스트로 유지 - 호환성)
+        self._data['lpd'] = []
+
+        self.logger.debug(
+            f"LPD 로드: daily={len(self._data['lpd_daily'])}건, "
+            f"scatter={len(self._data['lpd_scatter'])}건, "
+            f"year_cnt={self._data['lpd_year_stats'].get('CNT', 0)}"
+        )
 
     def _load_etc_trade(self) -> None:
         """TM_ETC_TRADE 매출 데이터 로드
