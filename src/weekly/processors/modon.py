@@ -63,9 +63,10 @@ class ModonProcessor(BaseProcessor):
         # 1. 기존 데이터 삭제
         self._delete_existing()
 
-        # 2. FarmDataLoader에서 계산된 데이터 사용
-        loaded_data = self.get_loaded_data()
-        modon_list = loaded_data.get('modon', [])
+        # 2. FarmDataLoader에서 현재 살아있는 모돈만 사용
+        # data_loader.modon에는 2년 이내 도폐사 모돈도 포함되어 있음
+        # 모돈현황은 현재 살아있는 모돈만 집계해야 함
+        modon_list = self.data_loader.get_current_modon() if self.data_loader else []
 
         # 3. 산차별 × 상태별 집계 (Python)
         parity_stats = self._calculate_parity_status(modon_list)

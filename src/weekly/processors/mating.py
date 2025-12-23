@@ -96,64 +96,116 @@ class MatingProcessor(BaseProcessor):
         return plan_hubo, plan_js
 
     def _get_acc_count(self, dt_to: str) -> int:
-        """연간 누적 교배복수 조회 (1/1 ~ 기준일)"""
-        sql = """
-        SELECT COUNT(*)
-        FROM TB_MODON_WK
-        WHERE FARM_NO = :farm_no
-          AND WK_GUBUN = 'G'
-          AND USE_YN = 'Y'
-          AND WK_DT >= :year_start
-          AND WK_DT <= :dt_to
+        """연간 누적 교배복수 조회 (1/1 ~ 기준일)
+
+        data_loader.gb 데이터를 필터링하여 계산
         """
         year_start = dt_to[:4] + '0101'
-        result = self.fetch_one(sql, {'farm_no': self.farm_no, 'year_start': year_start, 'dt_to': dt_to})
-        return result[0] if result else 0
+
+        if not self.data_loader:
+            return 0
+
+        data = self.data_loader.get_data()
+        gb_list = data.get('gb', [])
+
+        # 연간 교배 데이터 필터링
+        filtered = [
+            g for g in gb_list
+            if g.get('GB_DT') and year_start <= str(g['GB_DT'])[:8] <= dt_to
+        ]
+
+        return len(filtered)
 
     def _insert_stats(self, dt_from: str, dt_to: str, plan_hubo: int, plan_js: int, acc_gb_cnt: int) -> Dict[str, Any]:
-        """교배 요약 통계 집계 및 INSERT"""
-        # 집계
-        sql_agg = """
-        SELECT
-            NVL(COUNT(*), 0),
-            NVL(SUM(CASE WHEN C.WK_GUBUN = 'F' THEN 1 ELSE 0 END), 0),
-            NVL(SUM(CASE WHEN C.WK_GUBUN = 'B' THEN 1 ELSE 0 END), 0),
-            NVL(ROUND(AVG(
-                CASE WHEN A.GYOBAE_CNT = 1 AND B.WK_DT IS NOT NULL
-                          AND NOT (A.SANCHA = 0 AND A.GYOBAE_CNT = 1)
-                     THEN TO_DATE(A.WK_DT, 'YYYYMMDD') - TO_DATE(B.WK_DT, 'YYYYMMDD') END
-            ), 1), 0),
-            NVL(ROUND(AVG(
-                CASE WHEN A.SANCHA = 0 AND A.GYOBAE_CNT = 1
-                     THEN TO_DATE(A.WK_DT, 'YYYYMMDD') - D.BIRTH_DT END
-            ), 1), 0),
-            NVL(SUM(CASE WHEN A.SANCHA = 0 AND A.GYOBAE_CNT = 1 THEN 1 ELSE 0 END), 0),
-            NVL(SUM(CASE WHEN A.GYOBAE_CNT > 1 THEN 1 ELSE 0 END), 0),
-            NVL(SUM(CASE WHEN A.GYOBAE_CNT = 1 THEN 1 ELSE 0 END), 0)
-        FROM TB_MODON_WK A
-        LEFT OUTER JOIN TB_MODON_WK B ON B.FARM_NO = A.FARM_NO AND B.PIG_NO = A.PIG_NO
-           AND B.SEQ = A.SEQ - 1 AND B.USE_YN = 'Y'
-        LEFT OUTER JOIN TB_MODON_WK C ON C.FARM_NO = A.FARM_NO AND C.PIG_NO = A.PIG_NO
-           AND C.SEQ = A.SEQ + 1 AND C.USE_YN = 'Y'
-        INNER JOIN TB_MODON D ON D.FARM_NO = A.FARM_NO AND D.PIG_NO = A.PIG_NO AND D.USE_YN = 'Y'
-        WHERE A.FARM_NO = :farm_no
-          AND A.WK_GUBUN = 'G'
-          AND A.USE_YN = 'Y'
-          AND A.WK_DT >= :dt_from
-          AND A.WK_DT <= :dt_to
-        """
-        result = self.fetch_one(sql_agg, {'farm_no': self.farm_no, 'dt_from': dt_from, 'dt_to': dt_to})
+        """교배 요약 통계 집계 및 INSERT
 
-        stats = {
-            'total_cnt': result[0] if result else 0,
-            'sago_cnt': result[1] if result else 0,
-            'bunman_cnt': result[2] if result else 0,
-            'avg_return': result[3] if result else 0,
-            'avg_first_gb': result[4] if result else 0,
-            'first_gb_cnt': result[5] if result else 0,
-            'sago_gb_cnt': result[6] if result else 0,
-            'js_gb_cnt': result[7] if result else 0,
-        }
+        data_loader.modon_wk 데이터를 필터링하여 계산
+        - PREV_*: 이전 작업 정보 (SEQ-1) - 재귀일 계산용
+        - NEXT_*: 다음 작업 정보 (SEQ+1) - 사고/분만 여부 판단용
+        """
+        if not self.data_loader:
+            stats = {'total_cnt': 0, 'sago_cnt': 0, 'bunman_cnt': 0, 'avg_return': 0,
+                     'avg_first_gb': 0, 'first_gb_cnt': 0, 'sago_gb_cnt': 0, 'js_gb_cnt': 0}
+        else:
+            from datetime import datetime
+            data = self.data_loader.get_data()
+            modon_wk = data.get('modon_wk', [])
+            modon_list = data.get('modon', [])
+
+            # 모돈 생년월일 딕셔너리
+            modon_birth = {str(m.get('MODON_NO', '')): m.get('BIRTH_DT') for m in modon_list}
+
+            # 주간 교배 데이터 필터링 (WK_GUBUN = 'G')
+            week_gb = [
+                wk for wk in modon_wk
+                if wk.get('WK_GUBUN') == 'G'
+                and wk.get('WK_DT') and dt_from <= str(wk['WK_DT'])[:8] <= dt_to
+            ]
+
+            total_cnt = len(week_gb)
+
+            # 다음 작업이 사고(F)인 건수
+            sago_cnt = sum(1 for wk in week_gb if wk.get('NEXT_WK_GUBUN') == 'F')
+
+            # 다음 작업이 분만(B)인 건수
+            bunman_cnt = sum(1 for wk in week_gb if wk.get('NEXT_WK_GUBUN') == 'B')
+
+            # 재귀일 계산 (정상교배만: GYOBAE_CNT=1, 초교배 제외: NOT(SANCHA=0 AND GYOBAE_CNT=1))
+            return_days = []
+            for wk in week_gb:
+                gyobae_cnt = wk.get('GYOBAE_CNT') or 0
+                sancha = wk.get('SANCHA') or 0
+                prev_wk_dt = wk.get('PREV_WK_DT')
+                wk_dt = wk.get('WK_DT')
+
+                # 정상교배 (GYOBAE_CNT=1) AND 이전 작업일 있음 AND 초교배 아님
+                if gyobae_cnt == 1 and prev_wk_dt and not (sancha == 0 and gyobae_cnt == 1):
+                    try:
+                        cur_dt = datetime.strptime(str(wk_dt)[:8], '%Y%m%d')
+                        prv_dt = datetime.strptime(str(prev_wk_dt)[:8], '%Y%m%d')
+                        return_days.append((cur_dt - prv_dt).days)
+                    except (ValueError, TypeError):
+                        pass
+
+            avg_return = round(sum(return_days) / len(return_days), 1) if return_days else 0
+
+            # 초교배일령 계산 (SANCHA=0 AND GYOBAE_CNT=1)
+            first_gb_days = []
+            first_gb_cnt = 0
+            for wk in week_gb:
+                sancha = wk.get('SANCHA') or 0
+                gyobae_cnt = wk.get('GYOBAE_CNT') or 0
+                if sancha == 0 and gyobae_cnt == 1:
+                    first_gb_cnt += 1
+                    modon_no = str(wk.get('MODON_NO', ''))
+                    birth_dt = modon_birth.get(modon_no)
+                    wk_dt = wk.get('WK_DT')
+                    if birth_dt and wk_dt:
+                        try:
+                            cur_dt = datetime.strptime(str(wk_dt)[:8], '%Y%m%d')
+                            bir_dt = datetime.strptime(str(birth_dt)[:8], '%Y%m%d')
+                            first_gb_days.append((cur_dt - bir_dt).days)
+                        except (ValueError, TypeError):
+                            pass
+
+            avg_first_gb = round(sum(first_gb_days) / len(first_gb_days), 1) if first_gb_days else 0
+
+            # 재교배 건수 (GYOBAE_CNT > 1)
+            sago_gb_cnt = sum(1 for wk in week_gb if (wk.get('GYOBAE_CNT') or 0) > 1)
+
+            # 정상교배 건수 (GYOBAE_CNT = 1)
+            js_gb_cnt = sum(1 for wk in week_gb if (wk.get('GYOBAE_CNT') or 0) == 1)
+
+            stats = {
+                'total_cnt': total_cnt,
+                'sago_cnt': sago_cnt,
+                'bunman_cnt': bunman_cnt,
+                'avg_return': avg_return,
+                'avg_first_gb': avg_first_gb,
+                'first_gb_cnt': first_gb_cnt,
+                'sago_gb_cnt': sago_gb_cnt,
+                'js_gb_cnt': js_gb_cnt,
+            }
 
         # INSERT
         sql_ins = """

@@ -79,88 +79,123 @@ class FarrowingProcessor(BaseProcessor):
         return result[0] if result else 0
 
     def _get_acc_stats(self, dt_to: str) -> Dict[str, Any]:
-        """연간 누적 실적 조회 (1/1 ~ 기준일)"""
+        """연간 누적 실적 조회 (1/1 ~ 기준일)
+
+        data_loader.bunman 데이터를 필터링하여 계산
+        """
         year_start = dt_to[:4] + '0101'
 
-        sql = """
-        SELECT
-            COUNT(*),
-            NVL(SUM(NVL(B.SILSAN,0) + NVL(B.SASAN,0) + NVL(B.MILA,0)), 0),
-            NVL(SUM(B.SILSAN), 0),
-            NVL(ROUND(AVG(NVL(B.SILSAN,0) + NVL(B.SASAN,0) + NVL(B.MILA,0)), 1), 0),
-            NVL(ROUND(AVG(B.SILSAN), 1), 0)
-        FROM TB_MODON_WK A
-        INNER JOIN TB_BUNMAN B
-            ON B.FARM_NO = A.FARM_NO AND B.PIG_NO = A.PIG_NO
-           AND B.WK_DT = A.WK_DT AND B.WK_GUBUN = A.WK_GUBUN AND B.USE_YN = 'Y'
-        WHERE A.FARM_NO = :farm_no
-          AND A.WK_GUBUN = 'B'
-          AND A.USE_YN = 'Y'
-          AND A.WK_DT >= :year_start
-          AND A.WK_DT <= :dt_to
-        """
-        result = self.fetch_one(sql, {'farm_no': self.farm_no, 'year_start': year_start, 'dt_to': dt_to})
+        if not self.data_loader:
+            return {'acc_bm_cnt': 0, 'acc_total': 0, 'acc_live': 0, 'acc_avg_total': 0, 'acc_avg_live': 0}
+
+        data = self.data_loader.get_data()
+        bunman_list = data.get('bunman', [])
+
+        # 연간 데이터 필터링 (BUN_DT 기준)
+        filtered = [
+            b for b in bunman_list
+            if b.get('BUN_DT') and year_start <= str(b['BUN_DT'])[:8] <= dt_to
+        ]
+
+        if not filtered:
+            return {'acc_bm_cnt': 0, 'acc_total': 0, 'acc_live': 0, 'acc_avg_total': 0, 'acc_avg_live': 0}
+
+        acc_bm_cnt = len(filtered)
+        acc_total = sum((b.get('SILSAN') or 0) + (b.get('SASAN') or 0) + (b.get('MUMMY') or 0) for b in filtered)
+        acc_live = sum(b.get('SILSAN') or 0 for b in filtered)
+        acc_avg_total = round(acc_total / acc_bm_cnt, 1) if acc_bm_cnt > 0 else 0
+        acc_avg_live = round(acc_live / acc_bm_cnt, 1) if acc_bm_cnt > 0 else 0
 
         return {
-            'acc_bm_cnt': result[0] if result else 0,
-            'acc_total': result[1] if result else 0,
-            'acc_live': result[2] if result else 0,
-            'acc_avg_total': result[3] if result else 0,
-            'acc_avg_live': result[4] if result else 0,
+            'acc_bm_cnt': acc_bm_cnt,
+            'acc_total': acc_total,
+            'acc_live': acc_live,
+            'acc_avg_total': acc_avg_total,
+            'acc_avg_live': acc_avg_live,
         }
 
     def _insert_stats(self, dt_from: str, dt_to: str, plan_bm: int, acc_stats: Dict) -> Dict[str, Any]:
-        """분만 통계 집계 및 INSERT (포유개시 포함)"""
-        # 분만 통계 집계 (WITH절로 자돈 증감 사전 집계)
-        sql = """
-        WITH JADON_POGAE_AGG AS (
-            SELECT JT.FARM_NO, JT.PIG_NO, TO_CHAR(JT.BUN_DT, 'YYYYMMDD') AS BUN_DT,
-                   SUM(CASE WHEN JT.GUBUN_CD = '160001' THEN NVL(JT.DUSU,0)+NVL(JT.DUSU_SU,0) ELSE 0 END) AS PS_DS,
-                   SUM(CASE WHEN JT.GUBUN_CD = '160003' THEN NVL(JT.DUSU,0)+NVL(JT.DUSU_SU,0) ELSE 0 END) AS JI_DS,
-                   SUM(CASE WHEN JT.GUBUN_CD = '160004' THEN NVL(JT.DUSU,0)+NVL(JT.DUSU_SU,0) ELSE 0 END) AS JC_DS
-            FROM TB_MODON_JADON_TRANS JT
-            WHERE JT.FARM_NO = :farm_no AND JT.USE_YN = 'Y'
-            GROUP BY JT.FARM_NO, JT.PIG_NO, TO_CHAR(JT.BUN_DT, 'YYYYMMDD')
-        )
-        SELECT
-            COUNT(*),
-            NVL(SUM(NVL(B.SILSAN,0) + NVL(B.SASAN,0) + NVL(B.MILA,0)), 0),
-            NVL(SUM(NVL(B.SILSAN, 0)), 0),
-            NVL(SUM(NVL(B.SASAN, 0)), 0),
-            NVL(SUM(NVL(B.MILA, 0)), 0),
-            NVL(SUM(NVL(B.SILSAN, 0) - NVL(PO.PS_DS, 0) + NVL(PO.JI_DS, 0) - NVL(PO.JC_DS, 0)), 0),
-            NVL(ROUND(AVG(NVL(B.SILSAN,0) + NVL(B.SASAN,0) + NVL(B.MILA,0)), 1), 0),
-            NVL(ROUND(AVG(NVL(B.SILSAN, 0)), 1), 0),
-            NVL(ROUND(AVG(NVL(B.SASAN, 0)), 1), 0),
-            NVL(ROUND(AVG(NVL(B.MILA, 0)), 1), 0),
-            NVL(ROUND(AVG(NVL(B.SILSAN, 0) - NVL(PO.PS_DS, 0) + NVL(PO.JI_DS, 0) - NVL(PO.JC_DS, 0)), 1), 0)
-        FROM TB_MODON_WK A
-        INNER JOIN TB_BUNMAN B
-            ON B.FARM_NO = A.FARM_NO AND B.PIG_NO = A.PIG_NO
-           AND B.WK_DT = A.WK_DT AND B.WK_GUBUN = A.WK_GUBUN AND B.USE_YN = 'Y'
-        LEFT OUTER JOIN JADON_POGAE_AGG PO
-            ON PO.FARM_NO = A.FARM_NO AND PO.PIG_NO = A.PIG_NO AND PO.BUN_DT = A.WK_DT
-        WHERE A.FARM_NO = :farm_no
-          AND A.WK_GUBUN = 'B'
-          AND A.USE_YN = 'Y'
-          AND A.WK_DT >= :dt_from
-          AND A.WK_DT <= :dt_to
-        """
-        result = self.fetch_one(sql, {'farm_no': self.farm_no, 'dt_from': dt_from, 'dt_to': dt_to})
+        """분만 통계 집계 및 INSERT (포유개시 포함)
 
-        stats = {
-            'total_cnt': result[0] if result else 0,
-            'sum_total': result[1] if result else 0,
-            'sum_live': result[2] if result else 0,
-            'sum_dead': result[3] if result else 0,
-            'sum_mummy': result[4] if result else 0,
-            'sum_pogae': result[5] if result else 0,
-            'avg_total': result[6] if result else 0,
-            'avg_live': result[7] if result else 0,
-            'avg_dead': result[8] if result else 0,
-            'avg_mummy': result[9] if result else 0,
-            'avg_pogae': result[10] if result else 0,
-        }
+        data_loader.bunman, jadon_trans 데이터를 필터링하여 계산
+        """
+        if not self.data_loader:
+            stats = {'total_cnt': 0, 'sum_total': 0, 'sum_live': 0, 'sum_dead': 0,
+                     'sum_mummy': 0, 'sum_pogae': 0, 'avg_total': 0, 'avg_live': 0,
+                     'avg_dead': 0, 'avg_mummy': 0, 'avg_pogae': 0}
+        else:
+            data = self.data_loader.get_data()
+            bunman_list = data.get('bunman', [])
+            jadon_trans = data.get('jadon_trans', [])
+
+            # 주간 분만 데이터 필터링
+            week_bunman = [
+                b for b in bunman_list
+                if b.get('BUN_DT') and dt_from <= str(b['BUN_DT'])[:8] <= dt_to
+            ]
+
+            # 자돈 증감 집계 (모돈+분만일 기준)
+            jadon_agg = {}  # {(modon_no, bun_dt): {'ps': 0, 'ji': 0, 'jc': 0}}
+            for jt in jadon_trans:
+                modon_no = str(jt.get('MODON_NO', ''))
+                bun_dt = str(jt.get('BUN_DT', '') or '')[:8]
+                gubun_cd = str(jt.get('TRANS_GUBUN_CD', '') or '')
+                trans_cnt = jt.get('TRANS_CNT') or 0
+
+                if not modon_no or not bun_dt:
+                    continue
+
+                key = (modon_no, bun_dt)
+                if key not in jadon_agg:
+                    jadon_agg[key] = {'ps': 0, 'ji': 0, 'jc': 0}
+
+                if gubun_cd == '160001':  # 포유사고
+                    jadon_agg[key]['ps'] += trans_cnt
+                elif gubun_cd == '160003':  # 자돈입
+                    jadon_agg[key]['ji'] += trans_cnt
+                elif gubun_cd == '160004':  # 자돈출
+                    jadon_agg[key]['jc'] += trans_cnt
+
+            # 통계 계산
+            total_cnt = len(week_bunman)
+            sum_live = sum(b.get('SILSAN') or 0 for b in week_bunman)
+            sum_dead = sum(b.get('SASAN') or 0 for b in week_bunman)
+            sum_mummy = sum(b.get('MUMMY') or 0 for b in week_bunman)
+            sum_total = sum_live + sum_dead + sum_mummy
+
+            # 포유개시 계산: 실산 - 포유사고 + 자돈입 - 자돈출
+            pogae_list = []
+            for b in week_bunman:
+                modon_no = str(b.get('MODON_NO', ''))
+                bun_dt = str(b.get('BUN_DT', '') or '')[:8]
+                silsan = b.get('SILSAN') or 0
+                key = (modon_no, bun_dt)
+                adj = jadon_agg.get(key, {'ps': 0, 'ji': 0, 'jc': 0})
+                pogae = silsan - adj['ps'] + adj['ji'] - adj['jc']
+                pogae_list.append(pogae)
+
+            sum_pogae = sum(pogae_list)
+
+            # 평균 계산
+            avg_total = round(sum_total / total_cnt, 1) if total_cnt > 0 else 0
+            avg_live = round(sum_live / total_cnt, 1) if total_cnt > 0 else 0
+            avg_dead = round(sum_dead / total_cnt, 1) if total_cnt > 0 else 0
+            avg_mummy = round(sum_mummy / total_cnt, 1) if total_cnt > 0 else 0
+            avg_pogae = round(sum_pogae / total_cnt, 1) if total_cnt > 0 else 0
+
+            stats = {
+                'total_cnt': total_cnt,
+                'sum_total': sum_total,
+                'sum_live': sum_live,
+                'sum_dead': sum_dead,
+                'sum_mummy': sum_mummy,
+                'sum_pogae': sum_pogae,
+                'avg_total': avg_total,
+                'avg_live': avg_live,
+                'avg_dead': avg_dead,
+                'avg_mummy': avg_mummy,
+                'avg_pogae': avg_pogae,
+            }
 
         # INSERT
         sql_ins = """

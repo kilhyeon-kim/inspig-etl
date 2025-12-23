@@ -104,135 +104,17 @@ class CullingProcessor(BaseProcessor):
     def _get_culled_modon(self) -> List[Dict]:
         """도폐사된 모돈 데이터 조회
 
-        FarmDataLoader에서는 현재 재적 모돈만 조회하므로
-        도폐사 모돈은 별도 조회 필요
+        FarmDataLoader.get_culled_modon() 사용:
+        - data_loader에서 이미 2년 이내 모돈 조회 (WK_GUBUN <> 'Z' 조건 포함)
+        - Oracle SF_GET_MODONGB_STATUS 함수로 CALC_STATUS_CD 계산됨
+        - OUT_DT <= base_date 조건으로 도폐사 모돈만 필터링
 
         Returns:
             도폐사 모돈 리스트
         """
-        # 도폐사 모돈은 OUT_DT가 있으므로 별도 조회
-        # TB_MODON + TB_MODON_WK 조인 (최신 작업이력 기준)
-        sql = """
-        SELECT M.PIG_NO AS MODON_NO, M.FARM_PIG_NO AS MODON_NM, M.FARM_NO,
-               NVL(W.SANCHA, M.IN_SANCHA) AS SANCHA, M.IN_SANCHA,
-               M.STATUS_CD, TO_CHAR(M.IN_DT, 'YYYYMMDD') AS IN_DT,
-               TO_CHAR(M.OUT_DT, 'YYYYMMDD') AS OUT_DT, M.OUT_GUBUN_CD, M.OUT_REASON_CD,
-               TO_CHAR(M.BIRTH_DT, 'YYYYMMDD') AS BIRTH_DT,
-               NVL(W.GYOBAE_CNT, M.IN_GYOBAE_CNT) AS GB_SANCHA,
-               NULL AS LAST_GB_DT, NULL AS LAST_BUN_DT,
-               W.LOC_CD AS DONBANG_CD, NULL AS NOW_DONGHO, NULL AS NOW_BANGHO,
-               M.IN_GYOBAE_CNT, NVL(W.DAERI_YN, 'N') AS DAERI_YN, M.USE_YN
-        FROM TB_MODON M
-        LEFT JOIN (
-            SELECT FARM_NO, PIG_NO, WK_GUBUN, SANCHA, GYOBAE_CNT, LOC_CD, DAERI_YN,
-                   ROW_NUMBER() OVER (
-                       PARTITION BY FARM_NO, PIG_NO
-                       ORDER BY WK_DATE DESC, SEQ DESC
-                   ) RN
-            FROM TB_MODON_WK
-            WHERE USE_YN = 'Y'
-        ) W ON M.FARM_NO = W.FARM_NO AND M.PIG_NO = W.PIG_NO AND W.RN = 1
-        WHERE M.FARM_NO = :farm_no
-          AND M.USE_YN = 'Y'
-          AND M.OUT_DT IS NOT NULL
-          AND M.OUT_GUBUN_CD IS NOT NULL
-        """
-        cursor = self.conn.cursor()
-        try:
-            cursor.execute(sql, {'farm_no': self.farm_no})
-            columns = [col[0] for col in cursor.description]
-            modon_list = [dict(zip(columns, row)) for row in cursor.fetchall()]
-        finally:
-            cursor.close()
-
-        # 상태코드 계산 (FarmDataLoader 로직 활용)
-        loaded_data = self.get_loaded_data()
-        modon_wk = loaded_data.get('modon_wk', [])
-
-        # 모돈별 마지막 작업 계산 (도폐사 모돈용)
-        modon_last_wk = self._calculate_last_wk_for_culled(modon_wk, modon_list)
-
-        for modon in modon_list:
-            modon_no = str(modon.get('MODON_NO', ''))
-            last_wk = modon_last_wk.get(modon_no)
-
-            if last_wk:
-                # 마지막 작업 기준 상태코드 계산
-                wk_gubun = str(last_wk.get('WK_GUBUN', ''))
-                sago_gubun_cd = str(last_wk.get('SAGO_GUBUN_CD', '') or '')
-                daeri_yn = str(modon.get('DAERI_YN', '') or '')
-
-                status = self._get_status_by_wk_gubun(wk_gubun, sago_gubun_cd, daeri_yn)
-            else:
-                # 작업이력 없으면 TB_MODON.STATUS_CD 사용
-                in_sancha = modon.get('IN_SANCHA', 0) or 0
-                in_gyobae_cnt = modon.get('IN_GYOBAE_CNT', 0) or 0
-                orig_status = str(modon.get('STATUS_CD', '') or '010001')
-
-                if in_sancha == 0 and in_gyobae_cnt == 0:
-                    status = '010001'  # 후보돈
-                else:
-                    status = orig_status if orig_status else '010001'
-
-            modon['CALC_STATUS_CD'] = status
-
-        return modon_list
-
-    def _calculate_last_wk_for_culled(self, modon_wk: List[Dict],
-                                       modon_list: List[Dict]) -> Dict[str, Dict]:
-        """도폐사 모돈의 마지막 작업 계산
-
-        Args:
-            modon_wk: 전체 작업 이력
-            modon_list: 도폐사 모돈 리스트
-
-        Returns:
-            모돈번호별 마지막 작업 딕셔너리
-        """
-        # 도폐사 모돈 번호 집합
-        culled_modon_nos = {str(m.get('MODON_NO', '')) for m in modon_list}
-
-        result = {}
-        for wk in modon_wk:
-            modon_no = str(wk.get('MODON_NO', ''))
-            if modon_no not in culled_modon_nos:
-                continue
-
-            # WK_GUBUN이 'Z'가 아닌 작업만
-            if wk.get('WK_GUBUN') == 'Z':
-                continue
-
-            seq = wk.get('SEQ', 0)
-
-            # MAX(SEQ) 갱신
-            if modon_no not in result:
-                result[modon_no] = wk
-            elif seq > result[modon_no].get('SEQ', 0):
-                result[modon_no] = wk
-
-        return result
-
-    def _get_status_by_wk_gubun(self, wk_gubun: str, sago_gubun_cd: str,
-                                 daeri_yn: str) -> str:
-        """작업구분으로 상태코드 결정
-
-        SF_GET_MODONGB_STATUS 핵심 로직 (FarmDataLoader와 동일)
-        """
-        if wk_gubun == 'G':  # 교배
-            return '010002'
-        elif wk_gubun == 'B':  # 분만
-            return '010003'
-        elif wk_gubun == 'E':  # 이유
-            if daeri_yn == 'Y':
-                return '010004'
-            return '010005'
-        elif wk_gubun == 'F':  # 사고
-            if sago_gubun_cd == '020001':
-                return '010006'
-            elif sago_gubun_cd == '020002':
-                return '010007'
-            return '010006'
-        return '010001'
+        if self.data_loader:
+            return self.data_loader.get_culled_modon()
+        return []
 
     def _filter_by_out_period(self, modon_list: List[Dict],
                                dt_from: str, dt_to: str) -> List[Dict]:

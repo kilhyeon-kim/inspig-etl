@@ -245,14 +245,22 @@ def main():
             print(f"    차이: {total_sub_diff}건")
             print("\n  ※ ETL은 핵심 STAT 데이터만 저장, Oracle은 상세 ROW/SCATTER 포함")
 
-        # 7. SUB STAT 데이터 상세 비교 (핵심 통계 데이터)
+        # 7. SUB STAT 데이터 상세 비교 (핵심 통계 데이터) - 모든 컬럼 비교
         if bak_exists and sub_bak_exists:
             print("\n" + "=" * 60)
-            print("7. TS_INS_WEEK_SUB STAT 데이터 비교 (핵심 통계)")
+            print("7. TS_INS_WEEK_SUB STAT 데이터 상세 비교 (전체 컬럼)")
             print("=" * 60)
 
             stat_match = 0
             stat_diff = 0
+
+            # 비교 컬럼 정의 (SHIP/STAT 기준)
+            compare_columns = [
+                'SORT_NO', 'CNT_1', 'CNT_2', 'CNT_3', 'CNT_4', 'CNT_5', 'CNT_6',
+                'VAL_1', 'VAL_2', 'VAL_3', 'VAL_4', 'VAL_5',
+                'STR_1', 'STR_2'
+            ]
+            col_str = ', '.join(compare_columns)
 
             for bak_master_seq, farm_no, year, week_no in bak_week_records:
                 etl_master_seq = etl_master_map.get((farm_no, week_no))
@@ -264,8 +272,8 @@ def main():
                 diffs = []
 
                 for gubun in stat_gubuns:
-                    cursor.execute("""
-                        SELECT SORT_NO, CNT_1, CNT_2, CNT_3, CNT_4, CNT_5, VAL_1
+                    cursor.execute(f"""
+                        SELECT {col_str}
                         FROM TS_INS_WEEK_SUB
                         WHERE MASTER_SEQ = :master_seq AND FARM_NO = :farm_no
                           AND GUBUN = :gubun AND SUB_GUBUN = 'STAT'
@@ -273,8 +281,8 @@ def main():
                     """, {'master_seq': etl_master_seq, 'farm_no': farm_no, 'gubun': gubun})
                     etl_rows = cursor.fetchall()
 
-                    cursor.execute("""
-                        SELECT SORT_NO, CNT_1, CNT_2, CNT_3, CNT_4, CNT_5, VAL_1
+                    cursor.execute(f"""
+                        SELECT {col_str}
                         FROM TS_INS_WEEK_SUB_BAK
                         WHERE MASTER_SEQ = :master_seq AND FARM_NO = :farm_no
                           AND GUBUN = :gubun AND SUB_GUBUN = 'STAT'
@@ -286,19 +294,35 @@ def main():
                         diffs.append(f"{gubun}/STAT: 건수 다름 (ETL={len(etl_rows)}, BAK={len(bak_rows)})")
                     else:
                         for i, (etl_r, bak_r) in enumerate(zip(etl_rows, bak_rows)):
-                            # CNT_1 ~ CNT_5 비교 (주요 카운트 값)
-                            for j in range(1, 6):
-                                e_val = etl_r[j] or 0
-                                b_val = bak_r[j] or 0
-                                if abs(float(e_val) - float(b_val)) > 0.01:
-                                    diffs.append(f"{gubun}/STAT[{i}].CNT_{j}: ETL={e_val}, BAK={b_val}")
+                            # 모든 컬럼 비교
+                            for j, col_name in enumerate(compare_columns):
+                                e_val = etl_r[j] if etl_r[j] is not None else 0
+                                b_val = bak_r[j] if bak_r[j] is not None else 0
+
+                                # 문자열 비교
+                                if col_name.startswith('STR_'):
+                                    e_val = str(e_val or '').strip()
+                                    b_val = str(b_val or '').strip()
+                                    if e_val != b_val:
+                                        diffs.append(f"{gubun}/STAT.{col_name}: ETL='{e_val}', BAK='{b_val}'")
+                                # 숫자 비교
+                                else:
+                                    try:
+                                        if abs(float(e_val) - float(b_val)) > 0.01:
+                                            if isinstance(e_val, float) or isinstance(b_val, float):
+                                                diffs.append(f"{gubun}/STAT.{col_name}: ETL={e_val:.2f}, BAK={b_val:.2f}")
+                                            else:
+                                                diffs.append(f"{gubun}/STAT.{col_name}: ETL={e_val}, BAK={b_val}")
+                                    except (ValueError, TypeError):
+                                        if str(e_val) != str(b_val):
+                                            diffs.append(f"{gubun}/STAT.{col_name}: ETL={e_val}, BAK={b_val}")
 
                 if diffs:
                     print(f"\n  [{week_no}주차 농장 {farm_no}] STAT 차이:")
-                    for d in diffs[:5]:  # 최대 5개만 출력
+                    for d in diffs[:10]:  # 최대 10개만 출력
                         print(f"    {d}")
-                    if len(diffs) > 5:
-                        print(f"    ... 외 {len(diffs)-5}건")
+                    if len(diffs) > 10:
+                        print(f"    ... 외 {len(diffs)-10}건")
                     stat_diff += 1
                 else:
                     stat_match += 1
@@ -306,6 +330,61 @@ def main():
             print(f"\n  STAT 데이터 비교 결과:")
             print(f"    일치: {stat_match}건")
             print(f"    차이: {stat_diff}건")
+
+        # 8. SHIP/STAT 상세 비교 (VAL_4 내농장단가 확인)
+        if bak_exists and sub_bak_exists:
+            print("\n" + "=" * 60)
+            print("8. SHIP/STAT 상세 비교 (내농장단가 VAL_4 확인)")
+            print("=" * 60)
+
+            for bak_master_seq, farm_no, year, week_no in bak_week_records:
+                etl_master_seq = etl_master_map.get((farm_no, week_no))
+                if not etl_master_seq:
+                    continue
+
+                # ETL SHIP/STAT
+                cursor.execute("""
+                    SELECT CNT_1, CNT_2, CNT_3, CNT_4, CNT_5, CNT_6,
+                           VAL_1, VAL_2, VAL_3, VAL_4, VAL_5,
+                           STR_1, STR_2
+                    FROM TS_INS_WEEK_SUB
+                    WHERE MASTER_SEQ = :master_seq AND FARM_NO = :farm_no
+                      AND GUBUN = 'SHIP' AND SUB_GUBUN = 'STAT'
+                """, {'master_seq': etl_master_seq, 'farm_no': farm_no})
+                etl_ship = cursor.fetchone()
+
+                # BAK SHIP/STAT
+                cursor.execute("""
+                    SELECT CNT_1, CNT_2, CNT_3, CNT_4, CNT_5, CNT_6,
+                           VAL_1, VAL_2, VAL_3, VAL_4, VAL_5,
+                           STR_1, STR_2
+                    FROM TS_INS_WEEK_SUB_BAK
+                    WHERE MASTER_SEQ = :master_seq AND FARM_NO = :farm_no
+                      AND GUBUN = 'SHIP' AND SUB_GUBUN = 'STAT'
+                """, {'master_seq': bak_master_seq, 'farm_no': farm_no})
+                bak_ship = cursor.fetchone()
+
+                if etl_ship and bak_ship:
+                    col_names = ['CNT_1(출하두수)', 'CNT_2(누계)', 'CNT_3(1등급+)',
+                                 'CNT_4(출하일령)', 'CNT_5(포유기간)', 'CNT_6(역산일)',
+                                 'VAL_1(1등급율)', 'VAL_2(평균체중)', 'VAL_3(등지방)',
+                                 'VAL_4(내농장단가)', 'VAL_5(전국단가)',
+                                 'STR_1(이유FROM)', 'STR_2(이유TO)']
+
+                    print(f"\n  [{week_no}주차 농장 {farm_no}] SHIP/STAT:")
+                    for i, col in enumerate(col_names):
+                        e_val = etl_ship[i] if etl_ship[i] is not None else '-'
+                        b_val = bak_ship[i] if bak_ship[i] is not None else '-'
+                        match = "[O]" if str(e_val) == str(b_val) or (
+                            isinstance(e_val, (int, float)) and isinstance(b_val, (int, float)) and
+                            abs(float(e_val or 0) - float(b_val or 0)) < 0.01
+                        ) else "[X]"
+                        print(f"    {match} {col}: ETL={e_val}, BAK={b_val}")
+                else:
+                    if not etl_ship:
+                        print(f"  [{week_no}주차 농장 {farm_no}] ETL SHIP/STAT 없음")
+                    if not bak_ship:
+                        print(f"  [{week_no}주차 농장 {farm_no}] BAK SHIP/STAT 없음")
 
         cursor.close()
 

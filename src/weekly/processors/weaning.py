@@ -81,30 +81,35 @@ class WeaningProcessor(BaseProcessor):
         return result[0] if result else 0
 
     def _get_acc_stats(self, dt_to: str) -> Dict[str, Any]:
-        """연간 누적 실적 조회 (1/1 ~ 기준일)"""
+        """연간 누적 실적 조회 (1/1 ~ 기준일)
+
+        data_loader.eu 데이터를 필터링하여 계산
+        """
         year_start = dt_to[:4] + '0101'
 
-        sql = """
-        SELECT
-            COUNT(*),
-            NVL(SUM(NVL(D.DUSU, 0) + NVL(D.DUSU_SU, 0)), 0),
-            NVL(ROUND(AVG(NVL(D.DUSU, 0) + NVL(D.DUSU_SU, 0)), 1), 0)
-        FROM TB_MODON_WK A
-        INNER JOIN TB_EU D
-            ON D.FARM_NO = A.FARM_NO AND D.PIG_NO = A.PIG_NO
-           AND D.WK_DT = A.WK_DT AND D.WK_GUBUN = A.WK_GUBUN AND D.USE_YN = 'Y'
-        WHERE A.FARM_NO = :farm_no
-          AND A.WK_GUBUN = 'E'
-          AND A.USE_YN = 'Y'
-          AND A.WK_DT >= :year_start
-          AND A.WK_DT <= :dt_to
-        """
-        result = self.fetch_one(sql, {'farm_no': self.farm_no, 'year_start': year_start, 'dt_to': dt_to})
+        if not self.data_loader:
+            return {'acc_eu_cnt': 0, 'acc_eu_jd': 0, 'acc_avg_jd': 0}
+
+        data = self.data_loader.get_data()
+        eu_list = data.get('eu', [])
+
+        # 연간 이유 데이터 필터링
+        filtered = [
+            e for e in eu_list
+            if e.get('EU_DT') and year_start <= str(e['EU_DT'])[:8] <= dt_to
+        ]
+
+        if not filtered:
+            return {'acc_eu_cnt': 0, 'acc_eu_jd': 0, 'acc_avg_jd': 0}
+
+        acc_eu_cnt = len(filtered)
+        acc_eu_jd = sum(e.get('EU_CNT') or 0 for e in filtered)
+        acc_avg_jd = round(acc_eu_jd / acc_eu_cnt, 1) if acc_eu_cnt > 0 else 0
 
         return {
-            'acc_eu_cnt': result[0] if result else 0,
-            'acc_eu_jd': result[1] if result else 0,
-            'acc_avg_jd': result[2] if result else 0,
+            'acc_eu_cnt': acc_eu_cnt,
+            'acc_eu_jd': acc_eu_jd,
+            'acc_avg_jd': acc_avg_jd,
         }
 
     def _insert_stats(self, dt_from: str, dt_to: str, plan_eu: int, acc_stats: Dict) -> Dict[str, Any]:

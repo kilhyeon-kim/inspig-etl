@@ -215,6 +215,9 @@ class ConfigProcessor(BaseProcessor):
             })
 
             rearing_rate = result[0] if result and result[0] else 85.0
+            # Oracle과 동일: 0이면 기본값 85 사용
+            if rearing_rate == 0:
+                rearing_rate = 85.0
 
         except Exception as e:
             self.logger.warning(f"이유후육성율 계산 실패: {e}")

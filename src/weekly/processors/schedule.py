@@ -150,8 +150,8 @@ class ScheduleProcessor(BaseProcessor):
             'vaccine': {'sum': 0, 'daily': [0] * 7},
         }
 
-        # 교배예정 (150005)
-        self._count_schedule('150005', None, v_sdt, v_edt, dates, result['gb'])
+        # 교배예정 (150005) - Oracle과 동일: 기간 이전 데이터는 첫째 날에 합산
+        self._count_schedule('150005', None, v_sdt, v_edt, dates, result['gb'], add_early_to_first=True)
 
         # 분만예정 (150002)
         self._count_schedule('150002', None, v_sdt, v_edt, dates, result['bm'])
@@ -167,8 +167,18 @@ class ScheduleProcessor(BaseProcessor):
 
     def _count_schedule(self, job_gubun_cd: str, status_cd: Optional[str],
                         v_sdt: str, v_edt: str, dates: List[datetime],
-                        count_dict: Dict) -> None:
-        """FN_MD_SCHEDULE_BSE_2020 호출하여 카운트"""
+                        count_dict: Dict, add_early_to_first: bool = False) -> None:
+        """FN_MD_SCHEDULE_BSE_2020 호출하여 카운트
+
+        Args:
+            job_gubun_cd: 작업구분코드
+            status_cd: 상태코드 (None이면 전체)
+            v_sdt: 시작일 (yyyy-MM-dd)
+            v_edt: 종료일 (yyyy-MM-dd)
+            dates: 요일별 날짜 리스트
+            count_dict: 카운트 저장 딕셔너리
+            add_early_to_first: True면 기간 이전 데이터를 첫째 날에 합산 (교배예정만 해당)
+        """
         sql = """
         SELECT TO_DATE(PASS_DT, 'YYYY-MM-DD') AS SCH_DT
         FROM TABLE(FN_MD_SCHEDULE_BSE_2020(
@@ -189,13 +199,14 @@ class ScheduleProcessor(BaseProcessor):
             for row in cursor.fetchall():
                 sch_dt = row[0]
                 if sch_dt:
-                    count_dict['sum'] += 1
-                    # 기간 이전 데이터는 첫째 날에 합산
-                    if sch_dt < dates[0]:
+                    # Oracle과 동일: 교배예정만 기간 이전 데이터를 첫째 날에 합산
+                    if add_early_to_first and sch_dt < dates[0]:
+                        count_dict['sum'] += 1
                         count_dict['daily'][0] += 1
                     else:
                         for i, dt in enumerate(dates):
                             if sch_dt.date() == dt.date():
+                                count_dict['sum'] += 1
                                 count_dict['daily'][i] += 1
                                 break
         finally:
@@ -204,25 +215,23 @@ class ScheduleProcessor(BaseProcessor):
     def _get_imsin_check_counts(self, dt_from: datetime, dates: List[datetime]) -> Dict[str, Dict]:
         """재발확인 (3주/4주) 집계
 
-        마지막 작업이 교배(G)인 모돈 대상
-        - 3주령: 교배일 + 21일
-        - 4주령: 교배일 + 28일
+        Oracle SP_INS_WEEK_SCHEDULE_POPUP과 동일한 로직:
+        - VM_LAST_MODON_SEQ_WK 뷰 사용 (마지막 작업이 교배인 모돈)
+        - 3주령: 교배일 + 21일 (정확히 21일째)
+        - 4주령: 교배일 + 28일 (정확히 28일째)
+        - 모돈당 해당 날짜에 1번만 카운트
         """
         result = {
             '3w': {'sum': 0, 'daily': [0] * 7},
             '4w': {'sum': 0, 'daily': [0] * 7},
         }
 
+        # Oracle 프로시저와 동일: VM_LAST_MODON_SEQ_WK 뷰 사용
         sql = """
-        SELECT TO_DATE(WK.WK_DT, 'YYYYMMDD') AS GB_DT
-        FROM (
-            SELECT FARM_NO, PIG_NO, MAX(SEQ) AS MSEQ
-            FROM TB_MODON_WK
-            WHERE FARM_NO = :farm_no AND USE_YN = 'Y'
-            GROUP BY FARM_NO, PIG_NO
-        ) LW
-        INNER JOIN TB_MODON_WK WK
-            ON WK.FARM_NO = LW.FARM_NO AND WK.PIG_NO = LW.PIG_NO AND WK.SEQ = LW.MSEQ
+        SELECT /*+ INDEX(WK IX_TB_MODON_WK_01) */
+               TO_DATE(WK.WK_DT, 'YYYYMMDD') AS GB_DT,
+               WK.PIG_NO
+        FROM VM_LAST_MODON_SEQ_WK WK
         INNER JOIN TB_MODON MD
             ON MD.FARM_NO = WK.FARM_NO AND MD.PIG_NO = WK.PIG_NO
            AND MD.USE_YN = 'Y'
@@ -240,23 +249,26 @@ class ScheduleProcessor(BaseProcessor):
                 if not gb_dt:
                     continue
 
-                # 3주령 (교배일 + 21일)
+                # 3주령: 교배일 + 21일 (정확히 21일째)
                 check_3w = gb_dt + timedelta(days=21)
                 for i, dt in enumerate(dates):
                     if check_3w.date() == dt.date():
                         result['3w']['daily'][i] += 1
-                        result['3w']['sum'] += 1
                         break
 
-                # 4주령 (교배일 + 28일)
+                # 4주령: 교배일 + 28일 (정확히 28일째)
                 check_4w = gb_dt + timedelta(days=28)
                 for i, dt in enumerate(dates):
                     if check_4w.date() == dt.date():
                         result['4w']['daily'][i] += 1
-                        result['4w']['sum'] += 1
                         break
         finally:
             cursor.close()
+
+        # 합계 계산 (Oracle과 동일: 기간 내 날짜만 합산)
+        for i in range(7):
+            result['3w']['sum'] += result['3w']['daily'][i]
+            result['4w']['sum'] += result['4w']['daily'][i]
 
         return result
 

@@ -214,12 +214,26 @@ class FarmDataLoader:
         - TB_MODON_WK: 작업이력 (SANCHA, GYOBAE_CNT, DAERI_YN 등)
         - ROW_NUMBER로 마지막 작업 정보 조인
         - SF_GET_MODONGB_STATUS Oracle 함수로 상태코드 직접 계산
+
+        조회 조건:
+        - 기준일 기준 2년 이내 OUT_DT인 모돈 (M.OUT_DT > 기준일 - 2년)
+        - 현재 살아있는 모돈 (OUT_DT = '99991231') 또는
+        - 기준일 이후 도폐사된 모돈 (OUT_DT > base_date)
+        - 기준일 기준 2년 이내 도폐사된 모돈도 포함
+
+        다른 프로세서에서 OUT_DT 기준으로 필터링하여 사용:
+        - 현재모돈: OUT_DT = '99991231' 또는 OUT_DT > base_date
+        - 도폐사모돈: OUT_DT <= base_date AND OUT_DT > 2년 전
         """
+        # 기준일 기준 2년 전 날짜 계산
+        base_dt = datetime.strptime(self.base_date, '%Y%m%d')
+        two_years_ago = (base_dt - timedelta(days=730)).strftime('%Y%m%d')  # 약 2년
+
         sql = """
         SELECT M.PIG_NO AS MODON_NO, M.FARM_PIG_NO AS MODON_NM, M.FARM_NO,
                NVL(W.SANCHA, M.IN_SANCHA) AS SANCHA, M.IN_SANCHA,
                M.STATUS_CD, TO_CHAR(M.IN_DT, 'YYYYMMDD') AS IN_DT,
-               TO_CHAR(M.OUT_DT, 'YYYYMMDD') AS OUT_DT, M.OUT_GUBUN_CD,
+               TO_CHAR(M.OUT_DT, 'YYYYMMDD') AS OUT_DT, M.OUT_GUBUN_CD, M.OUT_REASON_CD,
                TO_CHAR(M.BIRTH_DT, 'YYYYMMDD') AS BIRTH_DT,
                NVL(W.GYOBAE_CNT, M.IN_GYOBAE_CNT) AS GB_SANCHA,
                NULL AS LAST_GB_DT, NULL AS LAST_BUN_DT,
@@ -239,6 +253,7 @@ class FarmDataLoader:
                ) AS CALC_STATUS_CD
         FROM TB_MODON M
         LEFT JOIN (
+            -- Oracle SP_INS_WEEK_DOPE_POPUP과 동일: WK_GUBUN <> 'Z' (도폐사 작업 제외)
             SELECT FARM_NO, PIG_NO, WK_GUBUN, SANCHA, GYOBAE_CNT, LOC_CD, DAERI_YN, SAGO_GUBUN_CD,
                    ROW_NUMBER() OVER (
                        PARTITION BY FARM_NO, PIG_NO
@@ -247,43 +262,87 @@ class FarmDataLoader:
             FROM TB_MODON_WK
             WHERE USE_YN = 'Y'
               AND WK_DATE <= TO_DATE(:base_date, 'YYYYMMDD')
+              AND WK_GUBUN <> 'Z'
         ) W ON M.FARM_NO = W.FARM_NO AND M.PIG_NO = W.PIG_NO AND W.RN = 1
         WHERE M.FARM_NO = :farm_no
           AND M.USE_YN = 'Y'
           AND M.IN_DT <= TO_DATE(:base_date, 'YYYYMMDD')
-          AND (M.OUT_DT = TO_DATE('99991231', 'YYYYMMDD') OR M.OUT_DT > TO_DATE(:base_date, 'YYYYMMDD'))
+          AND M.OUT_DT > TO_DATE(:two_years_ago, 'YYYYMMDD')
         """
         self._data['modon'] = self._fetch_all(sql, {
             'farm_no': self.farm_no,
             'base_date': self.base_date,
+            'two_years_ago': two_years_ago,
         })
-        self.logger.debug(f"모돈 로드: {len(self._data['modon'])}건")
+        self.logger.debug(f"모돈 로드: {len(self._data['modon'])}건 (기준일: {self.base_date}, 2년전: {two_years_ago})")
 
     def _load_modon_wk(self) -> None:
-        """TB_MODON_WK 모돈 작업 이력 로드
+        """TB_MODON_WK 모돈 작업 이력 로드 (SEQ 기반 이전/다음 작업 연결 포함)
 
         문서 참조: C:\Projects\inspig\docs\db\ref\01.table.md
         컬럼: FARM_NO, PIG_NO, WK_DT, WK_GUBUN, WK_DATE, SANCHA, GYOBAE_CNT,
               LOC_CD, SAGO_GUBUN_CD, DAERI_YN, SEQ, USE_YN
+
+        SEQ 연결:
+        - PREV_*: 이전 작업 정보 (SEQ - 1)
+        - NEXT_*: 다음 작업 정보 (SEQ + 1)
+
+        용도:
+        - mating.py: 재귀일 계산 (이전 이유일), 다음 작업 구분 (사고/분만)
+        - weaning.py: 자돈 증감 기간 계산 (다음 작업일)
+        - alert.py: 마지막 작업 조회
         """
+        # 기준일 기준 2년 전 날짜 계산
+        base_dt = datetime.strptime(self.base_date, '%Y%m%d')
+        two_years_ago = (base_dt - timedelta(days=730)).strftime('%Y%m%d')
+
         sql = """
-        SELECT W.SEQ, W.PIG_NO AS MODON_NO, W.PIG_NO, W.FARM_NO, W.WK_DT,
-               W.WK_GUBUN, W.SANCHA, W.GYOBAE_CNT,
-               W.LOC_CD, W.SAGO_GUBUN_CD, W.DAERI_YN, W.USE_YN
-        FROM TB_MODON_WK W
-        WHERE W.FARM_NO = :farm_no
-          AND W.USE_YN = 'Y'
-        ORDER BY W.PIG_NO, W.SEQ
+        SELECT A.SEQ, A.PIG_NO AS MODON_NO, A.PIG_NO, A.FARM_NO, A.WK_DT,
+               A.WK_GUBUN, A.SANCHA, A.GYOBAE_CNT,
+               A.LOC_CD, A.SAGO_GUBUN_CD, A.DAERI_YN, A.USE_YN,
+               TO_CHAR(A.WK_DATE, 'YYYYMMDD') AS WK_DATE,
+               -- 이전 작업 정보 (SEQ - 1)
+               B.SEQ AS PREV_SEQ,
+               B.WK_DT AS PREV_WK_DT,
+               B.WK_GUBUN AS PREV_WK_GUBUN,
+               B.SANCHA AS PREV_SANCHA,
+               B.GYOBAE_CNT AS PREV_GYOBAE_CNT,
+               -- 다음 작업 정보 (SEQ + 1)
+               C.SEQ AS NEXT_SEQ,
+               C.WK_DT AS NEXT_WK_DT,
+               C.WK_GUBUN AS NEXT_WK_GUBUN,
+               C.SANCHA AS NEXT_SANCHA,
+               C.GYOBAE_CNT AS NEXT_GYOBAE_CNT
+        FROM TB_MODON_WK A
+        LEFT OUTER JOIN TB_MODON_WK B
+            ON B.FARM_NO = A.FARM_NO AND B.PIG_NO = A.PIG_NO
+           AND B.SEQ = A.SEQ - 1 AND B.USE_YN = 'Y'
+        LEFT OUTER JOIN TB_MODON_WK C
+            ON C.FARM_NO = A.FARM_NO AND C.PIG_NO = A.PIG_NO
+           AND C.SEQ = A.SEQ + 1 AND C.USE_YN = 'Y'
+        WHERE A.FARM_NO = :farm_no
+          AND A.USE_YN = 'Y'
+          AND A.WK_DT > :two_years_ago
+        ORDER BY A.PIG_NO, A.SEQ
         """
-        self._data['modon_wk'] = self._fetch_all(sql, {'farm_no': self.farm_no})
-        self.logger.debug(f"모돈 작업 이력 로드: {len(self._data['modon_wk'])}건")
+        self._data['modon_wk'] = self._fetch_all(sql, {
+            'farm_no': self.farm_no,
+            'two_years_ago': two_years_ago,
+        })
+        self.logger.debug(f"모돈 작업 이력 로드: {len(self._data['modon_wk'])}건 (2년전: {two_years_ago})")
 
     def _load_bunman(self) -> None:
         """TB_BUNMAN 분만 정보 로드
 
         컬럼: FARM_NO, PIG_NO, WK_DT, WK_GUBUN, SILSAN, MILA, SASAN,
               BUNMAN_GUBUN_CD, SAENGSI_KG, SILSAN_AM, SILSAN_SU, BIGO, USE_YN
+
+        조회 조건: 기준일 기준 2년 이내 WK_DT 데이터만 조회
         """
+        # 기준일 기준 2년 전 날짜 계산
+        base_dt = datetime.strptime(self.base_date, '%Y%m%d')
+        two_years_ago = (base_dt - timedelta(days=730)).strftime('%Y%m%d')
+
         sql = """
         SELECT B.PIG_NO AS MODON_NO, B.FARM_NO, B.WK_DT AS BUN_DT,
                B.SILSAN, B.SASAN, B.MILA AS MUMMY,
@@ -294,17 +353,27 @@ class FarmDataLoader:
         FROM TB_BUNMAN B
         WHERE B.FARM_NO = :farm_no
           AND B.USE_YN = 'Y'
+          AND B.WK_DT > :two_years_ago
         ORDER BY B.PIG_NO, B.WK_DT
         """
-        self._data['bunman'] = self._fetch_all(sql, {'farm_no': self.farm_no})
-        self.logger.debug(f"분만 로드: {len(self._data['bunman'])}건")
+        self._data['bunman'] = self._fetch_all(sql, {
+            'farm_no': self.farm_no,
+            'two_years_ago': two_years_ago,
+        })
+        self.logger.debug(f"분만 로드: {len(self._data['bunman'])}건 (2년전: {two_years_ago})")
 
     def _load_eu(self) -> None:
         """TB_EU 이유 정보 로드
 
         컬럼: FARM_NO, PIG_NO, WK_DT, WK_GUBUN, DUSU, DUSU_SU, ILRYUNG,
               TOTAL_KG, DAERI_YN, BIGO, USE_YN
+
+        조회 조건: 기준일 기준 2년 이내 WK_DT 데이터만 조회
         """
+        # 기준일 기준 2년 전 날짜 계산
+        base_dt = datetime.strptime(self.base_date, '%Y%m%d')
+        two_years_ago = (base_dt - timedelta(days=730)).strftime('%Y%m%d')
+
         sql = """
         SELECT E.PIG_NO AS MODON_NO, E.FARM_NO, E.WK_DT AS EU_DT,
                (NVL(E.DUSU, 0) + NVL(E.DUSU_SU, 0)) AS EU_CNT,
@@ -317,26 +386,40 @@ class FarmDataLoader:
         FROM TB_EU E
         WHERE E.FARM_NO = :farm_no
           AND E.USE_YN = 'Y'
+          AND E.WK_DT > :two_years_ago
         ORDER BY E.PIG_NO, E.WK_DT
         """
-        self._data['eu'] = self._fetch_all(sql, {'farm_no': self.farm_no})
-        self.logger.debug(f"이유 로드: {len(self._data['eu'])}건")
+        self._data['eu'] = self._fetch_all(sql, {
+            'farm_no': self.farm_no,
+            'two_years_ago': two_years_ago,
+        })
+        self.logger.debug(f"이유 로드: {len(self._data['eu'])}건 (2년전: {two_years_ago})")
 
     def _load_sago(self) -> None:
         """TB_SAGO 사고 정보 로드
 
         컬럼: FARM_NO, PIG_NO, WK_DT, WK_GUBUN, SAGO_GUBUN_CD, BIGO, USE_YN
+
+        조회 조건: 기준일 기준 2년 이내 WK_DT 데이터만 조회
         """
+        # 기준일 기준 2년 전 날짜 계산
+        base_dt = datetime.strptime(self.base_date, '%Y%m%d')
+        two_years_ago = (base_dt - timedelta(days=730)).strftime('%Y%m%d')
+
         sql = """
         SELECT S.PIG_NO AS MODON_NO, S.FARM_NO, S.WK_DT AS SAGO_DT,
                S.SAGO_GUBUN_CD, S.BIGO AS MEMO, S.USE_YN
         FROM TB_SAGO S
         WHERE S.FARM_NO = :farm_no
           AND S.USE_YN = 'Y'
+          AND S.WK_DT > :two_years_ago
         ORDER BY S.PIG_NO, S.WK_DT
         """
-        self._data['sago'] = self._fetch_all(sql, {'farm_no': self.farm_no})
-        self.logger.debug(f"사고 로드: {len(self._data['sago'])}건")
+        self._data['sago'] = self._fetch_all(sql, {
+            'farm_no': self.farm_no,
+            'two_years_ago': two_years_ago,
+        })
+        self.logger.debug(f"사고 로드: {len(self._data['sago'])}건 (2년전: {two_years_ago})")
 
     def _load_jadon_trans(self) -> None:
         """TB_MODON_JADON_TRANS 자돈 이동 정보 로드
@@ -344,7 +427,14 @@ class FarmDataLoader:
         컬럼: FARM_NO, PIG_NO, SEQ, SANCHA, GUBUN_CD, SUB_GUBUN_CD, WK_DT,
               DUSU, DUSU_SU, ILRYUNG, TOTAL_KG, BUN_DT, EU_DT, IO_PIG_NO,
               LOC_CD, FW_NO, BIGO, USE_YN
+
+        조회 조건: 기준일 기준 2년 이내 WK_DT 데이터만 조회
+        WK_DT는 DATE 타입이므로 TO_DATE 사용
         """
+        # 기준일 기준 2년 전 날짜 계산
+        base_dt = datetime.strptime(self.base_date, '%Y%m%d')
+        two_years_ago = (base_dt - timedelta(days=730)).strftime('%Y%m%d')
+
         sql = """
         SELECT T.SEQ, T.PIG_NO AS MODON_NO, T.FARM_NO, TO_CHAR(T.WK_DT, 'YYYYMMDD') AS TRANS_DT,
                T.SANCHA, TO_CHAR(T.BUN_DT, 'YYYYMMDD') AS BUN_DT, T.GUBUN_CD AS TRANS_GUBUN_CD,
@@ -353,17 +443,27 @@ class FarmDataLoader:
         FROM TB_MODON_JADON_TRANS T
         WHERE T.FARM_NO = :farm_no
           AND T.USE_YN = 'Y'
+          AND T.WK_DT > TO_DATE(:two_years_ago, 'YYYYMMDD')
         ORDER BY T.PIG_NO, T.WK_DT, T.SEQ
         """
-        self._data['jadon_trans'] = self._fetch_all(sql, {'farm_no': self.farm_no})
-        self.logger.debug(f"자돈 이동 로드: {len(self._data['jadon_trans'])}건")
+        self._data['jadon_trans'] = self._fetch_all(sql, {
+            'farm_no': self.farm_no,
+            'two_years_ago': two_years_ago,
+        })
+        self.logger.debug(f"자돈 이동 로드: {len(self._data['jadon_trans'])}건 (2년전: {two_years_ago})")
 
     def _load_gb(self) -> None:
         """TB_GYOBAE 교배 정보 로드
 
         컬럼: FARM_NO, PIG_NO, WK_DT, WK_GUBUN, METHOD_1~3, UNGDON_PIG_NO_1~3,
               UFARM_PIG_NO_1~3, WK_PERSON_CD, BIGO, USE_YN
+
+        조회 조건: 기준일 기준 2년 이내 WK_DT 데이터만 조회
         """
+        # 기준일 기준 2년 전 날짜 계산
+        base_dt = datetime.strptime(self.base_date, '%Y%m%d')
+        two_years_ago = (base_dt - timedelta(days=730)).strftime('%Y%m%d')
+
         sql = """
         SELECT G.PIG_NO AS MODON_NO, G.FARM_NO, G.WK_DT AS GB_DT,
                G.METHOD_1, G.UNGDON_PIG_NO_1, G.UNGDON_PIG_NO_2, G.UNGDON_PIG_NO_3,
@@ -371,10 +471,14 @@ class FarmDataLoader:
         FROM TB_GYOBAE G
         WHERE G.FARM_NO = :farm_no
           AND G.USE_YN = 'Y'
+          AND G.WK_DT > :two_years_ago
         ORDER BY G.PIG_NO, G.WK_DT
         """
-        self._data['gb'] = self._fetch_all(sql, {'farm_no': self.farm_no})
-        self.logger.debug(f"교배 로드: {len(self._data['gb'])}건")
+        self._data['gb'] = self._fetch_all(sql, {
+            'farm_no': self.farm_no,
+            'two_years_ago': two_years_ago,
+        })
+        self.logger.debug(f"교배 로드: {len(self._data['gb'])}건 (2년전: {two_years_ago})")
 
         # TB_GYOBAE는 상세 테이블이 없으므로 빈 리스트
         self._data['gb_detail'] = []
@@ -385,7 +489,15 @@ class FarmDataLoader:
 
         컬럼: FARM_NO, DOCHUK_DT, DOCHUK_NO, FACTORY_CD, SEX_GUBUN, NET_KG,
               BACK_DEPTH, MEAT_QUALITY, AU_PRICE, USE_YN
+
+        조회 조건: dt_from(지난주 시작일) 해당년도 1.1일 이후 데이터만 조회
+        예: dt_from이 20251216이면 2025-01-01 이후 데이터만 조회
+
+        주의: DOCHUK_DT는 VARCHAR2(10) 형식 'YYYY-MM-DD'
         """
+        # dt_from 해당년도 1.1일 계산 (DOCHUK_DT는 'YYYY-MM-DD' 형식)
+        year_start = f"{self.dt_from[:4]}-01-01"
+
         sql = """
         SELECT L.SEQ, L.FARM_NO, L.DOCHUK_DT, L.DOCHUK_NO,
                L.NET_KG, L.BACK_DEPTH, L.MEAT_QUALITY,
@@ -393,10 +505,14 @@ class FarmDataLoader:
         FROM TM_LPD_DATA L
         WHERE L.FARM_NO = :farm_no
           AND L.USE_YN = 'Y'
+          AND L.DOCHUK_DT >= :year_start
         ORDER BY L.DOCHUK_DT
         """
-        self._data['lpd'] = self._fetch_all(sql, {'farm_no': self.farm_no})
-        self.logger.debug(f"LPD 로드: {len(self._data['lpd'])}건")
+        self._data['lpd'] = self._fetch_all(sql, {
+            'farm_no': self.farm_no,
+            'year_start': year_start,
+        })
+        self.logger.debug(f"LPD 로드: {len(self._data['lpd'])}건 (연초: {year_start})")
 
     def _load_etc_trade(self) -> None:
         """TM_ETC_TRADE 매출 데이터 로드
@@ -657,6 +773,37 @@ class FarmDataLoader:
         if not self._loaded:
             self.load()
         return [m for m in self._data['modon'] if m.get('CALC_STATUS_CD') == status_cd]
+
+    def get_current_modon(self) -> List[Dict]:
+        """현재 살아있는 모돈 조회
+
+        조건: OUT_DT = '99991231' 또는 OUT_DT > base_date
+
+        Returns:
+            현재 살아있는 모돈 리스트
+        """
+        if not self._loaded:
+            self.load()
+        return [
+            m for m in self._data['modon']
+            if m.get('OUT_DT') == '99991231' or (m.get('OUT_DT') and m.get('OUT_DT') > self.base_date)
+        ]
+
+    def get_culled_modon(self) -> List[Dict]:
+        """도폐사된 모돈 조회
+
+        조건: OUT_DT <= base_date (기준일까지 도폐사됨)
+        _load_modon_raw에서 이미 2년 이내 데이터만 조회됨
+
+        Returns:
+            도폐사된 모돈 리스트
+        """
+        if not self._loaded:
+            self.load()
+        return [
+            m for m in self._data['modon']
+            if m.get('OUT_DT') and m.get('OUT_DT') != '99991231' and m.get('OUT_DT') <= self.base_date
+        ]
 
     def get_last_wk(self, modon_no: str) -> Optional[Dict]:
         """모돈의 마지막 작업 정보 조회

@@ -328,8 +328,8 @@ class AccidentProcessor(BaseProcessor):
             and s.get('GYUNGIL') is not None
         ]
 
-        if not valid_sago:
-            return 0
+        # Oracle과 동일: 데이터 없어도 0으로 INSERT (차트 항상 생성)
+        # (조건 삭제)
 
         # 경과일별 집계
         counts = []
