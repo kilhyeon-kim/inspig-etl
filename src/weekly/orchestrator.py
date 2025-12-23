@@ -61,6 +61,7 @@ class WeeklyReportOrchestrator:
         skip_productivity: bool = True,  # 현재는 스킵
         skip_weather: bool = False,
         dry_run: bool = False,
+        init_delete: bool = True,  # 전체 삭제 여부 (배치 실행 시 첫 번째만 True)
     ) -> dict:
         """ETL 파이프라인 실행
 
@@ -70,6 +71,7 @@ class WeeklyReportOrchestrator:
             skip_productivity: 생산성 수집 스킵
             skip_weather: 기상청 수집 스킵
             dry_run: 실제 실행 없이 설정만 확인
+            init_delete: 전체 삭제 여부 (test_mode=True일 때만 적용, 배치 실행 시 첫 번째만 True)
 
         Returns:
             실행 결과 딕셔너리
@@ -151,7 +153,7 @@ class WeeklyReportOrchestrator:
             self.logger.info("-" * 40)
             self.logger.info("Step 3: 주간 리포트 생성")
             report_result = self._generate_weekly_report(
-                year, week_no, dt_from, dt_to, test_mode
+                year, week_no, dt_from, dt_to, test_mode, init_delete
             )
             result['steps']['weekly_report'] = report_result
 
@@ -184,6 +186,7 @@ class WeeklyReportOrchestrator:
         dt_from: str,
         dt_to: str,
         test_mode: bool,
+        init_delete: bool = True,
         use_python: bool = True,
         use_async: bool = True,
         farm_list: Optional[str] = None,
@@ -198,6 +201,7 @@ class WeeklyReportOrchestrator:
             dt_from: 시작일
             dt_to: 종료일
             test_mode: 테스트 모드
+            init_delete: 전체 삭제 여부 (배치 실행 시 첫 번째만 True)
             use_python: Python 프로세서 사용 여부 (False면 Oracle 프로시저 호출)
             use_async: 비동기 병렬 처리 사용 여부
             farm_list: 처리할 농장 목록 (콤마 구분, None이면 전체)
@@ -207,9 +211,9 @@ class WeeklyReportOrchestrator:
         """
         if use_python:
             if use_async:
-                return self._generate_weekly_report_async(year, week_no, dt_from, dt_to, test_mode, farm_list)
+                return self._generate_weekly_report_async(year, week_no, dt_from, dt_to, test_mode, init_delete, farm_list)
             else:
-                return self._generate_weekly_report_python(year, week_no, dt_from, dt_to, test_mode, farm_list)
+                return self._generate_weekly_report_python(year, week_no, dt_from, dt_to, test_mode, init_delete, farm_list)
         else:
             return self._generate_weekly_report_procedure(test_mode)
 
@@ -246,6 +250,7 @@ class WeeklyReportOrchestrator:
         dt_from: str,
         dt_to: str,
         test_mode: bool,
+        init_delete: bool = True,
         farm_list: Optional[str] = None,
     ) -> dict:
         """Python 프로세서를 사용한 주간 리포트 생성
@@ -268,8 +273,8 @@ class WeeklyReportOrchestrator:
                 national_price = self._get_national_price(cursor, dt_from, dt_to)
                 self.logger.info(f"전국 탕박 평균 단가: {national_price}원")
 
-                # 2. 기존 테스트 데이터 삭제 (테스트 모드: 전체 삭제, 일반 모드: 동일 연도/주차만)
-                self._delete_existing_master(cursor, year, week_no, farm_list, test_mode)
+                # 2. 기존 테스트 데이터 삭제 (테스트 모드+init_delete: 전체 삭제, 그 외: 동일 연도/주차만)
+                self._delete_existing_master(cursor, year, week_no, farm_list, test_mode, init_delete)
                 conn.commit()
 
                 # 3. 마스터 레코드 생성
@@ -335,6 +340,7 @@ class WeeklyReportOrchestrator:
         dt_from: str,
         dt_to: str,
         test_mode: bool,
+        init_delete: bool = True,
         farm_list: Optional[str] = None,
     ) -> dict:
         """비동기 병렬 처리를 사용한 주간 리포트 생성
@@ -347,6 +353,7 @@ class WeeklyReportOrchestrator:
             dt_from: 시작일
             dt_to: 종료일
             test_mode: 테스트 모드
+            init_delete: 전체 삭제 여부 (배치 실행 시 첫 번째만 True)
             farm_list: 처리할 농장 목록 (콤마 구분, None이면 전체)
 
         Returns:
@@ -375,8 +382,8 @@ class WeeklyReportOrchestrator:
                 national_price = self._get_national_price(cursor, dt_from, dt_to)
                 self.logger.info(f"전국 탕박 평균 단가: {national_price}원")
 
-                # 2. 기존 테스트 데이터 삭제 (테스트 모드: 전체 삭제, 일반 모드: 동일 연도/주차만)
-                self._delete_existing_master(cursor, year, week_no, farm_list, test_mode)
+                # 2. 기존 테스트 데이터 삭제 (테스트 모드+init_delete: 전체 삭제, 그 외: 동일 연도/주차만)
+                self._delete_existing_master(cursor, year, week_no, farm_list, test_mode, init_delete)
                 conn.commit()
 
                 # 3. 마스터 레코드 생성
@@ -529,25 +536,26 @@ class WeeklyReportOrchestrator:
 
     def _delete_existing_master(
         self, cursor, year: int, week_no: int, farm_list: Optional[str] = None,
-        test_mode: bool = False
+        test_mode: bool = False, init_delete: bool = True
     ) -> dict:
         """기존 테스트 데이터 삭제 (동일 연도/주차)
 
         테스트 시 중복 오류 방지를 위해 기존 데이터를 삭제합니다.
-        test_mode=True이면 전체 데이터를 삭제합니다.
+        test_mode=True AND init_delete=True이면 전체 데이터를 삭제합니다.
 
         Args:
             cursor: DB 커서
             year: 연도
             week_no: 주차
             farm_list: 농장 목록 (콤마 구분, None이면 전체)
-            test_mode: 테스트 모드 여부 (True이면 전체 삭제)
+            test_mode: 테스트 모드 여부
+            init_delete: 전체 삭제 여부 (배치 실행 시 첫 번째만 True)
 
         Returns:
             삭제된 건수 딕셔너리
         """
-        # 테스트 모드이면 전체 삭제
-        if test_mode:
+        # 테스트 모드이고 init_delete=True이면 전체 삭제
+        if test_mode and init_delete:
             return self._delete_all_test_data(cursor)
 
         deleted = {'master': 0, 'week': 0, 'week_sub': 0, 'job_log': 0}

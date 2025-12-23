@@ -264,12 +264,16 @@ def main():
                 print(f"[{i}/{len(date_list)}] 기준일: {run_date}")
                 print("-" * 40)
 
+                # 첫 번째 실행에서만 전체 삭제 (init_delete=True)
+                # 이후 실행에서는 해당 주차만 삭제 (init_delete=False)
+                is_first = (i == 1)
                 result = orchestrator.run(
                     base_date=run_date,
                     test_mode=args.test,
                     skip_productivity=True,
                     skip_weather=True,  # 배치에서는 기상청 스킵
                     dry_run=False,
+                    init_delete=is_first,  # 첫 번째만 전체 삭제
                 )
                 results.append({
                     'date': run_date,
