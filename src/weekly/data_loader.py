@@ -569,6 +569,7 @@ class FarmDataLoader:
         Oracle 프로시저 SP_INS_WEEK_SHIP_POPUP에서 내농장 단가 계산에 사용:
         - 계정코드 511% (비육돈매출)
         - TOTAL_KG > 0 조건
+        - WK_DT 기간 조건 (dt_from ~ dt_to)
         - 내농장단가 = SUM(TOTAL_PRICE) / SUM(TOTAL_KG)
 
         컬럼: FARM_NO, WK_DT, ACCOUNT_CD, TOTAL_PRICE, TOTAL_KG, USE_YN
@@ -579,11 +580,17 @@ class FarmDataLoader:
         FROM TM_ETC_TRADE T
         WHERE T.FARM_NO = :farm_no
           AND T.USE_YN = 'Y'
+          AND T.WK_DT >= TO_DATE(:dt_from, 'YYYYMMDD')
+          AND T.WK_DT < TO_DATE(:dt_to, 'YYYYMMDD') + 1
           AND SUBSTR(T.ACCOUNT_CD, 1, 3) = '511'
           AND T.TOTAL_KG > 0
         ORDER BY T.WK_DT
         """
-        self._data['etc_trade'] = self._fetch_all(sql, {'farm_no': self.farm_no})
+        self._data['etc_trade'] = self._fetch_all(sql, {
+            'farm_no': self.farm_no,
+            'dt_from': self.dt_from,
+            'dt_to': self.dt_to
+        })
         self.logger.debug(f"ETC_TRADE 로드: {len(self._data['etc_trade'])}건")
 
     def _load_farm_config(self) -> None:
