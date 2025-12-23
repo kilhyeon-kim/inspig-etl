@@ -30,13 +30,12 @@ echo -e "${YELLOW}1. 배포 대상 파일 확인${NC}"
 echo "   소스: $SCRIPT_DIR"
 echo "   대상: $REMOTE_USER@$REMOTE_HOST:$REMOTE_PATH"
 
-# 배포할 파일 목록
+# 배포할 파일 목록 (필수 파일만)
 FILES=(
     "run_etl.py"
     "run_weekly.sh"
     "requirements.txt"
     "config.ini.example"
-    "README.md"
 )
 
 DIRS=(

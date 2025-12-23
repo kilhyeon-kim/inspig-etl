@@ -1,22 +1,19 @@
 """
 비동기 병렬 처리 모듈
-- 농장별 병렬 처리 (농장 데이터 로드 완료 후 다음 농장 시작)
-- 프로세서별 병렬 처리 (데이터 로드 완료 후 프로세서 동시 실행)
+- 농장별 병렬 처리 (각 농장이 독립 DB 연결 사용)
 
 아키텍처:
 1. 농장별 병렬 처리: ThreadPoolExecutor로 여러 농장 동시 처리
-2. 프로세서별 병렬 처리: 각 농장 내에서 프로세서들 동시 실행
-3. DB 연결: 농장당 독립 연결 사용, 프로세서간 DB Lock 공유
+2. 각 농장은 연결 풀에서 독립 연결 획득 → thread-safe 보장
+3. 프로세서는 순차 실행 (동일 연결 내에서 안전)
 
-주의:
-- Oracle connection은 thread-safe하지 않음
-- 동일 농장 내 프로세서들은 동일 connection을 공유하므로 DB 작업 시 Lock 사용
-- Python 계산 작업은 병렬로 수행, DB 작업은 Lock으로 순차 실행
+수정 이력:
+- 2025-12-23: 연결 풀(SessionPool) 도입으로 농장별 독립 연결 사용
+- 프로세서 내부 병렬 처리 제거 (DB 작업 충돌 방지)
 """
 import logging
 import hashlib
 import secrets
-import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Callable
@@ -83,34 +80,26 @@ class FarmResult:
 class AsyncFarmProcessor:
     """비동기 농장 처리 클래스
 
-    데이터 로드 완료 후 프로세서들을 병렬로 실행
-
-    특징:
-    - Python 계산 작업은 병렬로 실행
-    - DB 작업(INSERT/UPDATE)은 Lock으로 순차 실행 보장
-    - FarmDataLoader 데이터는 읽기 전용으로 공유 (thread-safe)
+    각 농장은 독립 DB 연결을 사용하여 thread-safe 보장
+    프로세서는 순차 실행 (동일 연결 내에서 안전)
     """
 
-    def __init__(self, conn, master_seq: int, farm_no: int, locale: str = 'KOR',
-                 max_workers: int = 5):
+    def __init__(self, conn, master_seq: int, farm_no: int, locale: str = 'KOR'):
         """
         Args:
-            conn: Oracle DB 연결 객체
+            conn: Oracle DB 연결 객체 (농장별 독립 연결)
             master_seq: 마스터 시퀀스
             farm_no: 농장 번호
             locale: 로케일
-            max_workers: 프로세서 병렬 실행 수
         """
         self.conn = conn
         self.master_seq = master_seq
         self.farm_no = farm_no
         self.locale = locale
-        self.max_workers = max_workers
-        self.db_lock = threading.Lock()  # DB 작업용 Lock
         self.logger = logging.getLogger(f"{__name__}.Farm{farm_no}")
 
     def process(self, dt_from: str, dt_to: str, national_price: int = 0) -> Dict[str, Any]:
-        """농장 주간 리포트 생성 (프로세서 병렬 실행)
+        """농장 주간 리포트 생성 (프로세서 순차 실행)
 
         Args:
             dt_from: 시작일 (YYYYMMDD)
@@ -129,7 +118,7 @@ class AsyncFarmProcessor:
         )
 
         start_time = datetime.now()
-        self.logger.info(f"농장 처리 시작 (비동기): {self.farm_no}")
+        self.logger.info(f"농장 처리 시작: {self.farm_no}")
 
         processor_results = []
 
@@ -141,7 +130,7 @@ class AsyncFarmProcessor:
             self._update_status('RUNNING')
 
             # ========================================
-            # 3. 데이터 1회 로드 (동기)
+            # 3. 데이터 1회 로드
             # ========================================
             load_start = datetime.now()
             data_loader = FarmDataLoader(
@@ -161,7 +150,6 @@ class AsyncFarmProcessor:
             config_proc = ConfigProcessor(
                 self.conn, self.master_seq, self.farm_no, self.locale,
                 data_loader=data_loader,
-                db_lock=self.db_lock
             )
             config_result = self._run_processor(
                 ProcessorType.CONFIG,
@@ -170,14 +158,14 @@ class AsyncFarmProcessor:
             processor_results.append(config_result)
 
             # ========================================
-            # 5. 2차 프로세서들: 병렬 실행
+            # 5. 2차 프로세서들: 순차 실행 (동일 연결 사용)
             # ========================================
             # 금주 예정 날짜 계산
             this_dt_from = (datetime.strptime(dt_to, '%Y%m%d') + timedelta(days=1)).strftime('%Y%m%d')
             this_dt_to = (datetime.strptime(dt_to, '%Y%m%d') + timedelta(days=7)).strftime('%Y%m%d')
 
             # 프로세서 정의 (타입, 프로세서 클래스, 추가 인자)
-            parallel_processors = [
+            processors = [
                 (ProcessorType.ALERT, AlertProcessor, {'dt_from': dt_from, 'dt_to': dt_to}),
                 (ProcessorType.MODON, ModonProcessor, {'dt_from': dt_from, 'dt_to': dt_to}),
                 (ProcessorType.MATING, MatingProcessor, {'dt_from': dt_from, 'dt_to': dt_to}),
@@ -189,42 +177,17 @@ class AsyncFarmProcessor:
                 (ProcessorType.SCHEDULE, ScheduleProcessor, {'dt_from': this_dt_from, 'dt_to': this_dt_to}),
             ]
 
-            # ThreadPoolExecutor로 병렬 실행
-            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-                futures = {}
-
-                for proc_type, proc_class, kwargs in parallel_processors:
-                    processor = proc_class(
-                        self.conn, self.master_seq, self.farm_no, self.locale,
-                        data_loader=data_loader,
-                        db_lock=self.db_lock  # DB 작업 동기화용 Lock 전달
-                    )
-
-                    def run_proc(p=processor, kw=kwargs):
-                        return p.process(**kw)
-
-                    future = executor.submit(
-                        self._run_processor,
-                        proc_type,
-                        run_proc
-                    )
-                    futures[future] = proc_type
-
-                # 결과 수집
-                for future in as_completed(futures):
-                    proc_type = futures[future]
-                    try:
-                        result = future.result()
-                        processor_results.append(result)
-                    except Exception as e:
-                        self.logger.error(f"프로세서 실패: {proc_type.value} - {e}")
-                        processor_results.append(ProcessorResult(
-                            processor_type=proc_type,
-                            status='error',
-                            data={},
-                            elapsed_ms=0,
-                            error=str(e)
-                        ))
+            # 순차 실행 (동일 연결에서 안전)
+            for proc_type, proc_class, kwargs in processors:
+                processor = proc_class(
+                    self.conn, self.master_seq, self.farm_no, self.locale,
+                    data_loader=data_loader,
+                )
+                result = self._run_processor(
+                    proc_type,
+                    lambda p=processor, kw=kwargs: p.process(**kw)
+                )
+                processor_results.append(result)
 
             # 6. 상태 업데이트 (COMPLETE) + 공유 토큰 생성
             self._update_complete()
@@ -375,22 +338,19 @@ class AsyncFarmProcessor:
 class AsyncOrchestrator:
     """비동기 오케스트레이터
 
-    농장별 병렬 처리 + 프로세서별 병렬 처리
+    농장별 병렬 처리 (각 농장은 연결 풀에서 독립 연결 획득)
     """
 
-    def __init__(self, db, config=None, max_farm_workers: int = 4,
-                 max_processor_workers: int = 5):
+    def __init__(self, db, config=None, max_farm_workers: int = 4):
         """
         Args:
-            db: Database 객체
+            db: Database 객체 (use_pool=True 필수)
             config: Config 객체
             max_farm_workers: 동시 처리 농장 수
-            max_processor_workers: 농장당 동시 처리 프로세서 수
         """
         self.db = db
         self.config = config
         self.max_farm_workers = max_farm_workers
-        self.max_processor_workers = max_processor_workers
         self.logger = logging.getLogger(__name__)
 
     def process_farms_parallel(
@@ -418,18 +378,17 @@ class AsyncOrchestrator:
         results = []
 
         def process_single_farm(farm: Dict) -> FarmResult:
-            """단일 농장 처리 (별도 DB 연결 사용)"""
+            """단일 농장 처리 (풀에서 독립 연결 획득)"""
             farm_no = farm['FARM_NO']
             locale = farm.get('LOCALE', 'KOR')
 
-            # 농장별로 새 DB 연결 획득
+            # 농장별로 풀에서 새 DB 연결 획득 (thread-safe)
             with self.db.get_connection() as conn:
                 processor = AsyncFarmProcessor(
                     conn=conn,
                     master_seq=master_seq,
                     farm_no=farm_no,
                     locale=locale,
-                    max_workers=self.max_processor_workers
                 )
                 return processor.process(dt_from, dt_to, national_price)
 
@@ -470,19 +429,17 @@ def run_async_etl(
     dt_to: str,
     national_price: int = 0,
     max_farm_workers: int = 4,
-    max_processor_workers: int = 5,
 ) -> List[FarmResult]:
     """비동기 ETL 실행 함수
 
     Args:
-        db: Database 객체
+        db: Database 객체 (use_pool=True 필수)
         master_seq: 마스터 시퀀스
         farms: 농장 정보 리스트
         dt_from: 시작일
         dt_to: 종료일
         national_price: 전국 평균 단가
         max_farm_workers: 동시 처리 농장 수
-        max_processor_workers: 농장당 동시 처리 프로세서 수
 
     Returns:
         FarmResult 리스트
@@ -490,7 +447,6 @@ def run_async_etl(
     orchestrator = AsyncOrchestrator(
         db=db,
         max_farm_workers=max_farm_workers,
-        max_processor_workers=max_processor_workers
     )
 
     return orchestrator.process_farms_parallel(

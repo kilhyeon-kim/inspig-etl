@@ -70,7 +70,7 @@ class ShipmentProcessor(BaseProcessor):
         year_lpd = self._filter_lpd_by_period(lpd_data, year_start, dt_to)
 
         # 4. 출하 통계 계산 및 INSERT
-        stats = self._calculate_and_insert_stats(week_lpd, year_lpd, national_price)
+        stats = self._calculate_and_insert_stats(week_lpd, year_lpd, national_price, dt_from, dt_to)
 
         # 5. 출하 차트 INSERT (일자별)
         chart_cnt = self._calculate_and_insert_chart(week_lpd)
@@ -119,59 +119,129 @@ class ShipmentProcessor(BaseProcessor):
         return result
 
     def _calculate_and_insert_stats(self, week_lpd: List[Dict], year_lpd: List[Dict],
-                                     national_price: int) -> Dict[str, Any]:
+                                     national_price: int, dt_from: str = '', dt_to: str = '') -> Dict[str, Any]:
         """출하 통계 계산 및 INSERT
+
+        Oracle SP_INS_WEEK_SHIP_POPUP 프로시저와 동일한 컬럼 매핑:
+        - CNT_1: 출하두수, CNT_2: 당해년도누계, CNT_3: 1등급+두수
+        - CNT_4: 기준출하일령 (V_SHIP_DAY), CNT_5: 평균포유기간 (V_WEAN_PERIOD)
+        - CNT_6: 역산일 (V_EU_DAYS = V_SHIP_DAY - V_WEAN_PERIOD)
+        - VAL_1: 1등급+율, VAL_2: 평균도체중, VAL_3: 평균등지방
+        - VAL_4: 내농장단가, VAL_5: 전국탕박평균단가
+        - STR_1: 이유일 FROM, STR_2: 이유일 TO
 
         Args:
             week_lpd: 주간 LPD 데이터
             year_lpd: 연간 LPD 데이터
             national_price: 전국 평균 단가
+            dt_from: 시작일 (YYYYMMDD)
+            dt_to: 종료일 (YYYYMMDD)
 
         Returns:
             통계 딕셔너리
         """
+        # 설정값 조회 (CONFIG에서)
+        ship_day = 180  # 기준출하일령
+        wean_period = 21  # 평균포유기간
+        try:
+            sql_config = """
+                SELECT NVL(CNT_3, 180), NVL(CNT_2, 21)
+                FROM TS_INS_WEEK_SUB
+                WHERE MASTER_SEQ = :master_seq AND FARM_NO = :farm_no AND GUBUN = 'CONFIG'
+            """
+            result = self.fetch_one(sql_config, {'master_seq': self.master_seq, 'farm_no': self.farm_no})
+            if result:
+                ship_day = result[0] or 180
+                wean_period = result[1] or 21
+        except Exception:
+            pass
+        eu_days = ship_day - wean_period  # 역산일
+
         # 주간 통계
         ship_cnt = len(week_lpd)
 
-        kg_values = [lpd.get('DOCHUK_KG') or lpd.get('LPD_VAL', 0) or 0 for lpd in week_lpd]
+        # 평균 도체중 (NET_KG)
+        kg_values = [lpd.get('NET_KG') or lpd.get('DOCHUK_KG') or lpd.get('LPD_VAL', 0) or 0 for lpd in week_lpd]
         avg_kg = round(sum(kg_values) / len(kg_values), 1) if kg_values else 0
 
-        amt_values = [lpd.get('GYEOK_AUCTAMT', 0) or 0 for lpd in week_lpd]
-        avg_amt = round(sum(amt_values) / len(amt_values)) if amt_values else 0
+        # 평균 등지방
+        backfat_values = [lpd.get('BACK_DEPTH', 0) or 0 for lpd in week_lpd if lpd.get('BACK_DEPTH')]
+        avg_backfat = round(sum(backfat_values) / len(backfat_values), 1) if backfat_values else 0
+
+        # 1등급+ 두수 및 비율 (MEAT_QUALITY = '1+' 또는 '1')
+        grade1_cnt = sum(1 for lpd in week_lpd if str(lpd.get('MEAT_QUALITY', '')).strip() in ('1+', '1'))
+        grade1_rate = round(grade1_cnt / ship_cnt * 100, 1) if ship_cnt > 0 else 0
 
         # 연간 누적 통계
         sum_cnt = len(year_lpd)
-        year_kg_values = [lpd.get('DOCHUK_KG') or lpd.get('LPD_VAL', 0) or 0 for lpd in year_lpd]
+        year_kg_values = [lpd.get('NET_KG') or lpd.get('DOCHUK_KG') or lpd.get('LPD_VAL', 0) or 0 for lpd in year_lpd]
         sum_avg_kg = round(sum(year_kg_values) / len(year_kg_values), 1) if year_kg_values else 0
+
+        # 이유일 계산 (출하일 - 역산일)
+        str_1 = ''  # 이유일 FROM
+        str_2 = ''  # 이유일 TO
+        if dt_from and dt_to:
+            try:
+                from_date = datetime.strptime(dt_from, '%Y%m%d') - timedelta(days=eu_days)
+                to_date = datetime.strptime(dt_to, '%Y%m%d') - timedelta(days=eu_days)
+                str_1 = from_date.strftime('%y.%m.%d')
+                str_2 = to_date.strftime('%y.%m.%d')
+            except Exception:
+                pass
 
         stats = {
             'ship_cnt': ship_cnt,
             'avg_kg': avg_kg,
-            'avg_amt': avg_amt,
+            'avg_backfat': avg_backfat,
+            'grade1_cnt': grade1_cnt,
+            'grade1_rate': grade1_rate,
             'sum_cnt': sum_cnt,
             'sum_avg_kg': sum_avg_kg,
             'national_price': national_price,
+            'ship_day': ship_day,
+            'wean_period': wean_period,
+            'eu_days': eu_days,
         }
 
-        # INSERT
+        # 내농장 단가 계산 (data_loader의 get_farm_price 사용)
+        farm_price = 0
+        try:
+            farm_price = self.data_loader.get_farm_price(dt_from, dt_to)
+        except Exception as e:
+            self.logger.warning(f"내농장 단가 조회 실패: {e}")
+
+        stats['farm_price'] = farm_price
+
+        # INSERT - Oracle과 동일한 컬럼 매핑
         sql_ins = """
         INSERT INTO TS_INS_WEEK_SUB (
             MASTER_SEQ, FARM_NO, GUBUN, SUB_GUBUN, SORT_NO,
-            CNT_1, VAL_1, VAL_2, CNT_2, VAL_3, VAL_4
+            CNT_1, CNT_2, CNT_3, CNT_4, CNT_5, CNT_6,
+            VAL_1, VAL_2, VAL_3, VAL_4, VAL_5,
+            STR_1, STR_2
         ) VALUES (
             :master_seq, :farm_no, 'SHIP', 'STAT', 1,
-            :ship_cnt, :avg_kg, :avg_amt, :sum_cnt, :sum_avg_kg, :national_price
+            :cnt_1, :cnt_2, :cnt_3, :cnt_4, :cnt_5, :cnt_6,
+            :val_1, :val_2, :val_3, :val_4, :val_5,
+            :str_1, :str_2
         )
         """
         self.execute(sql_ins, {
             'master_seq': self.master_seq,
             'farm_no': self.farm_no,
-            'ship_cnt': stats.get('ship_cnt', 0),
-            'avg_kg': stats.get('avg_kg', 0),
-            'avg_amt': stats.get('avg_amt', 0),
-            'sum_cnt': stats.get('sum_cnt', 0),
-            'sum_avg_kg': stats.get('sum_avg_kg', 0),
-            'national_price': stats.get('national_price', 0),
+            'cnt_1': ship_cnt,        # 출하두수
+            'cnt_2': sum_cnt,         # 당해년도 누계
+            'cnt_3': grade1_cnt,      # 1등급+ 두수
+            'cnt_4': ship_day,        # 기준출하일령
+            'cnt_5': wean_period,     # 평균포유기간
+            'cnt_6': eu_days,         # 역산일
+            'val_1': grade1_rate,     # 1등급+율(%)
+            'val_2': avg_kg,          # 평균도체중
+            'val_3': avg_backfat,     # 평균등지방
+            'val_4': farm_price,      # 내농장단가 (TM_ETC_TRADE)
+            'val_5': national_price,  # 전국탕박평균단가
+            'str_1': str_1,           # 이유일 FROM
+            'str_2': str_2,           # 이유일 TO
         })
 
         return stats

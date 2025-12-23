@@ -19,6 +19,8 @@
 
 ### 로컬 개발 환경
 
+ssh -i "E:/ssh key/sshkey/aws/ProdPigplanKey.pem" pigplan@10.4.35.10
+
 ```bash
 cd C:\Projects\inspig-etl
 

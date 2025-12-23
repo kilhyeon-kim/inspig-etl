@@ -165,6 +165,7 @@ class FarmDataLoader:
         self._load_jadon_trans()
         self._load_gb()
         self._load_lpd()
+        self._load_etc_trade()       # TM_ETC_TRADE (내농장 단가 계산용)
         self._load_farm_config()
 
         # ========================================
@@ -396,6 +397,29 @@ class FarmDataLoader:
         """
         self._data['lpd'] = self._fetch_all(sql, {'farm_no': self.farm_no})
         self.logger.debug(f"LPD 로드: {len(self._data['lpd'])}건")
+
+    def _load_etc_trade(self) -> None:
+        """TM_ETC_TRADE 매출 데이터 로드
+
+        Oracle 프로시저 SP_INS_WEEK_SHIP_POPUP에서 내농장 단가 계산에 사용:
+        - 계정코드 511% (비육돈매출)
+        - TOTAL_KG > 0 조건
+        - 내농장단가 = SUM(TOTAL_PRICE) / SUM(TOTAL_KG)
+
+        컬럼: FARM_NO, WK_DT, ACCOUNT_CD, TOTAL_PRICE, TOTAL_KG, USE_YN
+        """
+        sql = """
+        SELECT T.SEQ, T.FARM_NO, TO_CHAR(T.WK_DT, 'YYYYMMDD') AS WK_DT,
+               T.ACCOUNT_CD, T.TOTAL_PRICE, T.TOTAL_KG, T.USE_YN
+        FROM TM_ETC_TRADE T
+        WHERE T.FARM_NO = :farm_no
+          AND T.USE_YN = 'Y'
+          AND SUBSTR(T.ACCOUNT_CD, 1, 3) = '511'
+          AND T.TOTAL_KG > 0
+        ORDER BY T.WK_DT
+        """
+        self._data['etc_trade'] = self._fetch_all(sql, {'farm_no': self.farm_no})
+        self.logger.debug(f"ETC_TRADE 로드: {len(self._data['etc_trade'])}건")
 
     def _load_farm_config(self) -> None:
         """농장 정보 로드"""
@@ -774,6 +798,44 @@ class FarmDataLoader:
                 result[key] = []
             result[key].append(row)
         return result
+
+    def get_farm_price(self, dt_from: str = None, dt_to: str = None) -> int:
+        """내농장 단가 계산 (TM_ETC_TRADE)
+
+        Oracle 프로시저 SP_INS_WEEK_SHIP_POPUP 로직:
+        - 계정코드 511% (비육돈매출), TOTAL_KG > 0
+        - 내농장단가 = ROUND(SUM(TOTAL_PRICE) / SUM(TOTAL_KG))
+
+        Args:
+            dt_from: 시작일 (YYYYMMDD), None이면 로드 시작일
+            dt_to: 종료일 (YYYYMMDD), None이면 로드 종료일
+
+        Returns:
+            내농장 단가 (원/kg), 데이터 없으면 0
+        """
+        if 'etc_trade' not in self._data:
+            self.load()
+
+        dt_from = dt_from or self.dt_from
+        dt_to = dt_to or self.dt_to
+
+        # 기간 필터링
+        filtered = [
+            row for row in self._data.get('etc_trade', [])
+            if row.get('WK_DT') and dt_from <= str(row['WK_DT'])[:8] <= dt_to
+        ]
+
+        if not filtered:
+            return 0
+
+        # SUM(TOTAL_PRICE) / SUM(TOTAL_KG)
+        total_price = sum(row.get('TOTAL_PRICE', 0) or 0 for row in filtered)
+        total_kg = sum(row.get('TOTAL_KG', 0) or 0 for row in filtered)
+
+        if total_kg <= 0:
+            return 0
+
+        return round(total_price / total_kg)
 
     def aggregate(self, data: List[Dict], value_field: str,
                   agg_type: str = 'sum') -> float:

@@ -466,18 +466,17 @@ class CullingProcessor(BaseProcessor):
     def _update_week(self, week_modon: List[Dict], year_modon: List[Dict]) -> None:
         """TS_INS_WEEK 도태폐사 관련 컬럼 업데이트
 
-        Oracle과 동일하게 도태(080001)+폐사(080002)만 카운트
-        (전출/판매 제외)
+        Oracle과 동일하게 OUT_GUBUN_CD가 있는 모든 모돈 카운트
+        (도태/폐사/전출/판매 모두 포함)
 
         Args:
             week_modon: 지난주 도폐사 모돈
             year_modon: 당해년도 도폐사 모돈
         """
-        # 도태+폐사만 카운트 (Oracle V_WEEK_TOTAL, V_YEAR_TOTAL과 동일)
-        week_cl_cnt = sum(1 for m in week_modon
-                         if m.get('OUT_GUBUN_CD') in (OUT_GUBUN_DOTAE, OUT_GUBUN_PYESA))
-        year_cl_cnt = sum(1 for m in year_modon
-                         if m.get('OUT_GUBUN_CD') in (OUT_GUBUN_DOTAE, OUT_GUBUN_PYESA))
+        # OUT_GUBUN_CD가 있는 모든 모돈 카운트 (Oracle V_WEEK_TOTAL, V_YEAR_TOTAL과 동일)
+        # 도태(080001), 폐사(080002), 전출(080003), 판매(080004) 모두 포함
+        week_cl_cnt = len(week_modon)
+        year_cl_cnt = len(year_modon)
 
         sql = """
         UPDATE TS_INS_WEEK

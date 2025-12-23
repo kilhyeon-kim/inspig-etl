@@ -86,21 +86,17 @@ class WeeklyReportOrchestrator:
         else:
             base_dt = datetime.now()
 
-        # 주차 계산 (ISO Week)
-        year = int(base_dt.strftime('%G'))  # ISO year
-        week_no = int(base_dt.strftime('%V'))  # ISO week
+        # 기간 계산: 기준일의 지난주 (월~일, 7일)
+        # test_mode 여부와 관계없이 항상 지난주 전체를 처리
+        # 예: 기준일 2025-11-10 (월) → 지난주 2025-11-03 (월) ~ 2025-11-09 (일)
+        last_sunday = base_dt - timedelta(days=base_dt.weekday() + 1)
+        last_monday = last_sunday - timedelta(days=6)
+        dt_from = last_monday.strftime('%Y%m%d')
+        dt_to = last_sunday.strftime('%Y%m%d')
 
-        # 기간 계산
-        if test_mode:
-            # 테스트 모드: 금주 (월요일 ~ 오늘)
-            dt_from = (base_dt - timedelta(days=base_dt.weekday())).strftime('%Y%m%d')
-            dt_to = base_dt.strftime('%Y%m%d')
-        else:
-            # 운영 모드: 지난주
-            last_sunday = base_dt - timedelta(days=base_dt.weekday() + 1)
-            last_monday = last_sunday - timedelta(days=6)
-            dt_from = last_monday.strftime('%Y%m%d')
-            dt_to = last_sunday.strftime('%Y%m%d')
+        # 주차 계산 (ISO Week) - 지난주 기준으로 계산
+        year = int(last_sunday.strftime('%G'))  # ISO year
+        week_no = int(last_sunday.strftime('%V'))  # ISO week
 
         self.logger.info(f"  기준일: {base_dt.strftime('%Y-%m-%d')}")
         self.logger.info(f"  리포트 기간: {dt_from} ~ {dt_to}")
@@ -188,7 +184,7 @@ class WeeklyReportOrchestrator:
         test_mode: bool,
         init_delete: bool = True,
         use_python: bool = True,
-        use_async: bool = True,
+        use_async: bool = True,  # 병렬 처리 활성화 (연결 풀 사용으로 thread-safe 보장)
         farm_list: Optional[str] = None,
     ) -> dict:
         """주간 리포트 생성
@@ -345,7 +341,7 @@ class WeeklyReportOrchestrator:
     ) -> dict:
         """비동기 병렬 처리를 사용한 주간 리포트 생성
 
-        농장별 병렬 처리 + 프로세서별 병렬 처리
+        농장별 병렬 처리 (각 농장은 연결 풀에서 독립 연결 획득)
 
         Args:
             year: 연도
@@ -365,128 +361,138 @@ class WeeklyReportOrchestrator:
 
         # 설정에서 병렬 처리 설정 가져오기
         max_farm_workers = self.config.processing.get('max_farm_workers', 4)
-        max_processor_workers = self.config.processing.get('max_processor_workers', 5)
 
         self.logger.info(f"  농장 병렬 처리: {max_farm_workers}개")
-        self.logger.info(f"  프로세서 병렬 처리: {max_processor_workers}개")
+
+        # 연결 풀 생성 (농장별 독립 연결 제공)
+        # pool_max는 max_farm_workers + 2로 설정 → 동시 사용 연결 수 제한
+        # 농장 수가 많아도 동시에 사용하는 연결은 max_farm_workers개로 제한됨
+        pool_db = Database(self.config, use_pool=True, pool_min=2, pool_max=max_farm_workers + 2)
 
         target_cnt = 0
         complete_cnt = 0
         error_cnt = 0
         farm_results = []
+        master_seq = None
 
-        with self.db.get_connection() as conn:
-            cursor = conn.cursor()
-            try:
-                # 1. 전국 탕박 평균 단가 계산
-                national_price = self._get_national_price(cursor, dt_from, dt_to)
-                self.logger.info(f"전국 탕박 평균 단가: {national_price}원")
+        try:
+            with self.db.get_connection() as conn:
+                cursor = conn.cursor()
+                try:
+                    # 1. 전국 탕박 평균 단가 계산
+                    national_price = self._get_national_price(cursor, dt_from, dt_to)
+                    self.logger.info(f"전국 탕박 평균 단가: {national_price}원")
 
-                # 2. 기존 테스트 데이터 삭제 (테스트 모드+init_delete: 전체 삭제, 그 외: 동일 연도/주차만)
-                self._delete_existing_master(cursor, year, week_no, farm_list, test_mode, init_delete)
-                conn.commit()
+                    # 2. 기존 테스트 데이터 삭제 (테스트 모드+init_delete: 전체 삭제, 그 외: 동일 연도/주차만)
+                    self._delete_existing_master(cursor, year, week_no, farm_list, test_mode, init_delete)
+                    conn.commit()
 
-                # 3. 마스터 레코드 생성
-                master_seq = self._create_master(cursor, year, week_no, dt_from, dt_to)
-                self.logger.info(f"마스터 SEQ: {master_seq}")
+                    # 3. 마스터 레코드 생성
+                    master_seq = self._create_master(cursor, year, week_no, dt_from, dt_to)
+                    self.logger.info(f"마스터 SEQ: {master_seq}")
 
-                # 4. 대상 농장 조회
-                farms = self._get_target_farms(cursor, farm_list, test_mode)
-                target_cnt = len(farms)
-                self.logger.info(f"대상 농장: {target_cnt}개")
+                    # 4. 대상 농장 조회
+                    farms = self._get_target_farms(cursor, farm_list, test_mode)
+                    target_cnt = len(farms)
+                    self.logger.info(f"대상 농장: {target_cnt}개")
 
-                if target_cnt == 0:
-                    self.logger.warning("대상 농장이 없습니다.")
-                    return {'status': 'complete', 'method': 'python_async', 'target_cnt': 0}
+                    if target_cnt == 0:
+                        self.logger.warning("대상 농장이 없습니다.")
+                        return {'status': 'complete', 'method': 'python_async', 'target_cnt': 0}
 
-                # 5. 농장별 초기 레코드 생성 (TS_INS_WEEK)
-                self._create_week_records(cursor, master_seq, farms, year, week_no, dt_from, dt_to)
-                conn.commit()
+                    # 5. 농장별 초기 레코드 생성 (TS_INS_WEEK)
+                    self._create_week_records(cursor, master_seq, farms, year, week_no, dt_from, dt_to)
+                    conn.commit()
 
-            finally:
-                cursor.close()
+                finally:
+                    cursor.close()
 
-        # 6. 농장별 병렬 처리 (각 농장은 별도 DB 연결 사용)
-        def process_single_farm(farm: dict) -> dict:
-            """단일 농장 처리 (별도 스레드에서 실행)"""
-            farm_no = farm['FARM_NO']
-            locale = farm.get('LOCALE', 'KOR')
-
-            try:
-                with self.db.get_connection() as farm_conn:
-                    processor = AsyncFarmProcessor(
-                        farm_conn,
-                        master_seq,
-                        farm_no,
-                        locale,
-                        max_workers=max_processor_workers,
-                    )
-                    result = processor.process(dt_from, dt_to, national_price=national_price)
-                    farm_conn.commit()
-                    return result
-            except Exception as e:
-                self.logger.error(f"농장 {farm_no} 처리 오류: {e}", exc_info=True)
-                return {
-                    'farm_no': farm_no,
-                    'status': 'error',
-                    'error': str(e),
-                }
-
-        # ThreadPoolExecutor로 농장별 병렬 처리
-        self.logger.info(f"농장별 병렬 처리 시작 (workers={max_farm_workers})")
-
-        with ThreadPoolExecutor(max_workers=max_farm_workers) as executor:
-            # 모든 농장에 대해 비동기 작업 제출
-            future_to_farm = {
-                executor.submit(process_single_farm, farm): farm
-                for farm in farms
-            }
-
-            # 완료된 작업 수집
-            for future in as_completed(future_to_farm):
-                farm = future_to_farm[future]
+            # 6. 농장별 병렬 처리 (각 농장은 연결 풀에서 독립 연결 획득)
+            def process_single_farm(farm: dict) -> dict:
+                """단일 농장 처리 (풀에서 독립 연결 획득)"""
                 farm_no = farm['FARM_NO']
+                locale = farm.get('LOCALE', 'KOR')
 
                 try:
-                    result = future.result()
-                    farm_results.append(result)
-
-                    if result.get('status') == 'success':
-                        complete_cnt += 1
-                        self.logger.info(f"농장 {farm_no} 완료")
-                    else:
-                        error_cnt += 1
-                        self.logger.warning(f"농장 {farm_no} 오류: {result.get('error', 'unknown')}")
-
+                    # 연결 풀에서 독립 연결 획득 (thread-safe)
+                    with pool_db.get_connection() as farm_conn:
+                        processor = AsyncFarmProcessor(
+                            farm_conn,
+                            master_seq,
+                            farm_no,
+                            locale,
+                        )
+                        result = processor.process(dt_from, dt_to, national_price=national_price)
+                        farm_conn.commit()
+                        return result
                 except Exception as e:
-                    error_cnt += 1
-                    self.logger.error(f"농장 {farm_no} 처리 예외: {e}")
-                    farm_results.append({
+                    self.logger.error(f"농장 {farm_no} 처리 오류: {e}", exc_info=True)
+                    return {
                         'farm_no': farm_no,
                         'status': 'error',
                         'error': str(e),
-                    })
+                    }
 
-        # 6. 마스터 상태 업데이트
-        with self.db.get_connection() as conn:
-            cursor = conn.cursor()
-            try:
-                self._update_master(cursor, master_seq, target_cnt, complete_cnt, error_cnt)
-                conn.commit()
-            finally:
-                cursor.close()
+            # ThreadPoolExecutor로 농장별 병렬 처리
+            self.logger.info(f"농장별 병렬 처리 시작 (workers={max_farm_workers})")
 
-        self.logger.info(f"Python ETL (비동기) 완료: 대상={target_cnt}, 완료={complete_cnt}, 오류={error_cnt}")
+            with ThreadPoolExecutor(max_workers=max_farm_workers) as executor:
+                # 모든 농장에 대해 비동기 작업 제출
+                future_to_farm = {
+                    executor.submit(process_single_farm, farm): farm
+                    for farm in farms
+                }
 
-        return {
-            'status': 'complete' if error_cnt == 0 else 'error',
-            'method': 'python_async',
-            'master_seq': master_seq,
-            'target_cnt': target_cnt,
-            'complete_cnt': complete_cnt,
-            'error_cnt': error_cnt,
-            'farm_results': farm_results,
-        }
+                # 완료된 작업 수집
+                for future in as_completed(future_to_farm):
+                    farm = future_to_farm[future]
+                    farm_no = farm['FARM_NO']
+
+                    try:
+                        result = future.result()
+                        farm_results.append(result)
+
+                        if result.get('status') == 'success':
+                            complete_cnt += 1
+                            self.logger.info(f"농장 {farm_no} 완료")
+                        else:
+                            error_cnt += 1
+                            self.logger.warning(f"농장 {farm_no} 오류: {result.get('error', 'unknown')}")
+
+                    except Exception as e:
+                        error_cnt += 1
+                        self.logger.error(f"농장 {farm_no} 처리 예외: {e}")
+                        farm_results.append({
+                            'farm_no': farm_no,
+                            'status': 'error',
+                            'error': str(e),
+                        })
+
+            # 7. 마스터 상태 업데이트
+            with self.db.get_connection() as conn:
+                cursor = conn.cursor()
+                try:
+                    self._update_master(cursor, master_seq, target_cnt, complete_cnt, error_cnt)
+                    conn.commit()
+                finally:
+                    cursor.close()
+
+            self.logger.info(f"Python ETL (비동기) 완료: 대상={target_cnt}, 완료={complete_cnt}, 오류={error_cnt}")
+
+            return {
+                'status': 'complete' if error_cnt == 0 else 'error',
+                'method': 'python_async',
+                'master_seq': master_seq,
+                'target_cnt': target_cnt,
+                'complete_cnt': complete_cnt,
+                'error_cnt': error_cnt,
+                'farm_results': farm_results,
+            }
+
+        finally:
+            # 장애 발생 시에도 연결 풀 반드시 종료
+            pool_db.close()
+            self.logger.info("연결 풀 종료")
 
     def _get_national_price(self, cursor, dt_from: str, dt_to: str) -> int:
         """전국 탕박 평균 단가 계산"""
