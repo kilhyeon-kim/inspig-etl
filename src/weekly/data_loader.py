@@ -205,23 +205,38 @@ class FarmDataLoader:
     # ========================================================================
 
     def _load_modon_raw(self) -> None:
-        """TB_MODON 모돈 기본 정보 로드 (Oracle 함수 호출 없이)
+        """TB_MODON + TB_MODON_WK 조인하여 모돈 정보 로드
 
-        VW_MODON_2020_MAX_WK_02 뷰의 조건 반영:
-        - IN_DT <= base_date (입사일이 기준일 이전)
-        - OUT_DT IS NULL OR OUT_DT > base_date (출고일이 없거나 기준일 이후)
+        문서 참조: C:\Projects\inspig\docs\db\ref\01.table.md (섹션 7)
+        - TB_MODON: 기본 정보 (PIG_NO, FARM_PIG_NO, IN_DT, OUT_DT 등)
+        - TB_MODON_WK: 작업이력 (SANCHA, GYOBAE_CNT, DAERI_YN 등)
+        - ROW_NUMBER로 마지막 작업 정보 조인
         """
         sql = """
-        SELECT M.MODON_NO, M.MODON_NM, M.FARM_NO, M.SANCHA, M.IN_SANCHA,
-               M.STATUS_CD, M.IN_DT, M.OUT_DT, M.OUT_GUBUN_CD,
-               M.BIRTH_DT, M.GB_SANCHA, M.LAST_GB_DT, M.LAST_BUN_DT,
-               M.DONBANG_CD, M.NOW_DONGHO, M.NOW_BANGHO,
-               M.IN_GYOBAE_CNT, M.DAERI_YN, M.USE_YN
+        SELECT M.PIG_NO AS MODON_NO, M.FARM_PIG_NO AS MODON_NM, M.FARM_NO,
+               NVL(W.SANCHA, M.IN_SANCHA) AS SANCHA, M.IN_SANCHA,
+               M.STATUS_CD, TO_CHAR(M.IN_DT, 'YYYYMMDD') AS IN_DT,
+               TO_CHAR(M.OUT_DT, 'YYYYMMDD') AS OUT_DT, M.OUT_GUBUN_CD,
+               TO_CHAR(M.BIRTH_DT, 'YYYYMMDD') AS BIRTH_DT,
+               NVL(W.GYOBAE_CNT, M.IN_GYOBAE_CNT) AS GB_SANCHA,
+               NULL AS LAST_GB_DT, NULL AS LAST_BUN_DT,
+               W.LOC_CD AS DONBANG_CD, NULL AS NOW_DONGHO, NULL AS NOW_BANGHO,
+               M.IN_GYOBAE_CNT, NVL(W.DAERI_YN, 'N') AS DAERI_YN, M.USE_YN
         FROM TB_MODON M
+        LEFT JOIN (
+            SELECT FARM_NO, PIG_NO, WK_GUBUN, SANCHA, GYOBAE_CNT, LOC_CD, DAERI_YN,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY FARM_NO, PIG_NO
+                       ORDER BY WK_DATE DESC, SEQ DESC
+                   ) RN
+            FROM TB_MODON_WK
+            WHERE USE_YN = 'Y'
+              AND WK_DATE <= TO_DATE(:base_date, 'YYYYMMDD')
+        ) W ON M.FARM_NO = W.FARM_NO AND M.PIG_NO = W.PIG_NO AND W.RN = 1
         WHERE M.FARM_NO = :farm_no
           AND M.USE_YN = 'Y'
-          AND M.IN_DT <= :base_date
-          AND (M.OUT_DT IS NULL OR M.OUT_DT > :base_date)
+          AND M.IN_DT <= TO_DATE(:base_date, 'YYYYMMDD')
+          AND (M.OUT_DT = TO_DATE('99991231', 'YYYYMMDD') OR M.OUT_DT > TO_DATE(:base_date, 'YYYYMMDD'))
         """
         self._data['modon'] = self._fetch_all(sql, {
             'farm_no': self.farm_no,
@@ -230,139 +245,146 @@ class FarmDataLoader:
         self.logger.debug(f"모돈 로드: {len(self._data['modon'])}건")
 
     def _load_modon_wk(self) -> None:
-        """TB_MODON_WK 모돈 작업 이력 로드 (전체 - Python에서 필터링)
+        """TB_MODON_WK 모돈 작업 이력 로드
 
-        작업이력은 연초부터가 아닌 전체를 로드하여 Python에서 MAX(SEQ) 계산
+        문서 참조: C:\Projects\inspig\docs\db\ref\01.table.md
+        컬럼: FARM_NO, PIG_NO, WK_DT, WK_GUBUN, WK_DATE, SANCHA, GYOBAE_CNT,
+              LOC_CD, SAGO_GUBUN_CD, DAERI_YN, SEQ, USE_YN
         """
         sql = """
-        SELECT W.SEQ, W.MODON_NO, W.PIG_NO, W.FARM_NO, W.WK_DT, W.WK_SEQ,
-               W.WK_GUBUN, W.WK_CD,
-               W.SANCHA, W.BUN_DT, W.BUN_SEQ,
-               W.SAGO_GUBUN_CD, W.SAGO_CAUSE_CD,
-               W.ETC_1, W.ETC_2, W.ETC_3, W.ETC_4, W.ETC_5,
-               W.VAL_1, W.VAL_2, W.VAL_3, W.VAL_4, W.VAL_5,
-               W.MEMO, W.USE_YN
+        SELECT W.SEQ, W.PIG_NO AS MODON_NO, W.PIG_NO, W.FARM_NO, W.WK_DT,
+               W.WK_GUBUN, W.SANCHA, W.GYOBAE_CNT,
+               W.LOC_CD, W.SAGO_GUBUN_CD, W.DAERI_YN, W.USE_YN
         FROM TB_MODON_WK W
         WHERE W.FARM_NO = :farm_no
           AND W.USE_YN = 'Y'
-        ORDER BY W.MODON_NO, W.SEQ
+        ORDER BY W.PIG_NO, W.SEQ
         """
         self._data['modon_wk'] = self._fetch_all(sql, {'farm_no': self.farm_no})
         self.logger.debug(f"모돈 작업 이력 로드: {len(self._data['modon_wk'])}건")
 
     def _load_bunman(self) -> None:
-        """TB_BUNMAN 분만 정보 로드"""
+        """TB_BUNMAN 분만 정보 로드
+
+        컬럼: FARM_NO, PIG_NO, WK_DT, WK_GUBUN, SILSAN, MILA, SASAN,
+              BUNMAN_GUBUN_CD, SAENGSI_KG, SILSAN_AM, SILSAN_SU, BIGO, USE_YN
+        """
         sql = """
-        SELECT B.SEQ, B.MODON_NO, B.FARM_NO, B.BUN_DT, B.BUN_SEQ,
-               B.SANCHA, B.GB_SANCHA,
-               B.SILSAN, B.SASAN, B.MUMMY, B.YAKDON, B.KISUNG,
-               B.TOTAL_CNT, B.SUM_WT, B.AVG_WT,
-               B.LAST_GB_DT, B.IMGAE_TERM, B.USE_YN
+        SELECT B.PIG_NO AS MODON_NO, B.FARM_NO, B.WK_DT AS BUN_DT,
+               B.SILSAN, B.SASAN, B.MILA AS MUMMY,
+               (B.SILSAN + B.SASAN + NVL(B.MILA, 0)) AS TOTAL_CNT,
+               B.SAENGSI_KG AS SUM_WT,
+               CASE WHEN B.SILSAN > 0 THEN ROUND(B.SAENGSI_KG / B.SILSAN, 2) ELSE 0 END AS AVG_WT,
+               B.USE_YN
         FROM TB_BUNMAN B
         WHERE B.FARM_NO = :farm_no
           AND B.USE_YN = 'Y'
-        ORDER BY B.MODON_NO, B.BUN_DT, B.BUN_SEQ
+        ORDER BY B.PIG_NO, B.WK_DT
         """
         self._data['bunman'] = self._fetch_all(sql, {'farm_no': self.farm_no})
         self.logger.debug(f"분만 로드: {len(self._data['bunman'])}건")
 
     def _load_eu(self) -> None:
-        """TB_EU 이유 정보 로드"""
+        """TB_EU 이유 정보 로드
+
+        컬럼: FARM_NO, PIG_NO, WK_DT, WK_GUBUN, DUSU, DUSU_SU, ILRYUNG,
+              TOTAL_KG, DAERI_YN, BIGO, USE_YN
+        """
         sql = """
-        SELECT E.SEQ, E.MODON_NO, E.FARM_NO, E.EU_DT, E.EU_SEQ,
-               E.SANCHA, E.EU_CNT, E.EU_WT, E.EU_AVG_WT,
-               E.POYU_DAYS, E.BUN_DT, E.BUN_SEQ,
-               E.SILSAN, E.POYU_START_CNT, E.USE_YN
+        SELECT E.PIG_NO AS MODON_NO, E.FARM_NO, E.WK_DT AS EU_DT,
+               (NVL(E.DUSU, 0) + NVL(E.DUSU_SU, 0)) AS EU_CNT,
+               E.TOTAL_KG AS EU_WT,
+               CASE WHEN (NVL(E.DUSU, 0) + NVL(E.DUSU_SU, 0)) > 0
+                    THEN ROUND(E.TOTAL_KG / (NVL(E.DUSU, 0) + NVL(E.DUSU_SU, 0)), 2)
+                    ELSE 0 END AS EU_AVG_WT,
+               E.ILRYUNG AS POYU_DAYS,
+               E.DAERI_YN, E.USE_YN
         FROM TB_EU E
         WHERE E.FARM_NO = :farm_no
           AND E.USE_YN = 'Y'
-        ORDER BY E.MODON_NO, E.EU_DT, E.EU_SEQ
+        ORDER BY E.PIG_NO, E.WK_DT
         """
         self._data['eu'] = self._fetch_all(sql, {'farm_no': self.farm_no})
         self.logger.debug(f"이유 로드: {len(self._data['eu'])}건")
 
     def _load_sago(self) -> None:
-        """TB_SAGO 사고 정보 로드"""
+        """TB_SAGO 사고 정보 로드
+
+        컬럼: FARM_NO, PIG_NO, WK_DT, WK_GUBUN, SAGO_GUBUN_CD, BIGO, USE_YN
+        """
         sql = """
-        SELECT S.SEQ, S.MODON_NO, S.FARM_NO, S.SAGO_DT, S.SAGO_SEQ,
-               S.SANCHA, S.SAGO_GUBUN_CD, S.SAGO_CAUSE_CD,
-               S.GB_SANCHA, S.LAST_GB_DT,
-               S.MEMO, S.USE_YN
+        SELECT S.PIG_NO AS MODON_NO, S.FARM_NO, S.WK_DT AS SAGO_DT,
+               S.SAGO_GUBUN_CD, S.BIGO AS MEMO, S.USE_YN
         FROM TB_SAGO S
         WHERE S.FARM_NO = :farm_no
           AND S.USE_YN = 'Y'
-        ORDER BY S.MODON_NO, S.SAGO_DT, S.SAGO_SEQ
+        ORDER BY S.PIG_NO, S.WK_DT
         """
         self._data['sago'] = self._fetch_all(sql, {'farm_no': self.farm_no})
         self.logger.debug(f"사고 로드: {len(self._data['sago'])}건")
 
     def _load_jadon_trans(self) -> None:
-        """TB_MODON_JADON_TRANS 자돈 이동 정보 로드"""
+        """TB_MODON_JADON_TRANS 자돈 이동 정보 로드
+
+        컬럼: FARM_NO, PIG_NO, SEQ, SANCHA, GUBUN_CD, SUB_GUBUN_CD, WK_DT,
+              DUSU, DUSU_SU, ILRYUNG, TOTAL_KG, BUN_DT, EU_DT, IO_PIG_NO,
+              LOC_CD, FW_NO, BIGO, USE_YN
+        """
         sql = """
-        SELECT T.SEQ, T.MODON_NO, T.FARM_NO, T.TRANS_DT, T.TRANS_SEQ,
-               T.SANCHA, T.BUN_DT, T.BUN_SEQ,
-               T.TRANS_GUBUN_CD, T.TRANS_CNT, T.USE_YN
+        SELECT T.SEQ, T.PIG_NO AS MODON_NO, T.FARM_NO, TO_CHAR(T.WK_DT, 'YYYYMMDD') AS TRANS_DT,
+               T.SANCHA, TO_CHAR(T.BUN_DT, 'YYYYMMDD') AS BUN_DT, T.GUBUN_CD AS TRANS_GUBUN_CD,
+               (NVL(T.DUSU, 0) + NVL(T.DUSU_SU, 0)) AS TRANS_CNT,
+               T.USE_YN
         FROM TB_MODON_JADON_TRANS T
         WHERE T.FARM_NO = :farm_no
           AND T.USE_YN = 'Y'
-        ORDER BY T.MODON_NO, T.TRANS_DT, T.TRANS_SEQ
+        ORDER BY T.PIG_NO, T.WK_DT, T.SEQ
         """
         self._data['jadon_trans'] = self._fetch_all(sql, {'farm_no': self.farm_no})
         self.logger.debug(f"자돈 이동 로드: {len(self._data['jadon_trans'])}건")
 
     def _load_gb(self) -> None:
-        """TB_MODON_GB, TB_MODON_GB_DETAIL 교배 정보 로드"""
-        # 교배 메인
+        """TB_GYOBAE 교배 정보 로드
+
+        컬럼: FARM_NO, PIG_NO, WK_DT, WK_GUBUN, METHOD_1~3, UNGDON_PIG_NO_1~3,
+              UFARM_PIG_NO_1~3, WK_PERSON_CD, BIGO, USE_YN
+        """
         sql = """
-        SELECT G.SEQ, G.MODON_NO, G.FARM_NO, G.SANCHA, G.GB_SANCHA,
-               G.GB_DT, G.LAST_GB_DT, G.GB_GUBUN_CD,
-               G.STATUS_CD, G.RESULT_CD,
-               G.JAGUNG_TYPE, G.GB_TYPE, G.MEMO, G.USE_YN
-        FROM TB_MODON_GB G
+        SELECT G.PIG_NO AS MODON_NO, G.FARM_NO, G.WK_DT AS GB_DT,
+               G.METHOD_1, G.UNGDON_PIG_NO_1, G.UNGDON_PIG_NO_2, G.UNGDON_PIG_NO_3,
+               G.USE_YN
+        FROM TB_GYOBAE G
         WHERE G.FARM_NO = :farm_no
           AND G.USE_YN = 'Y'
-        ORDER BY G.MODON_NO, G.SANCHA, G.GB_DT
+        ORDER BY G.PIG_NO, G.WK_DT
         """
         self._data['gb'] = self._fetch_all(sql, {'farm_no': self.farm_no})
         self.logger.debug(f"교배 로드: {len(self._data['gb'])}건")
 
-        # 교배 상세 (웅돈 정보)
-        sql = """
-        SELECT D.SEQ, D.MODON_NO, D.FARM_NO, D.SANCHA,
-               D.GB_DT, D.GB_SEQ, D.GB_GUBUN_CD,
-               D.WOONGDON_NO, D.GB_TIME, D.USE_YN
-        FROM TB_MODON_GB_DETAIL D
-        WHERE D.FARM_NO = :farm_no
-          AND D.USE_YN = 'Y'
-        ORDER BY D.MODON_NO, D.SANCHA, D.GB_DT, D.GB_SEQ
-        """
-        self._data['gb_detail'] = self._fetch_all(sql, {'farm_no': self.farm_no})
-        self.logger.debug(f"교배 상세 로드: {len(self._data['gb_detail'])}건")
+        # TB_GYOBAE는 상세 테이블이 없으므로 빈 리스트
+        self._data['gb_detail'] = []
+        self.logger.debug(f"교배 상세: TB_GYOBAE에 통합됨")
 
     def _load_lpd(self) -> None:
-        """TM_LPD_DATA 측정 데이터 로드 - 출하 데이터 포함
+        """TM_LPD_DATA 출하 데이터 로드
 
-        출하 프로세서에서 사용하는 필드 추가:
-        - DOCHUK_DT: 도축일
-        - DOCHUK_KG: 도축 중량
-        - GYEOK_AUCTAMT: 경매가
-        - GYEOK_GRADE: 등급
+        컬럼: FARM_NO, DOCHUK_DT, DOCHUK_NO, FACTORY_CD, SEX_GUBUN, NET_KG,
+              BACK_DEPTH, MEAT_QUALITY, AU_PRICE, USE_YN
         """
         sql = """
-        SELECT L.SEQ, L.MODON_NO, L.FARM_NO, L.MEAS_DT,
-               L.LPD_VAL, L.MEAS_TYPE,
-               L.DOCHUK_DT, L.DOCHUK_KG, L.GYEOK_AUCTAMT, L.GYEOK_GRADE,
-               L.USE_YN
+        SELECT L.SEQ, L.FARM_NO, L.DOCHUK_DT, L.DOCHUK_NO,
+               L.NET_KG, L.BACK_DEPTH, L.MEAT_QUALITY,
+               L.AU_PRICE, L.SEX_GUBUN, L.USE_YN
         FROM TM_LPD_DATA L
         WHERE L.FARM_NO = :farm_no
           AND L.USE_YN = 'Y'
-        ORDER BY L.MODON_NO, L.MEAS_DT
+        ORDER BY L.DOCHUK_DT
         """
         self._data['lpd'] = self._fetch_all(sql, {'farm_no': self.farm_no})
         self.logger.debug(f"LPD 로드: {len(self._data['lpd'])}건")
 
     def _load_farm_config(self) -> None:
-        """농장 설정값 로드"""
+        """농장 정보 로드"""
         sql = """
         SELECT F.FARM_NO, F.FARM_NM, F.PRINCIPAL_NM, F.SIGUN_CD,
                NVL(F.COUNTRY_CODE, 'KOR') AS LOCALE,
@@ -373,15 +395,15 @@ class FarmDataLoader:
         farms = self._fetch_all(sql, {'farm_no': self.farm_no})
         self._data['farm_config'] = farms[0] if farms else {}
 
-        # 농장 기본 설정값 로드
+        # 농장 기본 설정값 로드 (TC_FARM_CONFIG)
         sql = """
-        SELECT S.SET_CD, S.SET_VAL
-        FROM TS_FARM_SETTING S
-        WHERE S.FARM_NO = :farm_no
-          AND S.USE_YN = 'Y'
+        SELECT C.CODE, C.CVALUE
+        FROM TC_FARM_CONFIG C
+        WHERE C.FARM_NO = :farm_no
+          AND C.USE_YN = 'Y'
         """
         settings = self._fetch_all(sql, {'farm_no': self.farm_no})
-        self._data['farm_settings'] = {s['SET_CD']: s['SET_VAL'] for s in settings}
+        self._data['farm_settings'] = {s['CODE']: s['CVALUE'] for s in settings}
 
         self.logger.debug(f"농장 설정 로드: {len(self._data['farm_settings'])}건")
 

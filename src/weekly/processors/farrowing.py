@@ -114,13 +114,13 @@ class FarrowingProcessor(BaseProcessor):
         # 분만 통계 집계 (WITH절로 자돈 증감 사전 집계)
         sql = """
         WITH JADON_POGAE_AGG AS (
-            SELECT JT.FARM_NO, JT.PIG_NO, JT.BUN_DT,
+            SELECT JT.FARM_NO, JT.PIG_NO, TO_CHAR(JT.BUN_DT, 'YYYYMMDD') AS BUN_DT,
                    SUM(CASE WHEN JT.GUBUN_CD = '160001' THEN NVL(JT.DUSU,0)+NVL(JT.DUSU_SU,0) ELSE 0 END) AS PS_DS,
                    SUM(CASE WHEN JT.GUBUN_CD = '160003' THEN NVL(JT.DUSU,0)+NVL(JT.DUSU_SU,0) ELSE 0 END) AS JI_DS,
                    SUM(CASE WHEN JT.GUBUN_CD = '160004' THEN NVL(JT.DUSU,0)+NVL(JT.DUSU_SU,0) ELSE 0 END) AS JC_DS
             FROM TB_MODON_JADON_TRANS JT
             WHERE JT.FARM_NO = :farm_no AND JT.USE_YN = 'Y'
-            GROUP BY JT.FARM_NO, JT.PIG_NO, JT.BUN_DT
+            GROUP BY JT.FARM_NO, JT.PIG_NO, TO_CHAR(JT.BUN_DT, 'YYYYMMDD')
         )
         SELECT
             COUNT(*),
@@ -178,7 +178,17 @@ class FarrowingProcessor(BaseProcessor):
             'master_seq': self.master_seq,
             'farm_no': self.farm_no,
             'plan_bm': plan_bm,
-            **stats,
+            'total_cnt': stats.get('total_cnt', 0),
+            'sum_total': stats.get('sum_total', 0),
+            'sum_live': stats.get('sum_live', 0),
+            'sum_dead': stats.get('sum_dead', 0),
+            'sum_mummy': stats.get('sum_mummy', 0),
+            'sum_pogae': stats.get('sum_pogae', 0),
+            'avg_total': stats.get('avg_total', 0),
+            'avg_live': stats.get('avg_live', 0),
+            'avg_dead': stats.get('avg_dead', 0),
+            'avg_mummy': stats.get('avg_mummy', 0),
+            'avg_pogae': stats.get('avg_pogae', 0),
         })
 
         return stats
@@ -204,6 +214,16 @@ class FarrowingProcessor(BaseProcessor):
         self.execute(sql, {
             'master_seq': self.master_seq,
             'farm_no': self.farm_no,
-            **stats,
-            **acc_stats,
+            'total_cnt': stats.get('total_cnt', 0),
+            'sum_total': stats.get('sum_total', 0),
+            'sum_live': stats.get('sum_live', 0),
+            'sum_dead': stats.get('sum_dead', 0),
+            'sum_mummy': stats.get('sum_mummy', 0),
+            'avg_total': stats.get('avg_total', 0),
+            'avg_live': stats.get('avg_live', 0),
+            'acc_bm_cnt': acc_stats.get('acc_bm_cnt', 0),
+            'acc_total': acc_stats.get('acc_total', 0),
+            'acc_live': acc_stats.get('acc_live', 0),
+            'acc_avg_total': acc_stats.get('acc_avg_total', 0),
+            'acc_avg_live': acc_stats.get('acc_avg_live', 0),
         })

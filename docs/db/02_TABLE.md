@@ -1,0 +1,382 @@
+# ETL 테이블 정의
+
+> InsightPig ETL 주간/월간/분기 리포트용 테이블
+
+---
+
+## 테이블 목록
+
+| 테이블명 | 설명 | 용도 |
+|----------|------|------|
+| TA_SYS_CONFIG | 시스템 설정 | ETL 스케줄 실행 여부 설정 |
+| TS_INS_SERVICE | 서비스 신청 | 농장별 서비스 신청 정보 |
+| TS_INS_MASTER | 리포트 마스터 | 리포트 생성 배치 정보 |
+| TS_INS_JOB_LOG | 스케줄러 로그 | 프로시저 실행 로그 |
+| TS_INS_WEEK | 주간 리포트 | 농장별 주간 리포트 데이터 |
+| TS_INS_WEEK_SUB | 리포트 상세 | 팝업/상세 데이터 |
+| TS_INS_MGMT | 관리포인트 | 주요 포인트/추천 콘텐츠 |
+| TS_INS_ACCESS_LOG | 접속 로그 | 사용자 접속 로그 |
+| TM_WEATHER | 날씨 정보 | 기상청 API 데이터 |
+| TS_PSY_DELAY_HEATMAP | PSY 히트맵 | 농장 분포 히트맵 |
+
+---
+
+## 시간 저장 원칙
+
+- **저장**: UTC (SYSDATE) - 글로벌 표준시간
+- **계산/비교**: `SF_GET_LOCALE_VW_DATE_2022(LOCALE, SYSDATE)`
+  - `KOR`: 한국 +09:00
+  - `VNM`: 베트남 +07:00
+
+---
+
+## 1. TA_SYS_CONFIG (시스템 설정)
+
+```sql
+CREATE TABLE TA_SYS_CONFIG (
+    SEQ             NUMBER DEFAULT 1,           -- 일련번호 (항상 1)
+    MODON_HIST_YN   VARCHAR2(1) DEFAULT 'N',    -- 모돈이력제 연계여부
+    EKAPE_YN        VARCHAR2(1) DEFAULT 'N',    -- 축평원 연계여부
+    INS_SCHEDULE_YN VARCHAR2(1) DEFAULT 'Y',    -- ETL 스케줄 실행여부
+    LOG_INS_DT      DATE DEFAULT SYSDATE,
+    LOG_UPT_DT      DATE DEFAULT SYSDATE,
+    CONSTRAINT PK_TA_SYS_CONFIG PRIMARY KEY (SEQ)
+);
+
+-- 초기 데이터
+INSERT INTO TA_SYS_CONFIG (SEQ, INS_SCHEDULE_YN) VALUES (1, 'Y');
+```
+
+---
+
+## 2. TS_INS_SERVICE (서비스 신청)
+
+```sql
+CREATE TABLE TS_INS_SERVICE (
+    FARM_NO         INTEGER NOT NULL,           -- 농장번호 (PK, FK)
+    INSPIG_YN       VARCHAR2(1) DEFAULT 'N',    -- 서비스 신청여부
+    INSPIG_REG_DT   VARCHAR2(8),                -- 신청일 (YYYYMMDD)
+    INSPIG_FROM_DT  VARCHAR2(8),                -- 시작일 (YYYYMMDD)
+    INSPIG_TO_DT    VARCHAR2(8),                -- 종료일 (YYYYMMDD)
+    INSPIG_STOP_DT  VARCHAR2(8),                -- 중단일 (YYYYMMDD)
+    WEB_PAY_YN      VARCHAR2(1) DEFAULT 'N',    -- 웹결재 여부
+    REG_TYPE        VARCHAR2(10) DEFAULT 'AUTO', -- AUTO/MANUAL
+    USE_YN          VARCHAR2(1) DEFAULT 'Y',
+    LOG_INS_DT      DATE DEFAULT SYSDATE,
+    LOG_UPT_DT      DATE DEFAULT SYSDATE,
+    CONSTRAINT PK_TS_INS_SERVICE PRIMARY KEY (FARM_NO)
+);
+```
+
+### REG_TYPE 값
+
+| 값 | 설명 |
+|----|------|
+| AUTO | 정기 스케줄 대상 (기본값) |
+| MANUAL | 수동 등록 (테스트/개별 실행) |
+
+---
+
+## 3. TS_INS_MASTER (리포트 마스터)
+
+```sql
+CREATE TABLE TS_INS_MASTER (
+    SEQ             NUMBER NOT NULL,            -- 일련번호 (PK)
+    DAY_GB          VARCHAR2(10) NOT NULL,      -- WEEK/MON/QT
+    INS_DT          CHAR(8) NOT NULL,           -- 생성기준일 (YYYYMMDD)
+
+    -- 기간 정보
+    REPORT_YEAR     NUMBER(4) NOT NULL,         -- 년도
+    REPORT_WEEK_NO  NUMBER(2) NOT NULL,         -- 주차(1~53)/월(1~12)
+    DT_FROM         VARCHAR2(8) NOT NULL,       -- 시작일 (YYYYMMDD)
+    DT_TO           VARCHAR2(8) NOT NULL,       -- 종료일 (YYYYMMDD)
+
+    -- 실행 현황
+    TARGET_CNT      INTEGER DEFAULT 0,          -- 대상 농장수
+    COMPLETE_CNT    INTEGER DEFAULT 0,          -- 완료 농장수
+    ERROR_CNT       INTEGER DEFAULT 0,          -- 오류 농장수
+
+    -- 상태
+    STATUS_CD       VARCHAR2(10) DEFAULT 'READY', -- READY/RUNNING/COMPLETE/ERROR
+    START_DT        DATE,                       -- 시작일시
+    END_DT          DATE,                       -- 종료일시
+    ELAPSED_SEC     INTEGER DEFAULT 0,          -- 소요시간(초)
+
+    LOG_INS_DT      DATE DEFAULT SYSDATE,
+    CONSTRAINT PK_TS_INS_MASTER PRIMARY KEY (SEQ)
+);
+
+-- 인덱스
+CREATE UNIQUE INDEX UK_TS_INS_MASTER_01 ON TS_INS_MASTER(DAY_GB, REPORT_YEAR, REPORT_WEEK_NO);
+CREATE INDEX IDX_TS_INS_MASTER_01 ON TS_INS_MASTER(DAY_GB, INS_DT);
+CREATE INDEX IDX_TS_INS_MASTER_02 ON TS_INS_MASTER(STATUS_CD);
+```
+
+### DAY_GB 값
+
+| 값 | 설명 |
+|----|------|
+| WEEK | 주간 리포트 |
+| MON | 월간 리포트 |
+| QT | 분기 리포트 |
+
+---
+
+## 4. TS_INS_JOB_LOG (스케줄러 로그)
+
+```sql
+CREATE TABLE TS_INS_JOB_LOG (
+    SEQ             NUMBER NOT NULL,            -- 일련번호 (PK)
+    MASTER_SEQ      NUMBER,                     -- FK (NULL 허용)
+    JOB_NM          VARCHAR2(50) NOT NULL,      -- JOB 이름
+    PROC_NM         VARCHAR2(50) NOT NULL,      -- 프로시저명
+    FARM_NO         INTEGER,                    -- 농장번호 (NULL=전체)
+
+    -- 리포트 정보
+    DAY_GB          VARCHAR2(10),               -- WEEK/MON/QT
+    REPORT_YEAR     NUMBER(4),
+    REPORT_WEEK_NO  NUMBER(2),
+
+    -- 실행 상태
+    STATUS_CD       VARCHAR2(10) DEFAULT 'RUNNING', -- RUNNING/SUCCESS/ERROR
+    START_DT        DATE NOT NULL,
+    END_DT          DATE,
+    ELAPSED_MS      INTEGER DEFAULT 0,          -- 소요시간(ms)
+
+    -- 처리 결과
+    PROC_CNT        INTEGER DEFAULT 0,          -- 처리 건수
+    ERROR_CD        VARCHAR2(20),
+    ERROR_MSG       VARCHAR2(4000),
+
+    LOG_INS_DT      DATE DEFAULT SYSDATE,
+    CONSTRAINT PK_TS_INS_JOB_LOG PRIMARY KEY (SEQ)
+);
+
+-- 인덱스
+CREATE INDEX IDX_TS_INS_JOB_LOG_01 ON TS_INS_JOB_LOG(MASTER_SEQ);
+CREATE INDEX IDX_TS_INS_JOB_LOG_02 ON TS_INS_JOB_LOG(JOB_NM, START_DT);
+CREATE INDEX IDX_TS_INS_JOB_LOG_03 ON TS_INS_JOB_LOG(STATUS_CD, START_DT);
+CREATE INDEX IDX_TS_INS_JOB_LOG_04 ON TS_INS_JOB_LOG(MASTER_SEQ, FARM_NO, STATUS_CD);
+CREATE INDEX IDX_TS_INS_JOB_LOG_05 ON TS_INS_JOB_LOG(DAY_GB, REPORT_YEAR, REPORT_WEEK_NO);
+```
+
+### 보관 정책
+
+- 6개월 보관, 이전 로그 자동 삭제
+
+---
+
+## 5. TS_INS_WEEK (주간 리포트)
+
+```sql
+CREATE TABLE TS_INS_WEEK (
+    MASTER_SEQ      NUMBER NOT NULL,            -- FK → TS_INS_MASTER
+    FARM_NO         INTEGER NOT NULL,           -- FK → TS_INS_SERVICE
+
+    -- 기간 정보
+    REPORT_YEAR     NUMBER(4),
+    REPORT_WEEK_NO  NUMBER(2),
+    DT_FROM         VARCHAR2(8),
+    DT_TO           VARCHAR2(8),
+
+    -- 헤더 정보
+    FARM_NM         VARCHAR2(100),              -- 농장명
+    OWNER_NM        VARCHAR2(50),               -- 대표자명
+    SIGUNGU_CD      VARCHAR2(10),               -- 시군구코드 (날씨용)
+
+    -- 모돈 현황
+    MODON_REG_CNT   INTEGER DEFAULT 0,          -- 현재모돈수
+    MODON_REG_CHG   INTEGER DEFAULT 0,          -- 증감
+    MODON_SANGSI_CNT INTEGER DEFAULT 0,         -- 상시모돈수
+    MODON_SANGSI_CHG INTEGER DEFAULT 0,         -- 증감
+
+    -- 관리대상 모돈 (alertMd)
+    ALERT_TOTAL     INTEGER DEFAULT 0,
+    ALERT_HUBO      INTEGER DEFAULT 0,          -- 미교배 후보돈
+    ALERT_EU_MI     INTEGER DEFAULT 0,          -- 이유후 미교배
+    ALERT_SG_MI     INTEGER DEFAULT 0,          -- 사고후 미교배
+    ALERT_BM_DELAY  INTEGER DEFAULT 0,          -- 분만지연
+    ALERT_EU_DELAY  INTEGER DEFAULT 0,          -- 이유지연
+
+    -- 지난주 교배 (lastWeek.mating)
+    LAST_GB_CNT     INTEGER DEFAULT 0,          -- 교배 복수
+    LAST_GB_SUM     INTEGER DEFAULT 0,          -- 누계
+
+    -- 지난주 분만 (lastWeek.farrowing)
+    LAST_BM_CNT     INTEGER DEFAULT 0,          -- 분만 복수
+    LAST_BM_TOTAL   INTEGER DEFAULT 0,          -- 총산자수
+    LAST_BM_LIVE    INTEGER DEFAULT 0,          -- 실산자수
+    LAST_BM_DEAD    INTEGER DEFAULT 0,          -- 사산
+    LAST_BM_MUMMY   INTEGER DEFAULT 0,          -- 미라
+    LAST_BM_SUM_CNT INTEGER DEFAULT 0,          -- 누계 복수
+    LAST_BM_SUM_TOTAL INTEGER DEFAULT 0,        -- 총산 누계
+    LAST_BM_SUM_LIVE INTEGER DEFAULT 0,         -- 실산 누계
+    LAST_BM_AVG_TOTAL NUMBER(5,1) DEFAULT 0,    -- 총산 평균
+    LAST_BM_AVG_LIVE NUMBER(5,1) DEFAULT 0,     -- 실산 평균
+    LAST_BM_SUM_AVG_TOTAL NUMBER(5,1) DEFAULT 0,
+    LAST_BM_SUM_AVG_LIVE NUMBER(5,1) DEFAULT 0,
+
+    -- 지난주 이유 (lastWeek.weaning)
+    LAST_EU_CNT     INTEGER DEFAULT 0,          -- 이유 복수
+    LAST_EU_JD_CNT  INTEGER DEFAULT 0,          -- 이유자돈수
+    LAST_EU_AVG_JD  NUMBER(5,1) DEFAULT 0,      -- 평균 이유두수
+    LAST_EU_AVG_KG  NUMBER(5,1) DEFAULT 0,      -- 평균체중
+    LAST_EU_SUM_CNT INTEGER DEFAULT 0,
+    LAST_EU_SUM_JD  INTEGER DEFAULT 0,
+    LAST_EU_SUM_AVG_JD NUMBER(5,1) DEFAULT 0,
+
+    -- 지난주 사고 (lastWeek.accident)
+    LAST_SG_CNT     INTEGER DEFAULT 0,
+    LAST_SG_AVG_GYUNGIL NUMBER(5,1) DEFAULT 0,
+    LAST_SG_SUM     INTEGER DEFAULT 0,
+    LAST_SG_SUM_AVG_GYUNGIL NUMBER(5,1) DEFAULT 0,
+
+    -- 지난주 도폐 (lastWeek.culling)
+    LAST_CL_CNT     INTEGER DEFAULT 0,
+    LAST_CL_SUM     INTEGER DEFAULT 0,
+
+    -- 지난주 출하 (lastWeek.shipment)
+    LAST_SH_CNT     INTEGER DEFAULT 0,
+    LAST_SH_AVG_KG  NUMBER(5,1) DEFAULT 0,
+    LAST_SH_SUM     INTEGER DEFAULT 0,
+    LAST_SH_AVG_SUM NUMBER(5,1) DEFAULT 0,
+
+    -- 금주 예정 (thisWeek)
+    THIS_GB_SUM     INTEGER DEFAULT 0,          -- 교배 예정
+    THIS_IMSIN_SUM  INTEGER DEFAULT 0,          -- 임신확인 예정
+    THIS_BM_SUM     INTEGER DEFAULT 0,          -- 분만 예정
+    THIS_EU_SUM     INTEGER DEFAULT 0,          -- 이유 예정
+    THIS_VACCINE_SUM INTEGER DEFAULT 0,         -- 백신 예정
+    THIS_SHIP_SUM   INTEGER DEFAULT 0,          -- 출하 예정
+
+    -- KPI
+    KPI_PSY         NUMBER(5,1) DEFAULT 0,
+    KPI_DELAY_DAY   INTEGER DEFAULT 0,          -- 입력지연일
+    PSY_X           INTEGER DEFAULT 0,
+    PSY_Y           INTEGER DEFAULT 0,
+    PSY_ZONE        VARCHAR2(10),               -- 1A~4D
+
+    -- 상태
+    STATUS_CD       VARCHAR2(10) DEFAULT 'READY',
+
+    -- 공유 토큰
+    SHARE_TOKEN     VARCHAR2(64),               -- SHA256 (64자)
+    TOKEN_EXPIRE_DT VARCHAR2(8),                -- 만료일
+
+    LOG_INS_DT      DATE DEFAULT SYSDATE,
+    CONSTRAINT PK_TS_INS_WEEK PRIMARY KEY (MASTER_SEQ, FARM_NO)
+);
+
+-- 인덱스
+CREATE INDEX IDX_TS_INS_WEEK_01 ON TS_INS_WEEK(FARM_NO, MASTER_SEQ);
+CREATE INDEX IDX_TS_INS_WEEK_02 ON TS_INS_WEEK(FARM_NO, REPORT_YEAR, REPORT_WEEK_NO);
+CREATE UNIQUE INDEX UK_TS_INS_WEEK_TOKEN ON TS_INS_WEEK(SHARE_TOKEN);
+```
+
+---
+
+## 6. TS_INS_WEEK_SUB (리포트 상세)
+
+팝업/섹션별 상세 데이터 저장
+
+```sql
+CREATE TABLE TS_INS_WEEK_SUB (
+    MASTER_SEQ      NUMBER NOT NULL,
+    FARM_NO         INTEGER NOT NULL,
+    GUBUN           VARCHAR2(20) NOT NULL,      -- 데이터 구분
+    SUB_GUBUN       VARCHAR2(20) DEFAULT '-',   -- 세부 구분
+    SORT_NO         INTEGER DEFAULT 0,          -- 정렬순서
+
+    -- 코드
+    CODE_1          VARCHAR2(30),               -- 1차 구분코드
+    CODE_2          VARCHAR2(30),               -- 2차 구분코드
+
+    -- 숫자형 (CNT_1 ~ CNT_15)
+    CNT_1 ~ CNT_15  NUMBER(10,2) DEFAULT 0,
+
+    -- 수치형 (VAL_1 ~ VAL_15)
+    VAL_1 ~ VAL_15  NUMBER(10,2) DEFAULT 0,
+
+    -- 문자형 (STR_1 ~ STR_15)
+    STR_1 ~ STR_15  VARCHAR2(1000),
+
+    LOG_INS_DT      DATE DEFAULT SYSDATE,
+    CONSTRAINT PK_TS_INS_WEEK_SUB PRIMARY KEY (MASTER_SEQ, FARM_NO, GUBUN, SUB_GUBUN, SORT_NO)
+);
+```
+
+### GUBUN 값
+
+| 값 | 설명 | 내용 |
+|----|------|------|
+| MODON | 모돈현황 팝업 | 산차별 현황 |
+| ALERT | 관리대상 팝업 | 미교배/지연 모돈 목록 |
+| GB | 교배 팝업 | 교배 통계/목록 |
+| BM | 분만 팝업 | 분만 통계/목록 |
+| EU | 이유 팝업 | 이유 통계/목록 |
+| SG | 임신사고 팝업 | 사고 통계/목록 |
+| DOPE | 도폐 팝업 | 도폐 통계/목록 |
+| SHIP | 출하 팝업 | 출하 통계/목록 |
+| SCHEDULE | 예정 캘린더 | 일별 예정 작업 |
+
+### SUB_GUBUN 값
+
+| 값 | 설명 |
+|----|------|
+| STAT | 요약 통계 |
+| LIST | 목록 데이터 |
+| CHART | 차트 데이터 |
+| ROW | 행 데이터 |
+
+---
+
+## 7. 부가 테이블
+
+### TM_WEATHER (날씨)
+
+```sql
+CREATE TABLE TM_WEATHER (
+    SEQ             NUMBER NOT NULL,
+    WK_DATE         VARCHAR2(8) NOT NULL,       -- YYYYMMDD
+    SIGUNGU_CD      VARCHAR2(10) NOT NULL,      -- 시군구코드
+    SIGUNGU_NM      VARCHAR2(100),
+    NX              INTEGER NOT NULL,           -- 격자 X
+    NY              INTEGER NOT NULL,           -- 격자 Y
+    WEATHER_CD      VARCHAR2(20),               -- sunny/cloudy/rainy/snow
+    TEMP_HIGH       NUMBER(4,1),
+    TEMP_LOW        NUMBER(4,1),
+    RAIN_PROB       INTEGER DEFAULT 0,
+    HUMIDITY        INTEGER,
+    WIND_SPEED      NUMBER(4,1),
+    LOG_INS_DT      DATE DEFAULT SYSDATE,
+    CONSTRAINT PK_TM_WEATHER PRIMARY KEY (SEQ)
+);
+
+CREATE UNIQUE INDEX UK_TM_WEATHER_01 ON TM_WEATHER(SIGUNGU_CD, WK_DATE);
+```
+
+### TS_PSY_DELAY_HEATMAP (히트맵)
+
+```sql
+CREATE TABLE TS_PSY_DELAY_HEATMAP (
+    MASTER_SEQ      NUMBER NOT NULL,
+    X_POS           INTEGER NOT NULL,           -- 0~3: 입력지연일 구간
+    Y_POS           INTEGER NOT NULL,           -- 0~3: PSY 구간
+    ZONE_CD         VARCHAR2(10),               -- 1A~4D
+    FARM_CNT        INTEGER DEFAULT 0,
+    LOG_INS_DT      DATE DEFAULT SYSDATE,
+    CONSTRAINT PK_TS_PSY_DELAY_HEATMAP PRIMARY KEY (MASTER_SEQ, X_POS, Y_POS)
+);
+```
+
+---
+
+## 성능 최적화 인덱스 (운영 DB)
+
+```sql
+-- TM_LPD_DATA (약 1,000만 건) - 출하 조회용
+CREATE INDEX IDX_TM_LPD_DATA_INS_01 ON TM_LPD_DATA (FARM_NO, DOCHUK_DT);
+
+-- TB_EU (약 1,100만 건) - 이유 조회용
+CREATE INDEX IDX_TB_EU_INS_01 ON TB_EU (FARM_NO, WK_DT);
+```

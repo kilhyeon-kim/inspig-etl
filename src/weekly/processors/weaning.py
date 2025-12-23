@@ -119,23 +119,23 @@ class WeaningProcessor(BaseProcessor):
         sql = """
         WITH
         JADON_TRANS_AGG AS (
-            SELECT JT.FARM_NO, JT.PIG_NO, JT.SANCHA, JT.WK_DT,
+            SELECT JT.FARM_NO, JT.PIG_NO, JT.SANCHA, TO_CHAR(JT.WK_DT, 'YYYYMMDD') AS WK_DT,
                    SUM(CASE WHEN JT.GUBUN_CD = '160001' THEN NVL(JT.DUSU,0)+NVL(JT.DUSU_SU,0) ELSE 0 END) AS PS_DS,
                    SUM(CASE WHEN JT.GUBUN_CD = '160002' THEN NVL(JT.DUSU,0)+NVL(JT.DUSU_SU,0) ELSE 0 END) AS BB_DS,
                    SUM(CASE WHEN JT.GUBUN_CD = '160003' THEN NVL(JT.DUSU,0)+NVL(JT.DUSU_SU,0) ELSE 0 END) AS JI_DS,
                    SUM(CASE WHEN JT.GUBUN_CD = '160004' THEN NVL(JT.DUSU,0)+NVL(JT.DUSU_SU,0) ELSE 0 END) AS JC_DS
             FROM TB_MODON_JADON_TRANS JT
             WHERE JT.FARM_NO = :farm_no AND JT.USE_YN = 'Y'
-            GROUP BY JT.FARM_NO, JT.PIG_NO, JT.SANCHA, JT.WK_DT
+            GROUP BY JT.FARM_NO, JT.PIG_NO, JT.SANCHA, TO_CHAR(JT.WK_DT, 'YYYYMMDD')
         ),
         JADON_POGAE_AGG AS (
-            SELECT JT.FARM_NO, JT.PIG_NO, JT.BUN_DT,
+            SELECT JT.FARM_NO, JT.PIG_NO, TO_CHAR(JT.BUN_DT, 'YYYYMMDD') AS BUN_DT,
                    SUM(CASE WHEN JT.GUBUN_CD = '160001' THEN NVL(JT.DUSU,0)+NVL(JT.DUSU_SU,0) ELSE 0 END) AS PS_DS,
                    SUM(CASE WHEN JT.GUBUN_CD = '160003' THEN NVL(JT.DUSU,0)+NVL(JT.DUSU_SU,0) ELSE 0 END) AS JI_DS,
                    SUM(CASE WHEN JT.GUBUN_CD = '160004' THEN NVL(JT.DUSU,0)+NVL(JT.DUSU_SU,0) ELSE 0 END) AS JC_DS
             FROM TB_MODON_JADON_TRANS JT
             WHERE JT.FARM_NO = :farm_no AND JT.USE_YN = 'Y'
-            GROUP BY JT.FARM_NO, JT.PIG_NO, JT.BUN_DT
+            GROUP BY JT.FARM_NO, JT.PIG_NO, TO_CHAR(JT.BUN_DT, 'YYYYMMDD')
         ),
         NEXT_WK AS (
             SELECT FARM_NO, PIG_NO, WK_DT AS CUR_WK_DT,
@@ -171,7 +171,8 @@ class WeaningProcessor(BaseProcessor):
                 ON JT.FARM_NO = A.FARM_NO AND JT.PIG_NO = A.PIG_NO AND JT.SANCHA = A.SANCHA
                AND JT.WK_DT >= B.WK_DT
                AND JT.WK_DT <= CASE WHEN NW.NEXT_WK_GUBUN = 'G' THEN NW.NEXT_WK_DT
-                                    WHEN NW.NEXT_WK_DT IS NULL AND A.DAERI_YN = 'N' THEN :dt_to
+                                    WHEN NW.NEXT_WK_DT IS NULL AND NVL(A.DAERI_YN, 'N') = 'N' THEN :dt_to
+                                    WHEN A.WK_DT IS NULL OR LENGTH(TRIM(A.WK_DT)) != 8 THEN :dt_to
                                     ELSE TO_CHAR(TO_DATE(A.WK_DT, 'YYYYMMDD') - 1, 'YYYYMMDD') END
             WHERE A.FARM_NO = :farm_no
               AND A.WK_GUBUN = 'E'
@@ -185,10 +186,14 @@ class WeaningProcessor(BaseProcessor):
             NVL(SUM(NVL(D.DUSU, 0) + NVL(D.DUSU_SU, 0)), 0),
             NVL(SUM(NVL(E.SILSAN, 0) + NVL(E.SASAN, 0) + NVL(E.MILA, 0)), 0),
             NVL(SUM(NVL(E.SILSAN, 0)), 0),
-            NVL(SUM(TO_DATE(A.WK_DT, 'YYYYMMDD') - TO_DATE(B.WK_DT, 'YYYYMMDD')), 0),
+            NVL(SUM(CASE WHEN A.WK_DT IS NOT NULL AND B.WK_DT IS NOT NULL
+                         AND LENGTH(TRIM(A.WK_DT)) = 8 AND LENGTH(TRIM(B.WK_DT)) = 8
+                         THEN TO_DATE(A.WK_DT, 'YYYYMMDD') - TO_DATE(B.WK_DT, 'YYYYMMDD') ELSE 0 END), 0),
             NVL(SUM(NVL(D.TOTAL_KG, 0)), 0),
             NVL(ROUND(AVG(NVL(D.DUSU, 0) + NVL(D.DUSU_SU, 0)), 1), 0),
-            NVL(ROUND(AVG(TO_DATE(A.WK_DT, 'YYYYMMDD') - TO_DATE(B.WK_DT, 'YYYYMMDD')), 1), 0),
+            NVL(ROUND(AVG(CASE WHEN A.WK_DT IS NOT NULL AND B.WK_DT IS NOT NULL
+                               AND LENGTH(TRIM(A.WK_DT)) = 8 AND LENGTH(TRIM(B.WK_DT)) = 8
+                               THEN TO_DATE(A.WK_DT, 'YYYYMMDD') - TO_DATE(B.WK_DT, 'YYYYMMDD') ELSE NULL END), 1), 0),
             NVL(SUM(PA.SUM_PS_DS), 0),
             NVL(SUM(PA.SUM_BB_DS), 0),
             NVL(SUM(PA.SUM_JI_DS), 0),
@@ -283,7 +288,21 @@ class WeaningProcessor(BaseProcessor):
         self.execute(sql_ins, {
             'master_seq': self.master_seq,
             'farm_no': self.farm_no,
-            **stats,
+            'total_cnt': stats.get('total_cnt', 0),
+            'sum_eudusu': stats.get('sum_eudusu', 0),
+            'sum_silsan': stats.get('sum_silsan', 0),
+            'sum_pougigan': stats.get('sum_pougigan', 0),
+            'plan_eu': stats.get('plan_eu', 0),
+            'sum_ps_ds': stats.get('sum_ps_ds', 0),
+            'sum_bb_ds': stats.get('sum_bb_ds', 0),
+            'sum_ji_ds': stats.get('sum_ji_ds', 0),
+            'sum_jc_ds': stats.get('sum_jc_ds', 0),
+            'avg_eudusu': stats.get('avg_eudusu', 0),
+            'avg_kg': stats.get('avg_kg', 0),
+            'survival_rate': stats.get('survival_rate', 0),
+            'avg_pougigan': stats.get('avg_pougigan', 0),
+            'sum_pogae': stats.get('sum_pogae', 0),
+            'sum_chongsan': stats.get('sum_chongsan', 0),
         })
 
         return stats
@@ -305,6 +324,12 @@ class WeaningProcessor(BaseProcessor):
         self.execute(sql, {
             'master_seq': self.master_seq,
             'farm_no': self.farm_no,
-            **stats,
-            **acc_stats,
+            'total_cnt': stats.get('total_cnt', 0),
+            'sum_eudusu': stats.get('sum_eudusu', 0),
+            'avg_eudusu': stats.get('avg_eudusu', 0),
+            'avg_kg': stats.get('avg_kg', 0),
+            'chg_jd': stats.get('chg_jd', 0),
+            'acc_eu_cnt': acc_stats.get('acc_eu_cnt', 0),
+            'acc_eu_jd': acc_stats.get('acc_eu_jd', 0),
+            'acc_avg_jd': acc_stats.get('acc_avg_jd', 0),
         })

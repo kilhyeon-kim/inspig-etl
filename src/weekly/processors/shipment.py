@@ -166,7 +166,12 @@ class ShipmentProcessor(BaseProcessor):
         self.execute(sql_ins, {
             'master_seq': self.master_seq,
             'farm_no': self.farm_no,
-            **stats,
+            'ship_cnt': stats.get('ship_cnt', 0),
+            'avg_kg': stats.get('avg_kg', 0),
+            'avg_amt': stats.get('avg_amt', 0),
+            'sum_cnt': stats.get('sum_cnt', 0),
+            'sum_avg_kg': stats.get('sum_avg_kg', 0),
+            'national_price': stats.get('national_price', 0),
         })
 
         return stats
@@ -310,5 +315,8 @@ class ShipmentProcessor(BaseProcessor):
         self.execute(sql, {
             'master_seq': self.master_seq,
             'farm_no': self.farm_no,
-            **stats,
+            'ship_cnt': stats.get('ship_cnt', 0),
+            'avg_kg': stats.get('avg_kg', 0),
+            'sum_cnt': stats.get('sum_cnt', 0),
+            'sum_avg_kg': stats.get('sum_avg_kg', 0),
         })

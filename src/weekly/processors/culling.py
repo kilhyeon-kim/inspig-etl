@@ -111,13 +111,27 @@ class CullingProcessor(BaseProcessor):
             도폐사 모돈 리스트
         """
         # 도폐사 모돈은 OUT_DT가 있으므로 별도 조회
+        # TB_MODON + TB_MODON_WK 조인 (최신 작업이력 기준)
         sql = """
-        SELECT M.MODON_NO, M.MODON_NM, M.FARM_NO, M.SANCHA, M.IN_SANCHA,
-               M.STATUS_CD, M.IN_DT, M.OUT_DT, M.OUT_GUBUN_CD, M.OUT_REASON_CD,
-               M.BIRTH_DT, M.GB_SANCHA, M.LAST_GB_DT, M.LAST_BUN_DT,
-               M.DONBANG_CD, M.NOW_DONGHO, M.NOW_BANGHO,
-               M.IN_GYOBAE_CNT, M.DAERI_YN, M.USE_YN
+        SELECT M.PIG_NO AS MODON_NO, M.FARM_PIG_NO AS MODON_NM, M.FARM_NO,
+               NVL(W.SANCHA, M.IN_SANCHA) AS SANCHA, M.IN_SANCHA,
+               M.STATUS_CD, TO_CHAR(M.IN_DT, 'YYYYMMDD') AS IN_DT,
+               TO_CHAR(M.OUT_DT, 'YYYYMMDD') AS OUT_DT, M.OUT_GUBUN_CD, M.OUT_REASON_CD,
+               TO_CHAR(M.BIRTH_DT, 'YYYYMMDD') AS BIRTH_DT,
+               NVL(W.GYOBAE_CNT, M.IN_GYOBAE_CNT) AS GB_SANCHA,
+               NULL AS LAST_GB_DT, NULL AS LAST_BUN_DT,
+               W.LOC_CD AS DONBANG_CD, NULL AS NOW_DONGHO, NULL AS NOW_BANGHO,
+               M.IN_GYOBAE_CNT, NVL(W.DAERI_YN, 'N') AS DAERI_YN, M.USE_YN
         FROM TB_MODON M
+        LEFT JOIN (
+            SELECT FARM_NO, PIG_NO, WK_GUBUN, SANCHA, GYOBAE_CNT, LOC_CD, DAERI_YN,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY FARM_NO, PIG_NO
+                       ORDER BY WK_DATE DESC, SEQ DESC
+                   ) RN
+            FROM TB_MODON_WK
+            WHERE USE_YN = 'Y'
+        ) W ON M.FARM_NO = W.FARM_NO AND M.PIG_NO = W.PIG_NO AND W.RN = 1
         WHERE M.FARM_NO = :farm_no
           AND M.USE_YN = 'Y'
           AND M.OUT_DT IS NOT NULL

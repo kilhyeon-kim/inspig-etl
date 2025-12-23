@@ -268,11 +268,15 @@ class WeeklyReportOrchestrator:
                 national_price = self._get_national_price(cursor, dt_from, dt_to)
                 self.logger.info(f"전국 탕박 평균 단가: {national_price}원")
 
-                # 2. 마스터 레코드 생성
+                # 2. 기존 테스트 데이터 삭제 (동일 연도/주차)
+                self._delete_existing_master(cursor, year, week_no, farm_list)
+                conn.commit()
+
+                # 3. 마스터 레코드 생성
                 master_seq = self._create_master(cursor, year, week_no, dt_from, dt_to)
                 self.logger.info(f"마스터 SEQ: {master_seq}")
 
-                # 3. 대상 농장 조회
+                # 4. 대상 농장 조회
                 farms = self._get_target_farms(cursor, farm_list, test_mode)
                 target_cnt = len(farms)
                 self.logger.info(f"대상 농장: {target_cnt}개")
@@ -281,11 +285,11 @@ class WeeklyReportOrchestrator:
                     self.logger.warning("대상 농장이 없습니다.")
                     return {'status': 'complete', 'method': 'python', 'target_cnt': 0}
 
-                # 4. 농장별 초기 레코드 생성 (TS_INS_WEEK)
+                # 5. 농장별 초기 레코드 생성 (TS_INS_WEEK)
                 self._create_week_records(cursor, master_seq, farms, year, week_no, dt_from, dt_to)
                 conn.commit()
 
-                # 5. 농장별 처리
+                # 6. 농장별 처리
                 for i, farm in enumerate(farms, 1):
                     farm_no = farm['FARM_NO']
                     locale = farm.get('LOCALE', 'KOR')
@@ -371,11 +375,15 @@ class WeeklyReportOrchestrator:
                 national_price = self._get_national_price(cursor, dt_from, dt_to)
                 self.logger.info(f"전국 탕박 평균 단가: {national_price}원")
 
-                # 2. 마스터 레코드 생성
+                # 2. 기존 테스트 데이터 삭제 (동일 연도/주차)
+                self._delete_existing_master(cursor, year, week_no, farm_list)
+                conn.commit()
+
+                # 3. 마스터 레코드 생성
                 master_seq = self._create_master(cursor, year, week_no, dt_from, dt_to)
                 self.logger.info(f"마스터 SEQ: {master_seq}")
 
-                # 3. 대상 농장 조회
+                # 4. 대상 농장 조회
                 farms = self._get_target_farms(cursor, farm_list, test_mode)
                 target_cnt = len(farms)
                 self.logger.info(f"대상 농장: {target_cnt}개")
@@ -384,14 +392,14 @@ class WeeklyReportOrchestrator:
                     self.logger.warning("대상 농장이 없습니다.")
                     return {'status': 'complete', 'method': 'python_async', 'target_cnt': 0}
 
-                # 4. 농장별 초기 레코드 생성 (TS_INS_WEEK)
+                # 5. 농장별 초기 레코드 생성 (TS_INS_WEEK)
                 self._create_week_records(cursor, master_seq, farms, year, week_no, dt_from, dt_to)
                 conn.commit()
 
             finally:
                 cursor.close()
 
-        # 5. 농장별 병렬 처리 (각 농장은 별도 DB 연결 사용)
+        # 6. 농장별 병렬 처리 (각 농장은 별도 DB 연결 사용)
         def process_single_farm(farm: dict) -> dict:
             """단일 농장 처리 (별도 스레드에서 실행)"""
             farm_no = farm['FARM_NO']
@@ -489,8 +497,131 @@ class WeeklyReportOrchestrator:
         result = cursor.fetchone()
         return result[0] if result and result[0] else 0
 
+    def _delete_existing_master(
+        self, cursor, year: int, week_no: int, farm_list: Optional[str] = None
+    ) -> dict:
+        """기존 테스트 데이터 삭제 (동일 연도/주차)
+
+        테스트 시 중복 오류 방지를 위해 기존 데이터를 삭제합니다.
+
+        Args:
+            cursor: DB 커서
+            year: 연도
+            week_no: 주차
+            farm_list: 농장 목록 (콤마 구분, None이면 전체)
+
+        Returns:
+            삭제된 건수 딕셔너리
+        """
+        deleted = {'master': 0, 'week': 0, 'week_sub': 0, 'job_log': 0}
+
+        # 1. 해당 연도/주차의 마스터 SEQ 조회
+        cursor.execute("""
+            SELECT SEQ FROM TS_INS_MASTER
+            WHERE REPORT_YEAR = :year AND REPORT_WEEK_NO = :week_no AND DAY_GB = 'WEEK'
+        """, {'year': year, 'week_no': week_no})
+        master_rows = cursor.fetchall()
+
+        if not master_rows:
+            self.logger.info(f"삭제할 기존 데이터 없음: {year}년 {week_no}주")
+            return deleted
+
+        master_seqs = [row[0] for row in master_rows]
+        self.logger.info(f"기존 마스터 SEQ: {master_seqs}")
+
+        # farm_list가 지정된 경우 해당 농장만 삭제
+        if farm_list:
+            farm_nos = [int(f.strip()) for f in farm_list.split(',') if f.strip()]
+            farm_placeholders = ', '.join([f':f{i}' for i in range(len(farm_nos))])
+            farm_params = {f'f{i}': f for i, f in enumerate(farm_nos)}
+        else:
+            farm_nos = None
+
+        for master_seq in master_seqs:
+            params = {'master_seq': master_seq}
+            if farm_nos:
+                params.update(farm_params)
+
+            # 2. TS_INS_WEEK_SUB 삭제
+            if farm_nos:
+                cursor.execute(f"""
+                    DELETE FROM TS_INS_WEEK_SUB
+                    WHERE MASTER_SEQ = :master_seq AND FARM_NO IN ({farm_placeholders})
+                """, params)
+            else:
+                cursor.execute("""
+                    DELETE FROM TS_INS_WEEK_SUB WHERE MASTER_SEQ = :master_seq
+                """, params)
+            deleted['week_sub'] += cursor.rowcount
+
+            # 3. TS_INS_JOB_LOG 삭제
+            if farm_nos:
+                cursor.execute(f"""
+                    DELETE FROM TS_INS_JOB_LOG
+                    WHERE MASTER_SEQ = :master_seq AND FARM_NO IN ({farm_placeholders})
+                """, params)
+            else:
+                cursor.execute("""
+                    DELETE FROM TS_INS_JOB_LOG WHERE MASTER_SEQ = :master_seq
+                """, params)
+            deleted['job_log'] += cursor.rowcount
+
+            # 4. TS_INS_WEEK 삭제
+            if farm_nos:
+                cursor.execute(f"""
+                    DELETE FROM TS_INS_WEEK
+                    WHERE MASTER_SEQ = :master_seq AND FARM_NO IN ({farm_placeholders})
+                """, params)
+            else:
+                cursor.execute("""
+                    DELETE FROM TS_INS_WEEK WHERE MASTER_SEQ = :master_seq
+                """, params)
+            deleted['week'] += cursor.rowcount
+
+            # 5. TS_INS_MASTER 삭제 (farm_list 지정 시 해당 농장이 모두 삭제되었을 때만)
+            if not farm_nos:
+                cursor.execute("""
+                    DELETE FROM TS_INS_MASTER WHERE SEQ = :master_seq
+                """, {'master_seq': master_seq})
+                deleted['master'] += cursor.rowcount
+            else:
+                # farm_list 지정 시: 해당 마스터에 남은 농장이 없으면 마스터도 삭제
+                cursor.execute("""
+                    SELECT COUNT(*) FROM TS_INS_WEEK WHERE MASTER_SEQ = :master_seq
+                """, {'master_seq': master_seq})
+                remaining = cursor.fetchone()[0]
+                if remaining == 0:
+                    cursor.execute("""
+                        DELETE FROM TS_INS_MASTER WHERE SEQ = :master_seq
+                    """, {'master_seq': master_seq})
+                    deleted['master'] += cursor.rowcount
+
+        self.logger.info(f"기존 데이터 삭제 완료: {deleted}")
+        return deleted
+
     def _create_master(self, cursor, year: int, week_no: int, dt_from: str, dt_to: str) -> int:
-        """TS_INS_MASTER 레코드 생성"""
+        """TS_INS_MASTER 레코드 생성 또는 기존 레코드 재사용
+
+        동일 연도/주차의 마스터가 이미 존재하면 재사용합니다.
+        """
+        # 기존 마스터 확인
+        cursor.execute("""
+            SELECT SEQ FROM TS_INS_MASTER
+            WHERE REPORT_YEAR = :year AND REPORT_WEEK_NO = :week_no AND DAY_GB = 'WEEK'
+        """, {'year': year, 'week_no': week_no})
+        existing = cursor.fetchone()
+
+        if existing:
+            master_seq = existing[0]
+            # 상태를 RUNNING으로 업데이트
+            cursor.execute("""
+                UPDATE TS_INS_MASTER
+                SET STATUS_CD = 'RUNNING', START_DT = SYSDATE
+                WHERE SEQ = :seq
+            """, {'seq': master_seq})
+            return master_seq
+
+        # 새 마스터 생성
         cursor.execute("SELECT SEQ_TS_INS_MASTER.NEXTVAL FROM DUAL")
         master_seq = cursor.fetchone()[0]
 
@@ -787,18 +918,22 @@ class WeeklyReportOrchestrator:
                     national_price = self._get_national_price(cursor, dt_from, dt_to)
                     self.logger.info(f"전국 탕박 평균 단가: {national_price:,}원")
 
-                    # 3. 마스터 레코드 생성
+                    # 3. 기존 데이터 삭제 (동일 연도/주차, 해당 농장만)
+                    self._delete_existing_master(cursor, year, week_no, str(farm_no))
+                    conn.commit()
+
+                    # 4. 마스터 레코드 생성
                     master_seq = self._create_master(cursor, year, week_no, dt_from, dt_to)
                     self.logger.info(f"마스터 생성: SEQ={master_seq}")
 
-                    # 4. TS_INS_WEEK 초기 레코드 생성
+                    # 5. TS_INS_WEEK 초기 레코드 생성
                     self._create_week_records(cursor, master_seq, [farm_info], year, week_no, dt_from, dt_to)
                     conn.commit()
 
                 finally:
                     cursor.close()
 
-            # 5. FarmProcessor로 처리
+            # 6. FarmProcessor로 처리
             from .farm_processor import FarmProcessor
 
             with self.db.get_connection() as conn:
@@ -814,7 +949,7 @@ class WeeklyReportOrchestrator:
                     national_price=national_price,
                 )
 
-            # 6. 마스터 상태 업데이트
+            # 7. 마스터 상태 업데이트
             with self.db.get_connection() as conn:
                 cursor = conn.cursor()
                 try:

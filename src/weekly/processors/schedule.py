@@ -326,7 +326,12 @@ class ScheduleProcessor(BaseProcessor):
             'week_num': week_num,
             'period_from': period_from,
             'period_to': period_to,
-            **stats,
+            'gb_sum': stats.get('gb_sum', 0),
+            'imsin_sum': stats.get('imsin_sum', 0),
+            'bm_sum': stats.get('bm_sum', 0),
+            'eu_sum': stats.get('eu_sum', 0),
+            'vaccine_sum': stats.get('vaccine_sum', 0),
+            'ship_sum': stats.get('ship_sum', 0),
         })
 
         return stats
@@ -544,5 +549,10 @@ class ScheduleProcessor(BaseProcessor):
         self.execute(sql, {
             'master_seq': self.master_seq,
             'farm_no': self.farm_no,
-            **stats,
+            'gb_sum': stats.get('gb_sum', 0),
+            'imsin_sum': stats.get('imsin_sum', 0),
+            'bm_sum': stats.get('bm_sum', 0),
+            'eu_sum': stats.get('eu_sum', 0),
+            'vaccine_sum': stats.get('vaccine_sum', 0),
+            'ship_sum': stats.get('ship_sum', 0),
         })
