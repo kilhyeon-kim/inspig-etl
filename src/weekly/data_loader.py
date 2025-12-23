@@ -5,12 +5,11 @@
 - 각 프로세서는 이 데이터를 받아서 가공만 수행
 
 목적:
-- Oracle 의존도 최소화
 - DB 조회 횟수 최소화 (농장당 1회)
-- Python에서 데이터 가공 수행
+- Oracle 함수 활용으로 정확한 상태코드 계산
 
-v2 아키텍처:
-- SF_GET_MODONGB_STATUS 함수 로직 Python 구현
+v3 아키텍처:
+- SF_GET_MODONGB_STATUS Oracle 함수 직접 호출
 - VW_MODON_2020_MAX_WK_02 뷰 로직 Python 구현
 - MAX(SEQ) 기반 마지막 작업 정보 계산
 - 기준일(base_date) 기반 시점 데이터 계산
@@ -48,10 +47,10 @@ SAGO_YUSAN = '020002'   # 유산
 
 
 class FarmDataLoader:
-    """농장별 원시 데이터 로더 (v2 - 완전 Python 가공)
+    """농장별 원시 데이터 로더 (v3 - Oracle 함수 직접 호출)
 
     주간 리포트 생성에 필요한 모든 테이블 데이터를 1회 조회하여 반환
-    Oracle View/Function 로직을 Python으로 구현하여 처리
+    상태코드 계산은 Oracle SF_GET_MODONGB_STATUS 함수 직접 호출
 
     조회 대상 테이블:
     - TB_MODON: 모돈 기본 정보
@@ -64,8 +63,10 @@ class FarmDataLoader:
     - TB_MODON_GB_DETAIL: 교배 상세 정보
     - TM_LPD_DATA: LPD 측정 데이터
 
+    Oracle 함수 활용:
+    - SF_GET_MODONGB_STATUS: 상태코드 계산 (SQL에서 직접 호출)
+
     Python 가공 기능:
-    - SF_GET_MODONGB_STATUS: 상태코드 계산
     - VW_MODON_2020_MAX_WK_02: MAX(SEQ) 기반 마지막 작업 정보
     - 경과일 계산 (기준일 대비)
     """
@@ -167,10 +168,10 @@ class FarmDataLoader:
         self._load_farm_config()
 
         # ========================================
-        # 2단계: Python 가공 (Oracle 함수 로직 대체)
+        # 2단계: Python 가공 (Oracle 함수 결과 캐싱)
         # ========================================
         self._calculate_last_wk()           # MAX(SEQ) 기반 마지막 작업
-        self._calculate_modon_status()      # SF_GET_MODONGB_STATUS 대체
+        self._calculate_modon_status()      # Oracle 함수 결과 캐시 저장
         self._calculate_last_gb_dt()        # 마지막 교배일 계산
         self._calculate_schedule_python()   # 예정 정보 계산
 
@@ -211,6 +212,7 @@ class FarmDataLoader:
         - TB_MODON: 기본 정보 (PIG_NO, FARM_PIG_NO, IN_DT, OUT_DT 등)
         - TB_MODON_WK: 작업이력 (SANCHA, GYOBAE_CNT, DAERI_YN 등)
         - ROW_NUMBER로 마지막 작업 정보 조인
+        - SF_GET_MODONGB_STATUS Oracle 함수로 상태코드 직접 계산
         """
         sql = """
         SELECT M.PIG_NO AS MODON_NO, M.FARM_PIG_NO AS MODON_NM, M.FARM_NO,
@@ -221,10 +223,22 @@ class FarmDataLoader:
                NVL(W.GYOBAE_CNT, M.IN_GYOBAE_CNT) AS GB_SANCHA,
                NULL AS LAST_GB_DT, NULL AS LAST_BUN_DT,
                W.LOC_CD AS DONBANG_CD, NULL AS NOW_DONGHO, NULL AS NOW_BANGHO,
-               M.IN_GYOBAE_CNT, NVL(W.DAERI_YN, 'N') AS DAERI_YN, M.USE_YN
+               M.IN_GYOBAE_CNT, NVL(W.DAERI_YN, 'N') AS DAERI_YN, M.USE_YN,
+               W.WK_GUBUN, W.SAGO_GUBUN_CD,
+               -- SF_GET_MODONGB_STATUS Oracle 함수 직접 호출
+               -- 도폐사 전 마지막 상태: OUT_DT = '99991231' 전달
+               SF_GET_MODONGB_STATUS(
+                   'CD',
+                   W.WK_GUBUN,
+                   W.SAGO_GUBUN_CD,
+                   TO_DATE('99991231', 'YYYYMMDD'),
+                   M.STATUS_CD,
+                   W.DAERI_YN,
+                   ''
+               ) AS CALC_STATUS_CD
         FROM TB_MODON M
         LEFT JOIN (
-            SELECT FARM_NO, PIG_NO, WK_GUBUN, SANCHA, GYOBAE_CNT, LOC_CD, DAERI_YN,
+            SELECT FARM_NO, PIG_NO, WK_GUBUN, SANCHA, GYOBAE_CNT, LOC_CD, DAERI_YN, SAGO_GUBUN_CD,
                    ROW_NUMBER() OVER (
                        PARTITION BY FARM_NO, PIG_NO
                        ORDER BY WK_DATE DESC, SEQ DESC
@@ -438,77 +452,22 @@ class FarmDataLoader:
         self.logger.debug(f"마지막 작업 계산: {len(self._modon_last_wk)}건")
 
     def _calculate_modon_status(self) -> None:
-        """모돈별 상태코드 계산
+        """Oracle SF_GET_MODONGB_STATUS 함수 결과를 캐시에 저장
 
-        SF_GET_MODONGB_STATUS 함수 로직 Python 구현:
-        - G (교배) → 010002 (임신돈)
-        - B (분만) → 010003 (포유돈)
-        - E (이유) → 010005 (이유모) / 010004 (대리모, DAERI_YN='Y')
-        - F (사고) → 010006 (재발) / 010007 (유산)
-        - 작업이력 없으면 TB_MODON.STATUS_CD 사용
-        - 후보돈 특수 처리: IN_SANCHA=0, IN_GYOBAE_CNT=1, STATUS_CD='010002' → '010001'
+        v3 아키텍처:
+        - SQL에서 SF_GET_MODONGB_STATUS Oracle 함수를 직접 호출하여 CALC_STATUS_CD 계산
+        - Python에서는 해당 결과를 캐시(_modon_calc_status)에 저장만 수행
+        - Oracle 함수가 NULL 반환 시 STATUS_HUBO('010001') 기본값 사용
         """
         modon_list = self._data.get('modon', [])
 
         for modon in modon_list:
             modon_no = str(modon.get('MODON_NO', ''))
-            last_wk = self._modon_last_wk.get(modon_no)
-
-            if last_wk:
-                # 마지막 작업 기준 상태코드 계산
-                wk_gubun = str(last_wk.get('WK_GUBUN', ''))
-                sago_gubun_cd = str(last_wk.get('SAGO_GUBUN_CD', '') or '')
-                daeri_yn = str(modon.get('DAERI_YN', '') or '')
-
-                status = self._get_status_by_wk_gubun(wk_gubun, sago_gubun_cd, daeri_yn)
-            else:
-                # 작업이력 없으면 TB_MODON.STATUS_CD 사용
-                # 후보돈 특수 처리
-                in_sancha = modon.get('IN_SANCHA', 0) or 0
-                in_gyobae_cnt = modon.get('IN_GYOBAE_CNT', 0) or 0
-                orig_status = str(modon.get('STATUS_CD', '') or STATUS_HUBO)
-
-                if in_sancha == 0 and in_gyobae_cnt == 1 and orig_status == STATUS_IMSIN:
-                    status = STATUS_HUBO
-                else:
-                    status = orig_status if orig_status else STATUS_HUBO
-
+            # Oracle 함수 결과 사용 (NULL이면 후보돈)
+            status = modon.get('CALC_STATUS_CD') or STATUS_HUBO
             self._modon_calc_status[modon_no] = status
 
-            # modon 데이터에 계산된 상태코드 추가
-            modon['CALC_STATUS_CD'] = status
-
-        self.logger.debug(f"상태코드 계산: {len(self._modon_calc_status)}건")
-
-    def _get_status_by_wk_gubun(self, wk_gubun: str, sago_gubun_cd: str,
-                                 daeri_yn: str) -> str:
-        """작업구분으로 상태코드 결정
-
-        SF_GET_MODONGB_STATUS 핵심 로직:
-        - G (교배) → 010002 (임신돈)
-        - B (분만) → 010003 (포유돈)
-        - E (이유) → 010005 (이유모) / 010004 (대리모)
-        - F (사고) → 010006 (재발) / 010007 (유산)
-        """
-        if wk_gubun == WK_GYOBAE:  # G: 교배
-            return STATUS_IMSIN
-
-        elif wk_gubun == WK_BUNMAN:  # B: 분만
-            return STATUS_POYU
-
-        elif wk_gubun == WK_EU:  # E: 이유
-            if daeri_yn == 'Y':
-                return STATUS_DAERI
-            return STATUS_EUMO
-
-        elif wk_gubun == WK_SAGO:  # F: 사고
-            if sago_gubun_cd == SAGO_JAEBAL:
-                return STATUS_JAEBAL
-            elif sago_gubun_cd == SAGO_YUSAN:
-                return STATUS_YUSAN
-            return STATUS_JAEBAL  # 기본값
-
-        return STATUS_HUBO  # 알 수 없는 경우 후보돈
+        self.logger.debug(f"상태코드 캐시 저장: {len(self._modon_calc_status)}건")
 
     def _calculate_last_gb_dt(self) -> None:
         """모돈별 마지막 교배일 계산
