@@ -485,24 +485,18 @@ class FarmDataLoader:
         self.logger.debug(f"교배 상세: TB_GYOBAE에 통합됨")
 
     def _load_lpd(self) -> None:
-        """TM_LPD_DATA 출하 데이터 로드 (일별 요약)
+        """TM_LPD_DATA 출하 데이터 로드 (일별 요약 + 누계)
 
-        Oracle SP_INS_WEEK_SHIP_POPUP의 DAILY CTE와 동일한 로직으로
-        일별 요약 데이터를 조회하여 Python 가공 최소화
-
-        조회 결과:
-        - lpd_daily: 7일간 일별 요약 (ROW, CHART용)
-        - lpd_scatter: 산점도용 GROUP BY (ROUND(NET_KG), ROUND(BACK_DEPTH))
-        - lpd_year_stats: 연간 누계 (CNT, AVG)
+        Oracle SP_INS_WEEK_SHIP_POPUP과 동일한 로직:
+        - lpd_daily: 7일간 일별 요약 (dt_from ~ dt_to)
+        - lpd_year_stats: 연간 누계 (1.1일 ~ dt_to)
 
         주의: DOCHUK_DT는 VARCHAR2(10) 형식 'YYYY-MM-DD'
         """
-        # 날짜 형식 변환
-        dt_from_str = f"{self.dt_from[:4]}-{self.dt_from[4:6]}-{self.dt_from[6:8]}"
         dt_to_str = f"{self.dt_to[:4]}-{self.dt_to[4:6]}-{self.dt_to[6:8]}"
         year_start = f"{self.dt_to[:4]}-01-01"
 
-        # 1. 일별 요약 데이터 (Oracle SP DAILY CTE와 동일)
+        # 1. 일별 요약 (지난주 7일) - Oracle SP DAILY CTE와 동일
         sql_daily = """
         WITH DATE_LIST AS (
             SELECT TO_DATE(:dt_from, 'YYYYMMDD') + LEVEL - 1 AS DT,
@@ -545,23 +539,7 @@ class FarmDataLoader:
             'dt_from': self.dt_from,
         })
 
-        # 2. 산점도용 데이터 (Oracle SP SCATTER INSERT와 동일)
-        sql_scatter = """
-        SELECT ROUND(NET_KG) AS NET_KG_GRP, ROUND(BACK_DEPTH) AS BACK_GRP, COUNT(*) AS CNT
-        FROM TM_LPD_DATA
-        WHERE FARM_NO = :farm_no AND USE_YN = 'Y'
-          AND DOCHUK_DT >= :dt_from_str AND DOCHUK_DT <= :dt_to_str
-          AND NET_KG IS NOT NULL AND BACK_DEPTH IS NOT NULL
-        GROUP BY ROUND(NET_KG), ROUND(BACK_DEPTH)
-        ORDER BY 1, 2
-        """
-        self._data['lpd_scatter'] = self._fetch_all(sql_scatter, {
-            'farm_no': self.farm_no,
-            'dt_from_str': dt_from_str,
-            'dt_to_str': dt_to_str,
-        })
-
-        # 3. 연간 누계 (Oracle SP V_YEAR_CNT, V_YEAR_AVG와 동일)
+        # 2. 연간 누계 (1.1일 ~ dt_to)
         sql_year = """
         SELECT COUNT(*) AS CNT, ROUND(AVG(NET_KG), 1) AS AVG_NET
         FROM TM_LPD_DATA
@@ -575,27 +553,13 @@ class FarmDataLoader:
         })
         self._data['lpd_year_stats'] = year_rows[0] if year_rows else {'CNT': 0, 'AVG_NET': 0}
 
-        # 4. 전체 평균 (Oracle SP AVG_TBL CTE와 동일)
-        sql_avg = """
-        SELECT ROUND(AVG(NET_KG), 1) AS TOTAL_AVG_NET,
-               ROUND(AVG(CASE WHEN BACK_DEPTH > 0 THEN BACK_DEPTH END), 1) AS TOTAL_AVG_BACK
-        FROM TM_LPD_DATA
-        WHERE FARM_NO = :farm_no AND USE_YN = 'Y'
-          AND DOCHUK_DT >= :dt_from_str AND DOCHUK_DT <= :dt_to_str
-        """
-        avg_rows = self._fetch_all(sql_avg, {
-            'farm_no': self.farm_no,
-            'dt_from_str': dt_from_str,
-            'dt_to_str': dt_to_str,
-        })
-        self._data['lpd_week_avg'] = avg_rows[0] if avg_rows else {'TOTAL_AVG_NET': 0, 'TOTAL_AVG_BACK': 0}
-
-        # 기존 lpd (빈 리스트로 유지 - 호환성)
+        # 호환성 유지
         self._data['lpd'] = []
+        self._data['lpd_scatter'] = []  # shipment.py에서 직접 조회
+        self._data['lpd_week_avg'] = {}  # lpd_daily에서 계산
 
         self.logger.debug(
             f"LPD 로드: daily={len(self._data['lpd_daily'])}건, "
-            f"scatter={len(self._data['lpd_scatter'])}건, "
             f"year_cnt={self._data['lpd_year_stats'].get('CNT', 0)}"
         )
 

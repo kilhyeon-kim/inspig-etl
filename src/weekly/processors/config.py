@@ -214,14 +214,14 @@ class ConfigProcessor(BaseProcessor):
                 'wean_date_to': wean_date_to,
             })
 
-            rearing_rate = result[0] if result and result[0] else 85.0
-            # Oracle과 동일: 0이면 기본값 85 사용
+            rearing_rate = result[0] if result and result[0] else 90.0
+            # Oracle과 동일: 0이면 기본값 90 사용
             if rearing_rate == 0:
-                rearing_rate = 85.0
+                rearing_rate = 90.0
 
         except Exception as e:
             self.logger.warning(f"이유후육성율 계산 실패: {e}")
-            rearing_rate = 85.0
+            rearing_rate = 90.0
 
         return rearing_rate, rate_from, rate_to
 
@@ -249,7 +249,7 @@ class ConfigProcessor(BaseProcessor):
         # 이유후육성율 추가
         codes.append('REARING_RATE')
         names.append('이유후육성율(6개월)')
-        values.append(config_values.get('REARING_RATE', 85))
+        values.append(config_values.get('REARING_RATE', 90))
 
         return json.dumps(codes), json.dumps(names, ensure_ascii=False), json.dumps(values)
 
@@ -283,7 +283,7 @@ class ConfigProcessor(BaseProcessor):
             'ship_day': config_values.get('140005', 180),
             'first_gb_day': config_values.get('140007', 240),
             'avg_return': config_values.get('140008', 7),
-            'rearing_rate': config_values.get('REARING_RATE', 85),
+            'rearing_rate': config_values.get('REARING_RATE', 90),
             'codes_json': codes_json,
             'names_json': names_json,
             'values_json': values_json,
@@ -314,7 +314,7 @@ class ConfigProcessor(BaseProcessor):
                 'ship_day': result[2] or 180,         # 기준출하일령
                 'first_gb_day': result[3] or 240,     # 후보돈초교배일령
                 'avg_return': result[4] or 7,         # 평균재귀일
-                'rearing_rate': result[5] or 85,      # 이유후육성율
+                'rearing_rate': result[5] or 90,      # 이유후육성율
             }
         else:
             return {
@@ -323,5 +323,5 @@ class ConfigProcessor(BaseProcessor):
                 'ship_day': 180,
                 'first_gb_day': 240,
                 'avg_return': 7,
-                'rearing_rate': 85,
+                'rearing_rate': 90,
             }

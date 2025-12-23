@@ -57,24 +57,25 @@ class ShipmentProcessor(BaseProcessor):
         # 1. 기존 데이터 삭제
         self._delete_existing()
 
-        # 2. 로드된 요약 데이터 가져오기 (data_loader에서 SQL로 집계됨)
+        # 2. 로드된 요약 데이터 가져오기
         loaded_data = self.get_loaded_data()
         lpd_daily = loaded_data.get('lpd_daily', [])        # 일별 요약 (7행)
-        lpd_scatter = loaded_data.get('lpd_scatter', [])    # 산점도용 GROUP BY
         lpd_year_stats = loaded_data.get('lpd_year_stats', {})  # 연간 누계
-        lpd_week_avg = loaded_data.get('lpd_week_avg', {})  # 주간 전체 평균
 
-        # 3. 출하 ROW 크로스탭 INSERT (13행 × 7일) - lpd_daily 사용
+        # 3. lpd_daily에서 주간 전체 평균 계산 (Oracle AVG_TBL과 동일)
+        lpd_week_avg = self._calculate_week_avg(lpd_daily)
+
+        # 4. 출하 ROW 크로스탭 INSERT (13행 × 7일)
         row_cnt = self._calculate_and_insert_row(lpd_daily, lpd_week_avg, dt_from, dt_to)
 
-        # 4. 출하 통계 INSERT (ROW 데이터 기반) - Oracle SP와 동일 순서
+        # 5. 출하 통계 INSERT (ROW 데이터 기반) - Oracle SP와 동일 순서
         stats = self._calculate_and_insert_stats(lpd_year_stats, national_price, dt_from, dt_to)
 
-        # 5. 출하 차트 INSERT (일자별 7행) - lpd_daily 사용
+        # 6. 출하 차트 INSERT (일자별 7행)
         chart_cnt = self._calculate_and_insert_chart(lpd_daily)
 
-        # 6. 출하 산점도 INSERT - lpd_scatter 사용 (이미 GROUP BY 됨)
-        scatter_cnt = self._calculate_and_insert_scatter(lpd_scatter)
+        # 7. 출하 산점도 INSERT (직접 SQL 조회)
+        scatter_cnt = self._calculate_and_insert_scatter(dt_from, dt_to)
 
         # 8. TS_INS_WEEK 업데이트
         self._update_week(stats)
@@ -96,6 +97,22 @@ class ShipmentProcessor(BaseProcessor):
         WHERE MASTER_SEQ = :master_seq AND FARM_NO = :farm_no AND GUBUN = 'SHIP'
         """
         self.execute(sql, {'master_seq': self.master_seq, 'farm_no': self.farm_no})
+
+    def _calculate_week_avg(self, lpd_daily: List[Dict]) -> Dict[str, Any]:
+        """lpd_daily에서 주간 전체 평균 계산 (Oracle AVG_TBL과 동일)
+
+        가중평균 계산: 총 지육중량 / 총 두수
+        """
+        total_cnt = sum(d.get('CNT') or 0 for d in lpd_daily)
+        total_net = sum(d.get('TOT_NET') or 0 for d in lpd_daily)
+
+        # 평균 등지방: 데이터 있는 날만 평균 (Oracle AVG와 동일)
+        valid_back = [d.get('AVG_BACK') for d in lpd_daily if d.get('AVG_BACK') is not None]
+
+        return {
+            'TOTAL_AVG_NET': oracle_round(total_net / total_cnt, 1) if total_cnt > 0 else None,
+            'TOTAL_AVG_BACK': oracle_round(sum(valid_back) / len(valid_back), 1) if valid_back else None,
+        }
 
     def _calculate_and_insert_stats(self, lpd_year_stats: Dict,
                                      national_price: int, dt_from: str, dt_to: str) -> Dict[str, Any]:
@@ -273,21 +290,41 @@ class ShipmentProcessor(BaseProcessor):
 
         return insert_count
 
-    def _calculate_and_insert_scatter(self, lpd_scatter: List[Dict]) -> int:
-        """출하 산점도 INSERT
+    def _calculate_and_insert_scatter(self, dt_from: str, dt_to: str) -> int:
+        """출하 산점도 INSERT (직접 SQL 조회)
 
         Oracle SP_INS_WEEK_SHIP_POPUP과 동일:
-        - ROUND(NET_KG), ROUND(BACK_DEPTH) 단위로 GROUP BY (SQL에서 이미 처리됨)
+        - ROUND(NET_KG), ROUND(BACK_DEPTH) 단위로 GROUP BY
         - VAL_1: ROUND(NET_KG)
         - VAL_2: ROUND(BACK_DEPTH)
         - CNT_1: 건수
 
         Args:
-            lpd_scatter: data_loader에서 조회된 산점도 데이터 (이미 GROUP BY됨)
+            dt_from: 시작일 (YYYYMMDD)
+            dt_to: 종료일 (YYYYMMDD)
 
         Returns:
             INSERT된 레코드 수
         """
+        dt_from_str = f"{dt_from[:4]}-{dt_from[4:6]}-{dt_from[6:8]}"
+        dt_to_str = f"{dt_to[:4]}-{dt_to[4:6]}-{dt_to[6:8]}"
+
+        # 산점도 데이터 조회 (Oracle SP와 동일)
+        sql_scatter = """
+            SELECT ROUND(NET_KG) AS NET_KG_GRP, ROUND(BACK_DEPTH) AS BACK_GRP, COUNT(*) AS CNT
+            FROM TM_LPD_DATA
+            WHERE FARM_NO = :farm_no AND USE_YN = 'Y'
+              AND DOCHUK_DT >= :dt_from_str AND DOCHUK_DT <= :dt_to_str
+              AND NET_KG IS NOT NULL AND BACK_DEPTH IS NOT NULL
+            GROUP BY ROUND(NET_KG), ROUND(BACK_DEPTH)
+            ORDER BY 1, 2
+        """
+        lpd_scatter = self.fetch_all(sql_scatter, {
+            'farm_no': self.farm_no,
+            'dt_from_str': dt_from_str,
+            'dt_to_str': dt_to_str,
+        })
+
         if not lpd_scatter:
             return 0
 
