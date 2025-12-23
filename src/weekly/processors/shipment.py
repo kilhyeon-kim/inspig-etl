@@ -34,22 +34,6 @@ def oracle_round(value: float, decimals: int = 1) -> float:
 
 logger = logging.getLogger(__name__)
 
-# 등급 매핑
-GRADE_MAPPING = {
-    '1+': '1등급↑',
-    '1': '1등급↑',
-    '2': '2등급',
-}
-
-# 중량 범위 정의
-KG_RANGES = [
-    (None, 90, '~90'),
-    (90, 100, '90~100'),
-    (100, 110, '100~110'),
-    (110, 120, '110~120'),
-    (120, None, '120↑'),
-]
-
 
 class ShipmentProcessor(BaseProcessor):
     """출하 팝업 프로세서 (v2 - Python 가공)"""
@@ -88,8 +72,8 @@ class ShipmentProcessor(BaseProcessor):
         # 5. 출하 ROW 크로스탭 INSERT (13행 × 7일)
         row_cnt = self._calculate_and_insert_row(week_lpd, dt_from, dt_to)
 
-        # 6. 출하 차트 INSERT (일자별)
-        chart_cnt = self._calculate_and_insert_chart(week_lpd)
+        # 6. 출하 차트 INSERT (일자별 7행)
+        chart_cnt = self._calculate_and_insert_chart(week_lpd, dt_from)
 
         # 7. 출하 산점도 INSERT (규격도수 × 중량도수)
         scatter_cnt = self._calculate_and_insert_scatter(week_lpd)
@@ -263,20 +247,30 @@ class ShipmentProcessor(BaseProcessor):
 
         return stats
 
-    def _calculate_and_insert_chart(self, week_lpd: List[Dict]) -> int:
-        """출하 차트 계산 및 INSERT (일자별)
+    def _calculate_and_insert_chart(self, week_lpd: List[Dict], dt_from: str) -> int:
+        """출하 차트 계산 및 INSERT (일자별 7행)
+
+        Oracle SP_INS_WEEK_SHIP_POPUP과 동일:
+        - 7일 모두 INSERT (데이터 없는 날은 NULL)
+        - STR_1: 날짜 표시 (MM.DD)
+        - CNT_1: 출하두수 (없으면 NULL)
+        - VAL_1: 평균 NET_KG (없으면 NULL)
+        - VAL_2: 평균 BACK_DEPTH (없으면 NULL)
 
         Args:
             week_lpd: 주간 LPD 데이터
+            dt_from: 시작일 (YYYYMMDD)
 
         Returns:
-            INSERT된 레코드 수
+            INSERT된 레코드 수 (항상 7)
         """
-        if not week_lpd:
-            return 0
+        # 7일간의 날짜 리스트 생성
+        start_date = datetime.strptime(dt_from, '%Y%m%d')
+        date_list = [(start_date + timedelta(days=i)).strftime('%Y-%m-%d') for i in range(7)]
+        date_disp = [(start_date + timedelta(days=i)).strftime('%m.%d') for i in range(7)]
 
         # 일자별 그룹핑
-        daily_data: Dict[str, List[Dict]] = {}
+        daily_data: Dict[str, List[Dict]] = {dt: [] for dt in date_list}
         for lpd in week_lpd:
             dt_value = lpd.get('DOCHUK_DT') or lpd.get('MEAS_DT', '')
             if not dt_value:
@@ -289,39 +283,58 @@ class ShipmentProcessor(BaseProcessor):
             else:
                 dt_str = dt_str[:10]  # YYYY-MM-DD
 
-            if dt_str not in daily_data:
-                daily_data[dt_str] = []
-            daily_data[dt_str].append(lpd)
+            if dt_str in daily_data:
+                daily_data[dt_str].append(lpd)
 
-        # 날짜순 정렬 및 INSERT
+        # 7일 모두 INSERT (Oracle과 동일)
         insert_count = 0
-        for sort_no, dt_str in enumerate(sorted(daily_data.keys()), 1):
-            day_lpd = daily_data[dt_str]
-            day_cnt = len(day_lpd)
-            kg_values = [lpd.get('NET_KG') or lpd.get('DOCHUK_KG') or lpd.get('LPD_VAL', 0) or 0 for lpd in day_lpd]
-            avg_kg = oracle_round(sum(kg_values) / len(kg_values), 1) if kg_values else 0
+        sql_ins = """
+        INSERT INTO TS_INS_WEEK_SUB (
+            MASTER_SEQ, FARM_NO, GUBUN, SUB_GUBUN, SORT_NO, STR_1, CNT_1, VAL_1, VAL_2
+        ) VALUES (
+            :master_seq, :farm_no, 'SHIP', 'CHART', :sort_no, :str_1, :cnt_1, :val_1, :val_2
+        )
+        """
 
-            sql_ins = """
-            INSERT INTO TS_INS_WEEK_SUB (
-                MASTER_SEQ, FARM_NO, GUBUN, SUB_GUBUN, SORT_NO, CODE_1, CNT_1, VAL_1
-            ) VALUES (
-                :master_seq, :farm_no, 'SHIP', 'CHART', :sort_no, :code_1, :cnt_1, :val_1
-            )
-            """
+        for day_no in range(7):
+            dt_str = date_list[day_no]
+            day_lpd = daily_data[dt_str]
+
+            if len(day_lpd) > 0:
+                # 데이터 있음
+                day_cnt = len(day_lpd)
+                kg_values = [lpd.get('NET_KG') or 0 for lpd in day_lpd if lpd.get('NET_KG')]
+                back_values = [lpd.get('BACK_DEPTH') or 0 for lpd in day_lpd if lpd.get('BACK_DEPTH')]
+                avg_kg = oracle_round(sum(kg_values) / len(kg_values), 1) if kg_values else None
+                avg_back = oracle_round(sum(back_values) / len(back_values), 1) if back_values else None
+            else:
+                # 데이터 없음 - NULL 저장 (Oracle과 동일)
+                day_cnt = None
+                avg_kg = None
+                avg_back = None
+
             self.execute(sql_ins, {
                 'master_seq': self.master_seq,
                 'farm_no': self.farm_no,
-                'sort_no': sort_no,
-                'code_1': dt_str,
+                'sort_no': day_no + 1,
+                'str_1': date_disp[day_no],
                 'cnt_1': day_cnt,
                 'val_1': avg_kg,
+                'val_2': avg_back,
             })
             insert_count += 1
 
         return insert_count
 
     def _calculate_and_insert_scatter(self, week_lpd: List[Dict]) -> int:
-        """출하 산점도 계산 및 INSERT (규격도수 × 중량도수)
+        """출하 산점도 계산 및 INSERT
+
+        Oracle SP_INS_WEEK_SHIP_POPUP과 동일:
+        - ROUND(NET_KG), ROUND(BACK_DEPTH) 단위로 GROUP BY
+        - VAL_1: ROUND(NET_KG)
+        - VAL_2: ROUND(BACK_DEPTH)
+        - CNT_1: 건수
+        - NET_KG, BACK_DEPTH 둘 다 NOT NULL인 데이터만
 
         Args:
             week_lpd: 주간 LPD 데이터
@@ -332,56 +345,42 @@ class ShipmentProcessor(BaseProcessor):
         if not week_lpd:
             return 0
 
-        # 등급×중량 그룹핑
+        # ROUND(NET_KG), ROUND(BACK_DEPTH) 그룹핑 (Oracle과 동일)
         scatter_data: Dict[tuple, int] = {}
 
         for lpd in week_lpd:
-            # 등급 처리 (MEAT_QUALITY 또는 GYEOK_GRADE)
-            grade = str(lpd.get('MEAT_QUALITY', '') or lpd.get('GYEOK_GRADE', '') or '').strip()
-            grade_label = GRADE_MAPPING.get(grade, '등외')
+            net_kg = lpd.get('NET_KG')
+            back_depth = lpd.get('BACK_DEPTH')
 
-            # 중량 처리
-            kg = lpd.get('NET_KG') or lpd.get('DOCHUK_KG') or lpd.get('LPD_VAL', 0) or 0
+            # Oracle: NET_KG IS NOT NULL AND BACK_DEPTH IS NOT NULL
+            if net_kg is None or back_depth is None:
+                continue
 
-            # 중량 범위 결정
-            kg_label = '등외'
-            for min_kg, max_kg, label in KG_RANGES:
-                if min_kg is None:
-                    if kg < max_kg:
-                        kg_label = label
-                        break
-                elif max_kg is None:
-                    if kg >= min_kg:
-                        kg_label = label
-                        break
-                else:
-                    if min_kg <= kg < max_kg:
-                        kg_label = label
-                        break
+            # Oracle: ROUND(NET_KG), ROUND(BACK_DEPTH)
+            net_kg_grp = round(net_kg)
+            back_grp = round(back_depth)
 
-            # 그룹 카운트
-            key = (grade_label, kg_label)
+            key = (net_kg_grp, back_grp)
             scatter_data[key] = scatter_data.get(key, 0) + 1
 
-        # 정렬 및 INSERT
+        # 정렬 (NET_KG, BACK_DEPTH 순) 및 INSERT
         insert_count = 0
         sort_no = 1
-        for (grade_label, kg_label), cnt in sorted(scatter_data.items()):
-            sql_ins = """
-            INSERT INTO TS_INS_WEEK_SUB (
-                MASTER_SEQ, FARM_NO, GUBUN, SUB_GUBUN, SORT_NO,
-                CODE_1, CODE_2, CNT_1
-            ) VALUES (
-                :master_seq, :farm_no, 'SHIP', 'SCATTER', :sort_no,
-                :code_1, :code_2, :cnt_1
-            )
-            """
-            self.execute(sql_ins, {
+        for (net_kg_grp, back_grp), cnt in sorted(scatter_data.items()):
+            self.execute("""
+                INSERT INTO TS_INS_WEEK_SUB (
+                    MASTER_SEQ, FARM_NO, GUBUN, SUB_GUBUN, SORT_NO,
+                    VAL_1, VAL_2, CNT_1
+                ) VALUES (
+                    :master_seq, :farm_no, 'SHIP', 'SCATTER', :sort_no,
+                    :val_1, :val_2, :cnt_1
+                )
+            """, {
                 'master_seq': self.master_seq,
                 'farm_no': self.farm_no,
                 'sort_no': sort_no,
-                'code_1': grade_label,
-                'code_2': kg_label,
+                'val_1': net_kg_grp,
+                'val_2': back_grp,
                 'cnt_1': cnt,
             })
             insert_count += 1
