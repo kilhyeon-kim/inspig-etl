@@ -434,7 +434,7 @@ class ShipmentProcessor(BaseProcessor):
                 q_11 = day_data.get('Q_11') or 0
                 q_1 = day_data.get('Q_1') or 0
                 one_ratio = oracle_round((q_11 + q_1) / day_cnt * 100, 1) if day_cnt > 0 else None
-                eu_ratio = oracle_round(day_cnt / eu_dusu * 100, 1) if eu_dusu > 0 else None
+                # 일별 육성율은 사용하지 않음 (주간 합계 기준만 사용)
 
                 daily_stats.append({
                     'day_no': day_no,
@@ -451,7 +451,7 @@ class ShipmentProcessor(BaseProcessor):
                     'etc': day_data.get('ETC') or 0,
                     'eu_dusu': eu_dusu,
                     'one_ratio': one_ratio,
-                    'eu_ratio': eu_ratio,
+                    'eu_ratio': None,  # 일별 육성율 사용 안함
                 })
 
         # 4. 합계/평균 계산

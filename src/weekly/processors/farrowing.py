@@ -121,8 +121,9 @@ class FarrowingProcessor(BaseProcessor):
         """
         if not self.data_loader:
             stats = {'total_cnt': 0, 'sum_total': 0, 'sum_live': 0, 'sum_dead': 0,
-                     'sum_mummy': 0, 'sum_pogae': 0, 'avg_total': 0, 'avg_live': 0,
-                     'avg_dead': 0, 'avg_mummy': 0, 'avg_pogae': 0}
+                     'sum_mummy': 0, 'sum_sdotae': 0, 'sum_yangja': 0, 'sum_pogae': 0,
+                     'avg_total': 0, 'avg_live': 0, 'avg_dead': 0, 'avg_mummy': 0,
+                     'avg_sdotae': 0, 'avg_yangja': 0, 'avg_pogae': 0}
         else:
             data = self.data_loader.get_data()
             bunman_list = data.get('bunman', [])
@@ -135,6 +136,7 @@ class FarrowingProcessor(BaseProcessor):
             ]
 
             # 자돈 증감 집계 (모돈+분만일 기준)
+            # ps: 포유사고(생시도태), ji: 자돈입(양자전입), jc: 자돈출(양자전출)
             jadon_agg = {}  # {(modon_no, bun_dt): {'ps': 0, 'ji': 0, 'jc': 0}}
             for jt in jadon_trans:
                 modon_no = str(jt.get('MODON_NO', ''))
@@ -149,11 +151,11 @@ class FarrowingProcessor(BaseProcessor):
                 if key not in jadon_agg:
                     jadon_agg[key] = {'ps': 0, 'ji': 0, 'jc': 0}
 
-                if gubun_cd == '160001':  # 포유사고
+                if gubun_cd == '160001':  # 포유사고 (생시도태)
                     jadon_agg[key]['ps'] += trans_cnt
-                elif gubun_cd == '160003':  # 자돈입
+                elif gubun_cd == '160003':  # 자돈입 (양자전입)
                     jadon_agg[key]['ji'] += trans_cnt
-                elif gubun_cd == '160004':  # 자돈출
+                elif gubun_cd == '160004':  # 자돈출 (양자전출)
                     jadon_agg[key]['jc'] += trans_cnt
 
             # 통계 계산
@@ -163,17 +165,28 @@ class FarrowingProcessor(BaseProcessor):
             sum_mummy = sum(b.get('MUMMY') or 0 for b in week_bunman)
             sum_total = sum_live + sum_dead + sum_mummy
 
-            # 포유개시 계산: 실산 - 포유사고 + 자돈입 - 자돈출
-            pogae_list = []
+            # 자돈 증감 집계 (생시도태, 양자, 포유개시)
+            sdotae_list = []  # 생시도태 (포유사고)
+            yangja_list = []  # 양자 (전입 - 전출)
+            pogae_list = []   # 포유개시 (실산 - 생시도태 + 양자)
+
             for b in week_bunman:
                 modon_no = str(b.get('MODON_NO', ''))
                 bun_dt = str(b.get('BUN_DT', '') or '')[:8]
                 silsan = b.get('SILSAN') or 0
                 key = (modon_no, bun_dt)
                 adj = jadon_agg.get(key, {'ps': 0, 'ji': 0, 'jc': 0})
-                pogae = silsan - adj['ps'] + adj['ji'] - adj['jc']
+
+                sdotae = adj['ps']  # 생시도태
+                yangja = adj['ji'] - adj['jc']  # 양자 (전입 - 전출)
+                pogae = silsan - sdotae + yangja  # 포유개시
+
+                sdotae_list.append(sdotae)
+                yangja_list.append(yangja)
                 pogae_list.append(pogae)
 
+            sum_sdotae = sum(sdotae_list)
+            sum_yangja = sum(yangja_list)
             sum_pogae = sum(pogae_list)
 
             # 평균 계산
@@ -181,6 +194,8 @@ class FarrowingProcessor(BaseProcessor):
             avg_live = round(sum_live / total_cnt, 1) if total_cnt > 0 else 0
             avg_dead = round(sum_dead / total_cnt, 1) if total_cnt > 0 else 0
             avg_mummy = round(sum_mummy / total_cnt, 1) if total_cnt > 0 else 0
+            avg_sdotae = round(sum_sdotae / total_cnt, 1) if total_cnt > 0 else 0
+            avg_yangja = round(sum_yangja / total_cnt, 1) if total_cnt > 0 else 0
             avg_pogae = round(sum_pogae / total_cnt, 1) if total_cnt > 0 else 0
 
             stats = {
@@ -189,24 +204,33 @@ class FarrowingProcessor(BaseProcessor):
                 'sum_live': sum_live,
                 'sum_dead': sum_dead,
                 'sum_mummy': sum_mummy,
+                'sum_sdotae': sum_sdotae,
+                'sum_yangja': sum_yangja,
                 'sum_pogae': sum_pogae,
                 'avg_total': avg_total,
                 'avg_live': avg_live,
                 'avg_dead': avg_dead,
                 'avg_mummy': avg_mummy,
+                'avg_sdotae': avg_sdotae,
+                'avg_yangja': avg_yangja,
                 'avg_pogae': avg_pogae,
             }
 
         # INSERT
+        # CNT_1: 분만복수, CNT_2: 총산합계, CNT_3: 실산합계, CNT_4: 사산합계
+        # CNT_5: 미라합계, CNT_6: 포유개시합계, CNT_7: 분만예정
+        # CNT_8: 생시도태합계, CNT_9: 양자합계
+        # VAL_1~5: 평균(총산,실산,사산,미라,포유개시)
+        # VAL_6: 평균생시도태, VAL_7: 평균양자
         sql_ins = """
         INSERT INTO TS_INS_WEEK_SUB (
             MASTER_SEQ, FARM_NO, GUBUN, SORT_NO,
-            CNT_1, CNT_2, CNT_3, CNT_4, CNT_5, CNT_6, CNT_7,
-            VAL_1, VAL_2, VAL_3, VAL_4, VAL_5
+            CNT_1, CNT_2, CNT_3, CNT_4, CNT_5, CNT_6, CNT_7, CNT_8, CNT_9,
+            VAL_1, VAL_2, VAL_3, VAL_4, VAL_5, VAL_6, VAL_7
         ) VALUES (
             :master_seq, :farm_no, 'BM', 1,
-            :total_cnt, :sum_total, :sum_live, :sum_dead, :sum_mummy, :sum_pogae, :plan_bm,
-            :avg_total, :avg_live, :avg_dead, :avg_mummy, :avg_pogae
+            :total_cnt, :sum_total, :sum_live, :sum_dead, :sum_mummy, :sum_pogae, :plan_bm, :sum_sdotae, :sum_yangja,
+            :avg_total, :avg_live, :avg_dead, :avg_mummy, :avg_pogae, :avg_sdotae, :avg_yangja
         )
         """
         self.execute(sql_ins, {
@@ -218,11 +242,15 @@ class FarrowingProcessor(BaseProcessor):
             'sum_live': stats.get('sum_live', 0),
             'sum_dead': stats.get('sum_dead', 0),
             'sum_mummy': stats.get('sum_mummy', 0),
+            'sum_sdotae': stats.get('sum_sdotae', 0),
+            'sum_yangja': stats.get('sum_yangja', 0),
             'sum_pogae': stats.get('sum_pogae', 0),
             'avg_total': stats.get('avg_total', 0),
             'avg_live': stats.get('avg_live', 0),
             'avg_dead': stats.get('avg_dead', 0),
             'avg_mummy': stats.get('avg_mummy', 0),
+            'avg_sdotae': stats.get('avg_sdotae', 0),
+            'avg_yangja': stats.get('avg_yangja', 0),
             'avg_pogae': stats.get('avg_pogae', 0),
         })
 

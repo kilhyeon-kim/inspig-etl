@@ -174,17 +174,17 @@ def main():
             cursor.execute("""
                 SELECT MASTER_SEQ, FARM_NO, REPORT_YEAR, REPORT_WEEK_NO
                 FROM TS_INS_WEEK_BAK
-                WHERE REPORT_YEAR = 2025 AND REPORT_WEEK_NO BETWEEN 45 AND 47
+                WHERE REPORT_YEAR = 2025 AND REPORT_WEEK_NO BETWEEN 45 AND 51
                 ORDER BY REPORT_WEEK_NO, FARM_NO
             """)
             bak_week_records = cursor.fetchall()
-            print(f"  비교 대상: {len(bak_week_records)}건 (TS_INS_WEEK_BAK 45~47주)")
+            print(f"  비교 대상: {len(bak_week_records)}건 (TS_INS_WEEK_BAK 45~51주)")
 
             # 현재 ETL 테이블의 MASTER_SEQ 매핑 조회
             cursor.execute("""
                 SELECT W.MASTER_SEQ, W.FARM_NO, W.REPORT_YEAR, W.REPORT_WEEK_NO
                 FROM TS_INS_WEEK W
-                WHERE W.REPORT_YEAR = 2025 AND W.REPORT_WEEK_NO BETWEEN 45 AND 47
+                WHERE W.REPORT_YEAR = 2025 AND W.REPORT_WEEK_NO BETWEEN 45 AND 51
                 ORDER BY W.REPORT_WEEK_NO, W.FARM_NO
             """)
             etl_week_records = cursor.fetchall()

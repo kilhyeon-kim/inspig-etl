@@ -37,7 +37,7 @@ TEST_DATES = [
     '20251222',
 ]
 
-TEST_FARM_LIST = '1387,2807,4448,1456,1517'
+TEST_FARM_LIST = '1387,2807,4448,1456,1517,848'
 
 
 class WeeklyReportOrchestrator:
@@ -58,7 +58,7 @@ class WeeklyReportOrchestrator:
         self,
         base_date: Optional[str] = None,
         test_mode: bool = False,
-        skip_productivity: bool = True,  # 현재는 스킵
+        skip_productivity: bool = False,  # 생산성 수집 활성화 (테이블 생성 필요)
         skip_weather: bool = False,
         dry_run: bool = False,
         init_delete: bool = True,  # 전체 삭제 여부 (배치 실행 시 첫 번째만 True)
@@ -68,7 +68,7 @@ class WeeklyReportOrchestrator:
         Args:
             base_date: 기준 날짜 (YYYYMMDD), None이면 오늘
             test_mode: 테스트 모드 (금주 데이터)
-            skip_productivity: 생산성 수집 스킵
+            skip_productivity: 생산성 수집 스킵 (테이블 생성 후 False로 설정)
             skip_weather: 기상청 수집 스킵
             dry_run: 실제 실행 없이 설정만 확인
             init_delete: 전체 삭제 여부 (test_mode=True일 때만 적용, 배치 실행 시 첫 번째만 True)
@@ -125,29 +125,18 @@ class WeeklyReportOrchestrator:
         }
 
         try:
-            # Step 1: 생산성 데이터 수집 (현재 스킵)
-            if not skip_productivity:
-                self.logger.info("-" * 40)
-                self.logger.info("Step 1: 생산성 데이터 수집")
-                productivity_count = self._collect_productivity(dt_to)
-                result['steps']['productivity'] = productivity_count
-            else:
-                self.logger.info("Step 1: 생산성 데이터 수집 (스킵)")
-                result['steps']['productivity'] = 'skipped'
-
-            # Step 2: 기상청 데이터 수집
-            if not skip_weather:
-                self.logger.info("-" * 40)
-                self.logger.info("Step 2: 기상청 데이터 수집")
-                weather_count = self._collect_weather()
-                result['steps']['weather'] = weather_count
-            else:
-                self.logger.info("Step 2: 기상청 데이터 수집 (스킵)")
-                result['steps']['weather'] = 'skipped'
-
-            # Step 3: 주간 리포트 생성
+            # Step 1: 외부 데이터 수집 (생산성 + 기상청 병렬 처리)
             self.logger.info("-" * 40)
-            self.logger.info("Step 3: 주간 리포트 생성")
+            self.logger.info("Step 1: 외부 데이터 수집 (병렬 처리)")
+            collect_result = self._collect_external_data(
+                dt_to, skip_productivity, skip_weather
+            )
+            result['steps']['productivity'] = collect_result.get('productivity', 'skipped')
+            result['steps']['weather'] = collect_result.get('weather', 'skipped')
+
+            # Step 2: 주간 리포트 생성
+            self.logger.info("-" * 40)
+            self.logger.info("Step 2: 주간 리포트 생성")
             report_result = self._generate_weekly_report(
                 year, week_no, dt_from, dt_to, test_mode, init_delete
             )
@@ -165,15 +154,98 @@ class WeeklyReportOrchestrator:
 
         return result
 
-    def _collect_productivity(self, stat_date: str) -> int:
-        """생산성 데이터 수집"""
-        collector = ProductivityCollector(self.config, self.db)
-        return collector.run(stat_date=stat_date)
+    def _collect_productivity(self, stat_date: str) -> dict:
+        """생산성 데이터 수집
 
-    def _collect_weather(self) -> int:
+        Args:
+            stat_date: 기준 날짜 (YYYYMMDD)
+
+        Returns:
+            수집 결과 딕셔너리
+
+        Note:
+            API 파라미터 중 statDate 외에는 고정값 사용 (period=Y 등)
+        """
+        try:
+            collector = ProductivityCollector(self.config, self.db)
+            count = collector.run(stat_date=stat_date)
+            return {'status': 'success', 'count': count}
+        except Exception as e:
+            self.logger.error(f"생산성 데이터 수집 실패: {e}", exc_info=True)
+            # 테이블 미존재 등 오류 시에도 ETL 계속 진행
+            return {'status': 'error', 'error': str(e), 'count': 0}
+
+    def _collect_weather(self) -> dict:
         """기상청 데이터 수집"""
-        collector = WeatherCollector(self.config, self.db)
-        return collector.run()
+        try:
+            collector = WeatherCollector(self.config, self.db)
+            count = collector.run()
+            return {'status': 'success', 'count': count}
+        except Exception as e:
+            self.logger.error(f"기상청 데이터 수집 실패: {e}", exc_info=True)
+            return {'status': 'error', 'error': str(e), 'count': 0}
+
+    def _collect_external_data(
+        self,
+        stat_date: str,
+        skip_productivity: bool = False,
+        skip_weather: bool = False,
+    ) -> dict:
+        """외부 데이터 수집 (생산성 + 기상청 병렬 처리)
+
+        Args:
+            stat_date: 기준 날짜 (YYYYMMDD)
+            skip_productivity: 생산성 수집 스킵
+            skip_weather: 기상청 수집 스킵
+
+        Returns:
+            수집 결과 딕셔너리
+        """
+        result = {}
+
+        # 둘 다 스킵이면 바로 반환
+        if skip_productivity and skip_weather:
+            self.logger.info("  생산성/기상청 수집 모두 스킵")
+            return {'productivity': 'skipped', 'weather': 'skipped'}
+
+        # 하나만 실행하면 병렬 처리 불필요
+        if skip_productivity:
+            self.logger.info("  기상청 데이터 수집 (생산성 스킵)")
+            result['productivity'] = 'skipped'
+            result['weather'] = self._collect_weather()
+            return result
+
+        if skip_weather:
+            self.logger.info("  생산성 데이터 수집 (기상청 스킵)")
+            result['productivity'] = self._collect_productivity(stat_date)
+            result['weather'] = 'skipped'
+            return result
+
+        # 둘 다 실행: 병렬 처리
+        self.logger.info("  생산성 + 기상청 병렬 수집 시작")
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            # 병렬로 두 작업 제출
+            future_productivity = executor.submit(self._collect_productivity, stat_date)
+            future_weather = executor.submit(self._collect_weather)
+
+            # 결과 수집
+            try:
+                result['productivity'] = future_productivity.result(timeout=300)
+                self.logger.info(f"  생산성 수집 완료: {result['productivity']}")
+            except Exception as e:
+                self.logger.error(f"  생산성 수집 실패: {e}")
+                result['productivity'] = {'status': 'error', 'error': str(e), 'count': 0}
+
+            try:
+                result['weather'] = future_weather.result(timeout=300)
+                self.logger.info(f"  기상청 수집 완료: {result['weather']}")
+            except Exception as e:
+                self.logger.error(f"  기상청 수집 실패: {e}")
+                result['weather'] = {'status': 'error', 'error': str(e), 'count': 0}
+
+        self.logger.info("  외부 데이터 수집 완료")
+        return result
 
     def _generate_weekly_report(
         self,
@@ -828,16 +900,17 @@ class WeeklyReportOrchestrator:
         self,
         farm_list: str = TEST_FARM_LIST,
         dates: Optional[List[str]] = None,
-        parallel: int = 4,
+        parallel: int = 4,  # noqa: ARG002 - 호환성 유지용
     ) -> dict:
         """테스트용 배치 실행
 
-        지정된 날짜들에 대해 SP_INS_WEEK_MAIN 순차 실행
+        지정된 날짜들에 대해 Python 프로세서로 주간 리포트 생성
+        (Oracle SP_INS_WEEK_MAIN 대신 Python 프로세서 사용)
 
         Args:
             farm_list: 테스트 농장 목록 (콤마 구분)
             dates: 실행할 날짜 목록 (YYYYMMDD), None이면 기본 테스트 날짜 사용
-            parallel: 병렬 처리 레벨
+            parallel: 미사용 (기존 API 호환성 유지)
 
         Returns:
             실행 결과 딕셔너리
@@ -846,53 +919,70 @@ class WeeklyReportOrchestrator:
             dates = TEST_DATES
 
         self.logger.info("=" * 60)
-        self.logger.info("테스트 배치 실행 시작")
+        self.logger.info("테스트 배치 실행 시작 (Python 프로세서)")
         self.logger.info(f"  날짜 수: {len(dates)}")
         self.logger.info(f"  농장 목록: {farm_list}")
-        self.logger.info(f"  병렬 레벨: {parallel}")
         self.logger.info("=" * 60)
 
         results = []
 
-        with self.db.get_connection() as conn:
-            cursor = conn.cursor()
+        for i, dt in enumerate(dates, 1):
+            self.logger.info(f"[{i}/{len(dates)}] 날짜: {dt}")
+
             try:
-                for i, dt in enumerate(dates, 1):
-                    self.logger.info(f"[{i}/{len(dates)}] 날짜: {dt}")
+                # 날짜에서 year, week_no, dt_from, dt_to 계산
+                base_dt = datetime.strptime(dt, '%Y%m%d')
 
-                    # SP_INS_WEEK_MAIN(P_DAY_GB, P_BASE_DT, P_PARALLEL_LEVEL, P_TEST_MODE, P_FARM_LIST)
-                    # P_BASE_DT는 DATE 타입이므로 TO_DATE 사용
-                    sql = """
-                    BEGIN
-                        SP_INS_WEEK_MAIN(:p_day_gb, TO_DATE(:p_base_dt, 'YYYYMMDD'), :p_parallel, :p_test_mode, :p_farm_list);
-                    END;
-                    """
-                    cursor.execute(sql, {
-                        'p_day_gb': 'WEEK',
-                        'p_base_dt': dt,
-                        'p_parallel': parallel,
-                        'p_test_mode': '',  # 빈 문자열 (테스트 모드 아님 - 실제 데이터 생성)
-                        'p_farm_list': farm_list,
-                    })
-                    conn.commit()
+                # 기준일의 지난주 (월~일) 계산
+                last_sunday = base_dt - timedelta(days=base_dt.weekday() + 1)
+                last_monday = last_sunday - timedelta(days=6)
+                dt_from = last_monday.strftime('%Y%m%d')
+                dt_to = last_sunday.strftime('%Y%m%d')
 
-                    self.logger.info(f"  완료: {dt}")
-                    results.append({'date': dt, 'status': 'success'})
+                # ISO 주차 계산
+                year = int(last_sunday.strftime('%G'))
+                week_no = int(last_sunday.strftime('%V'))
+
+                self.logger.info(f"  기간: {dt_from} ~ {dt_to}, {year}년 {week_no}주")
+
+                # Python 프로세서로 주간 리포트 생성
+                # init_delete: 첫 번째만 True (전체 삭제), 이후는 False
+                init_delete = (i == 1)
+
+                report_result = self._generate_weekly_report(
+                    year=year,
+                    week_no=week_no,
+                    dt_from=dt_from,
+                    dt_to=dt_to,
+                    test_mode=True,
+                    init_delete=init_delete,
+                    use_python=True,
+                    use_async=True,
+                    farm_list=farm_list,
+                )
+
+                self.logger.info(f"  완료: {dt}")
+                results.append({
+                    'date': dt,
+                    'status': report_result.get('status', 'success'),
+                    'year': year,
+                    'week_no': week_no,
+                    'dt_from': dt_from,
+                    'dt_to': dt_to,
+                })
 
             except Exception as e:
                 self.logger.error(f"배치 실행 실패: {e}")
                 results.append({'date': dt, 'status': 'error', 'error': str(e)})
                 raise
-            finally:
-                cursor.close()
 
         self.logger.info("=" * 60)
-        self.logger.info(f"테스트 배치 완료: {len([r for r in results if r['status'] == 'success'])}/{len(dates)}")
+        self.logger.info(f"테스트 배치 완료: {len([r for r in results if r['status'] in ('success', 'complete')])}/{len(dates)}")
         self.logger.info("=" * 60)
 
         return {
             'total': len(dates),
-            'success': len([r for r in results if r['status'] == 'success']),
+            'success': len([r for r in results if r['status'] in ('success', 'complete')]),
             'failed': len([r for r in results if r['status'] == 'error']),
             'details': results,
         }

@@ -78,7 +78,7 @@ class ScheduleProcessor(BaseProcessor):
         self._insert_popup_details(v_sdt, v_edt, dt_from_obj)
 
         # 10. HELP 정보 INSERT (SUB_GUBUN='HELP')
-        self._insert_help_info(config)
+        self._insert_help_info(config, dt_from_obj)
 
         # 11. TS_INS_WEEK 업데이트
         self._update_week(stats)
@@ -96,7 +96,7 @@ class ScheduleProcessor(BaseProcessor):
         SELECT NVL(CNT_1, 115) AS PREG_PERIOD,
                NVL(CNT_2, 21) AS WEAN_PERIOD,
                NVL(CNT_3, 180) AS SHIP_DAY,
-               NVL(VAL_1, 85) AS REARING_RATE,
+               NVL(VAL_1, 90) AS REARING_RATE,
                STR_4 AS RATE_FROM,
                STR_5 AS RATE_TO
         FROM TS_INS_WEEK_SUB
@@ -119,7 +119,7 @@ class ScheduleProcessor(BaseProcessor):
             'preg_period': 115,
             'wean_period': 21,
             'ship_day': 180,
-            'rearing_rate': 85,
+            'rearing_rate': 90,
             'rate_from': '',
             'rate_to': '',
         }
@@ -510,9 +510,19 @@ class ScheduleProcessor(BaseProcessor):
             'dt_from': dt_from,
         })
 
-    def _insert_help_info(self, config: Dict[str, Any]) -> None:
-        """HELP 정보 INSERT (SUB_GUBUN='HELP')"""
+    def _insert_help_info(self, config: Dict[str, Any], dt_from: datetime) -> None:
+        """HELP 정보 INSERT (SUB_GUBUN='HELP')
+
+        출하예정 계산 안내:
+        - 출하예정두수 = N일전 이유두수 × 육성율
+        - N = 기준출하일령 - 평균포유기간 (예: 180 - 25 = 155일)
+        """
         ship_offset = config['ship_day'] - config['wean_period']
+
+        # 이유 기간 계산 (금주 출하예정 대상이 되는 이유일 범위)
+        wean_from = dt_from - timedelta(days=ship_offset)
+        wean_to = dt_from + timedelta(days=6) - timedelta(days=ship_offset)
+        wean_period_str = f"{wean_from.strftime('%Y-%m-%d')} ~ {wean_to.strftime('%Y-%m-%d')}"
 
         sql = """
         INSERT INTO TS_INS_WEEK_SUB (
@@ -528,10 +538,10 @@ class ScheduleProcessor(BaseProcessor):
                 FROM TB_PLAN_MODON WHERE FARM_NO = :farm_no AND JOB_GUBUN_CD = '150003' AND USE_YN = 'Y'),
                (SELECT LISTAGG(WK_NM || '(' || PASS_DAY || '일)', ',') WITHIN GROUP (ORDER BY WK_NM)
                 FROM TB_PLAN_MODON WHERE FARM_NO = :farm_no AND JOB_GUBUN_CD = '150004' AND USE_YN = 'Y'),
-               '* 공식: (이유두수 × 이유후육성율)' || CHR(10) ||
-               '* 이유일 = 출하예정일 - (기준출하일령 ' || :ship_day || '일 - 평균포유기간 ' || :wean_period || '일)' || CHR(10) ||
-               '  (설정값: ' || :ship_day || ' - ' || :wean_period || ' = ' || :ship_offset || '일 전)' || CHR(10) ||
-               '* 이유후육성율: ' || :rearing_rate || '% (' || :rate_from || '~' || :rate_to || ' 평균, 기본 85%)',
+               '* 육성율: ' || :rearing_rate || '% (' || :rate_from || '~' || :rate_to || ' 평균, 기본 90%)' || CHR(10) ||
+               '* 공식: ' || :ship_offset || '일전 이유두수 × 육성율' || CHR(10) ||
+               '  - 기준출하일령(' || :ship_day || '일) - 평균포유기간(' || :wean_period || '일) = ' || :ship_offset || '일' || CHR(10) ||
+               '* 이유기간: ' || :wean_period_str,
                '(고정)교배후 3주(21일~27일), 4주(28일~35일) 대상모돈'
         FROM DUAL
         """
@@ -544,6 +554,7 @@ class ScheduleProcessor(BaseProcessor):
             'rearing_rate': config['rearing_rate'],
             'rate_from': config['rate_from'],
             'rate_to': config['rate_to'],
+            'wean_period_str': wean_period_str,
         })
 
     def _update_week(self, stats: Dict[str, int]) -> None:

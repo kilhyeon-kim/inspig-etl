@@ -67,6 +67,7 @@ class Config:
         return {
             'productivity_base_url': self._config.get('api', 'productivity_base_url', fallback='http://10.4.35.10:11000'),
             'productivity_timeout': self._config.getint('api', 'productivity_timeout', fallback=60),
+            'productivity_workers': self._config.getint('api', 'productivity_workers', fallback=4),
         }
 
     @property

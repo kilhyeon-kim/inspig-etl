@@ -26,11 +26,11 @@ run_etl.py weekly
        ▼
 WeeklyReportOrchestrator.run()
        │
-       ├──▶ Step 1: 생산성 데이터 수집 (ProductivityCollector) - 현재 스킵
+       ├──▶ Step 1: 외부 데이터 수집 (병렬 처리)
+       │         ├── ProductivityCollector (생산성 API)
+       │         └── WeatherCollector (기상청 API)
        │
-       ├──▶ Step 2: 기상청 데이터 수집 (WeatherCollector)
-       │
-       └──▶ Step 3: 주간 리포트 생성
+       └──▶ Step 2: 주간 리포트 생성
               │
               ├── 전국 탕박 평균 단가 계산
               ├── TS_INS_MASTER 생성

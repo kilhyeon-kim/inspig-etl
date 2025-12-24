@@ -18,6 +18,7 @@
 | TS_INS_ACCESS_LOG | 접속 로그 | 사용자 접속 로그 |
 | TM_WEATHER | 날씨 정보 | 기상청 API 데이터 |
 | TS_PSY_DELAY_HEATMAP | PSY 히트맵 | 농장 분포 히트맵 |
+| TS_PRODUCTIVITY | 생산성 데이터 | 외부 API 수집 (PCODE별 통합) |
 
 ---
 
@@ -368,6 +369,140 @@ CREATE TABLE TS_PSY_DELAY_HEATMAP (
     CONSTRAINT PK_TS_PSY_DELAY_HEATMAP PRIMARY KEY (MASTER_SEQ, X_POS, Y_POS)
 );
 ```
+
+---
+
+## 8. TS_PRODUCTIVITY (생산성 데이터)
+
+외부 API(10.4.35.10:11000)에서 수집한 생산성 지표 저장
+
+### 기간 구분
+
+| PERIOD | 설명 | PERIOD_NO 범위 |
+|--------|------|----------------|
+| W | 주간 | 1~53 (ISO 주차) |
+| M | 월간 | 1~12 (월) |
+| Q | 분기 | 1~4 (분기) |
+
+### PCODE 구분
+
+| PCODE | 설명 | 항목 수 |
+|-------|------|---------|
+| 031 | 교배 | 28개 |
+| 032 | 분만 | 24개 |
+| 033 | 이유 | 18개 |
+| 034 | 번식종합 | 30개 |
+| 035 | 모돈현황 | 13개 |
+
+### 테이블 구조
+
+```sql
+CREATE TABLE TS_PRODUCTIVITY (
+    SEQ             NUMBER(12) NOT NULL,
+    FARM_NO         NUMBER(10) NOT NULL,
+    PCODE           VARCHAR2(3) NOT NULL,              -- 031:교배, 032:분만, 033:이유, 034:번식종합, 035:모돈현황
+    STAT_YEAR       NUMBER(4) NOT NULL,                -- 통계년도 (YYYY)
+    PERIOD          VARCHAR2(1) NOT NULL,              -- 기간구분 (W:주간, M:월간, Q:분기)
+    PERIOD_NO       NUMBER(2) NOT NULL,                -- 기간차수 (W:1~53, M:1~12, Q:1~4)
+    STAT_DATE       VARCHAR2(10) NOT NULL,             -- 통계기준일 (YYYY-MM-DD)
+    -- 데이터 컬럼 (C001~C043) - PCODE별로 사용 컬럼 다름
+    C001            NUMBER(15,4),
+    C002            NUMBER(15,4),
+    C003            NUMBER(15,4),
+    C004            NUMBER(15,4),
+    C005            NUMBER(15,4),
+    C006            NUMBER(15,4),
+    C007            NUMBER(15,4),
+    C008            NUMBER(15,4),
+    C009            NUMBER(15,4),
+    C010            NUMBER(15,4),
+    C011            NUMBER(15,4),
+    C012            NUMBER(15,4),
+    C013            NUMBER(15,4),
+    C014            NUMBER(15,4),
+    C015            NUMBER(15,4),
+    C016            NUMBER(15,4),
+    C017            NUMBER(15,4),
+    C018            NUMBER(15,4),
+    C019            NUMBER(15,4),
+    C020            NUMBER(15,4),
+    C021            NUMBER(15,4),
+    C022            NUMBER(15,4),
+    C023            NUMBER(15,4),
+    C024            NUMBER(15,4),
+    C025            NUMBER(15,4),
+    C026            NUMBER(15,4),
+    C027            NUMBER(15,4),
+    C028            NUMBER(15,4),
+    C029            NUMBER(15,4),
+    C030            NUMBER(15,4),
+    C031            NUMBER(15,4),
+    C032            NUMBER(15,4),
+    C033            NUMBER(15,4),
+    C034            NUMBER(15,4),
+    C035            NUMBER(15,4),
+    C036            NUMBER(15,4),
+    C037            NUMBER(15,4),
+    C038            NUMBER(15,4),
+    C039            NUMBER(15,4),
+    C040            NUMBER(15,4),
+    C041            NUMBER(15,4),
+    C042            NUMBER(15,4),
+    C043            NUMBER(15,4),
+    INS_DT          DATE DEFAULT SYSDATE,
+    UPD_DT          DATE,
+    CONSTRAINT PK_TS_PRODUCTIVITY PRIMARY KEY (SEQ)
+);
+
+-- 유니크 인덱스: 농장 + PCODE + 년도 + 기간구분 + 차수
+CREATE UNIQUE INDEX UK_TS_PRODUCTIVITY ON TS_PRODUCTIVITY (FARM_NO, PCODE, STAT_YEAR, PERIOD, PERIOD_NO);
+
+-- 조회용 인덱스
+CREATE INDEX IX_TS_PRODUCTIVITY_01 ON TS_PRODUCTIVITY (STAT_YEAR, PERIOD, PERIOD_NO);
+CREATE INDEX IX_TS_PRODUCTIVITY_02 ON TS_PRODUCTIVITY (PCODE, STAT_DATE);
+
+-- 시퀀스
+CREATE SEQUENCE SEQ_TS_PRODUCTIVITY START WITH 1 INCREMENT BY 1 NOCACHE NOCYCLE;
+```
+
+### 컬럼명 규칙
+
+- `C + 뒤3자리` (예: 031001 → C001, 035024 → C024)
+- TC_CODE_SYS 조인: `PCODE IN ('031','032','033','034','035'), CODE=PCODE||컬럼뒤3자리`
+- CNAME = 통계명 (STAT_NM), HELP_MSG = {"tooltip":"설명"} (JSON 형식)
+
+### PCODE별 주요 컬럼 (031: 교배)
+
+| 컬럼 | 코드 | 설명 |
+|------|------|------|
+| C001 | 031001 | 교배복수 |
+| C013 | 031013 | 정상교배 |
+| C014 | 031014 | 1차재발교배 |
+| C015 | 031015 | 2차재발교배 |
+| C016 | 031016 | 기타사고후교배 |
+| C017 | 031017 | 미경산돈교배복수 |
+| C024 | 031024 | 초교배복수(모돈편입) |
+| C025 | 031025 | 평균초교배일령 |
+| C028 | 031028 | 평균재귀발정일령 |
+| C037 | 031037 | 7일내재귀율 |
+| C039 | 031039 | 재발교배비율 |
+
+### 조회 예시
+
+```sql
+-- 2024년 52주차 주간 데이터 조회
+SELECT FARM_NO, PCODE, C023 AS PSY, C029 AS MSY
+FROM TS_PRODUCTIVITY
+WHERE STAT_YEAR = 2024 AND PERIOD = 'W' AND PERIOD_NO = 52 AND PCODE = '034';
+
+-- 2024년 12월 월간 데이터 조회
+SELECT FARM_NO, PCODE, C023 AS PSY, C029 AS MSY
+FROM TS_PRODUCTIVITY
+WHERE STAT_YEAR = 2024 AND PERIOD = 'M' AND PERIOD_NO = 12 AND PCODE = '034';
+```
+
+> 전체 DDL: [TS_PRODUCTIVITY.sql](../ddl/TS_PRODUCTIVITY.sql)
+> 상세 코드 목록: [api_stat_codes.csv](../../api_stat_codes.csv)
 
 ---
 

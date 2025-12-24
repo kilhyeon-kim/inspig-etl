@@ -238,80 +238,196 @@ class MatingProcessor(BaseProcessor):
         return stats
 
     def _insert_chart(self, dt_from: str, dt_to: str) -> int:
-        """재귀일별 교배복수 차트 INSERT"""
+        """재귀일별 교배복수 차트 INSERT
+
+        데이터 소스 우선순위:
+        1. TS_PRODUCTIVITY API 데이터 (PCODE='031', C029~C036)
+        2. SQL 계산값 (API 데이터 없을 경우)
+
+        x축 구간 (8개): 3일이내, 4일, 5일, 6일, 7일, 8일, 9일, 10일이상
+        - C029: 3일내재귀복수
+        - C030: 4일재귀복수
+        - C031: 5일재귀복수
+        - C032: 6일재귀복수
+        - C033: 7일재귀복수
+        - C034: 8일재귀복수
+        - C035: 9일재귀복수
+        - C036: 10일이상재귀복수
+        """
+        # x축 구간 정의 (8개)
+        chart_periods = [
+            (1, '~3', 'C029'),   # 3일내재귀복수
+            (2, '4', 'C030'),    # 4일재귀복수
+            (3, '5', 'C031'),    # 5일재귀복수
+            (4, '6', 'C032'),    # 6일재귀복수
+            (5, '7', 'C033'),    # 7일재귀복수
+            (6, '8', 'C034'),    # 8일재귀복수
+            (7, '9', 'C035'),    # 9일재귀복수
+            (8, '10↑', 'C036'), # 10일이상재귀복수
+        ]
+
+        # 1. TS_PRODUCTIVITY에서 API 데이터 조회 (PCODE='031')
+        api_data = self._get_productivity_chart_data()
+
+        # 2. API 데이터 있으면 사용, 없으면 SQL 계산
+        if api_data:
+            self.logger.info(f"GB_CHART: API 데이터 사용 (PCODE=031)")
+            return self._insert_chart_from_api(chart_periods, api_data)
+        else:
+            self.logger.info(f"GB_CHART: SQL 계산값 사용 (API 데이터 없음)")
+            return self._insert_chart_from_sql(chart_periods, dt_from, dt_to)
+
+    def _get_productivity_chart_data(self) -> dict:
+        """TS_PRODUCTIVITY에서 재귀일별 데이터 조회 (PCODE='031')
+
+        Returns:
+            API 데이터 딕셔너리 {'C029': 값, ...} 또는 None
+        """
+        # 리포트 년도/주차 조회
+        sql_week = """
+        SELECT REPORT_YEAR, REPORT_WEEK_NO
+        FROM TS_INS_WEEK
+        WHERE MASTER_SEQ = :master_seq AND FARM_NO = :farm_no
+        """
+        week_result = self.fetch_one(sql_week, {
+            'master_seq': self.master_seq,
+            'farm_no': self.farm_no,
+        })
+
+        if not week_result:
+            return None
+
+        report_year, report_week = week_result[0], week_result[1]
+
+        # TS_PRODUCTIVITY 조회 (PCODE='031')
         sql = """
+        SELECT C029, C030, C031, C032, C033, C034, C035, C036
+        FROM TS_PRODUCTIVITY
+        WHERE FARM_NO = :farm_no
+          AND PCODE = '031'
+          AND STAT_YEAR = :report_year
+          AND PERIOD = 'W'
+          AND PERIOD_NO = :report_week
+        """
+        result = self.fetch_one(sql, {
+            'farm_no': self.farm_no,
+            'report_year': report_year,
+            'report_week': report_week,
+        })
+
+        if not result:
+            return None
+
+        return {
+            'C029': result[0],
+            'C030': result[1],
+            'C031': result[2],
+            'C032': result[3],
+            'C033': result[4],
+            'C034': result[5],
+            'C035': result[6],
+            'C036': result[7],
+        }
+
+    def _insert_chart_from_api(self, chart_periods: list, api_data: dict) -> int:
+        """API 데이터로 차트 INSERT"""
+        insert_sql = """
         INSERT INTO TS_INS_WEEK_SUB (
             MASTER_SEQ, FARM_NO, GUBUN, SUB_GUBUN, SORT_NO, CODE_1, CNT_1
+        ) VALUES (
+            :master_seq, :farm_no, 'GB', 'CHART', :sort_no, :period, :cnt
         )
-        SELECT :master_seq, :farm_no, 'GB', 'CHART', SORT_NO, PERIOD, CNT
-        FROM (
-            SELECT
-                CASE
-                    WHEN RETURN_DAY <= 7 THEN '~7'
-                    WHEN RETURN_DAY <= 10 THEN '10'
-                    WHEN RETURN_DAY <= 15 THEN '15'
-                    WHEN RETURN_DAY <= 20 THEN '20'
-                    WHEN RETURN_DAY <= 25 THEN '25'
-                    WHEN RETURN_DAY <= 30 THEN '30'
-                    WHEN RETURN_DAY <= 35 THEN '35'
-                    WHEN RETURN_DAY <= 40 THEN '40'
-                    WHEN RETURN_DAY <= 45 THEN '45'
-                    WHEN RETURN_DAY <= 50 THEN '50'
-                    ELSE '50↑'
-                END AS PERIOD,
-                CASE
-                    WHEN RETURN_DAY <= 7 THEN 1
-                    WHEN RETURN_DAY <= 10 THEN 2
-                    WHEN RETURN_DAY <= 15 THEN 3
-                    WHEN RETURN_DAY <= 20 THEN 4
-                    WHEN RETURN_DAY <= 25 THEN 5
-                    WHEN RETURN_DAY <= 30 THEN 6
-                    WHEN RETURN_DAY <= 35 THEN 7
-                    WHEN RETURN_DAY <= 40 THEN 8
-                    WHEN RETURN_DAY <= 45 THEN 9
-                    WHEN RETURN_DAY <= 50 THEN 10
-                    ELSE 11
-                END AS SORT_NO,
-                COUNT(*) AS CNT
-            FROM (
-                SELECT TO_DATE(A.WK_DT, 'YYYYMMDD') - TO_DATE(E.WK_DT, 'YYYYMMDD') AS RETURN_DAY
-                FROM TB_MODON_WK A
-                LEFT OUTER JOIN (
-                    SELECT FARM_NO, PIG_NO, WK_DT,
-                           ROW_NUMBER() OVER (PARTITION BY FARM_NO, PIG_NO ORDER BY SEQ DESC) AS RN
-                    FROM TB_MODON_WK
-                    WHERE FARM_NO = :farm_no AND WK_GUBUN = 'E' AND USE_YN = 'Y'
-                ) E ON E.FARM_NO = A.FARM_NO AND E.PIG_NO = A.PIG_NO AND E.RN = 1
-                WHERE A.FARM_NO = :farm_no
-                  AND A.WK_GUBUN = 'G'
-                  AND A.USE_YN = 'Y'
-                  AND A.WK_DT >= :dt_from
-                  AND A.WK_DT <= :dt_to
-                  AND NOT (A.SANCHA = 0 AND A.GYOBAE_CNT = 1)
-                  AND E.WK_DT IS NOT NULL
-            )
-            GROUP BY
-                CASE WHEN RETURN_DAY <= 7 THEN '~7' WHEN RETURN_DAY <= 10 THEN '10'
-                     WHEN RETURN_DAY <= 15 THEN '15' WHEN RETURN_DAY <= 20 THEN '20'
-                     WHEN RETURN_DAY <= 25 THEN '25' WHEN RETURN_DAY <= 30 THEN '30'
-                     WHEN RETURN_DAY <= 35 THEN '35' WHEN RETURN_DAY <= 40 THEN '40'
-                     WHEN RETURN_DAY <= 45 THEN '45' WHEN RETURN_DAY <= 50 THEN '50'
-                     ELSE '50↑' END,
-                CASE WHEN RETURN_DAY <= 7 THEN 1 WHEN RETURN_DAY <= 10 THEN 2
-                     WHEN RETURN_DAY <= 15 THEN 3 WHEN RETURN_DAY <= 20 THEN 4
-                     WHEN RETURN_DAY <= 25 THEN 5 WHEN RETURN_DAY <= 30 THEN 6
-                     WHEN RETURN_DAY <= 35 THEN 7 WHEN RETURN_DAY <= 40 THEN 8
-                     WHEN RETURN_DAY <= 45 THEN 9 WHEN RETURN_DAY <= 50 THEN 10
-                     ELSE 11 END
-        )
-        ORDER BY SORT_NO
         """
-        return self.execute(sql, {
+
+        for sort_no, period, col_name in chart_periods:
+            cnt = api_data.get(col_name)
+            # None이면 0으로 처리
+            cnt_val = int(cnt) if cnt is not None else 0
+
+            self.execute(insert_sql, {
+                'master_seq': self.master_seq,
+                'farm_no': self.farm_no,
+                'sort_no': sort_no,
+                'period': period,
+                'cnt': cnt_val,
+            })
+
+        return len(chart_periods)
+
+    def _insert_chart_from_sql(self, chart_periods: list, dt_from: str, dt_to: str) -> int:
+        """SQL 계산값으로 차트 INSERT (기존 로직)
+
+        재귀일 구간: ~3, 4, 5, 6, 7, 8, 9, 10↑
+        """
+        # 1. x축 기본 행 생성 (8개 구간 모두 0으로 초기화)
+        insert_sql = """
+        INSERT INTO TS_INS_WEEK_SUB (
+            MASTER_SEQ, FARM_NO, GUBUN, SUB_GUBUN, SORT_NO, CODE_1, CNT_1
+        ) VALUES (
+            :master_seq, :farm_no, 'GB', 'CHART', :sort_no, :period, 0
+        )
+        """
+
+        for sort_no, period, _ in chart_periods:
+            self.execute(insert_sql, {
+                'master_seq': self.master_seq,
+                'farm_no': self.farm_no,
+                'sort_no': sort_no,
+                'period': period,
+            })
+
+        # 2. 실제 데이터로 UPDATE
+        update_sql = """
+        UPDATE TS_INS_WEEK_SUB
+        SET CNT_1 = (
+            SELECT NVL(SUM(CNT), 0)
+            FROM (
+                SELECT
+                    CASE
+                        WHEN RETURN_DAY <= 3 THEN 1
+                        WHEN RETURN_DAY = 4 THEN 2
+                        WHEN RETURN_DAY = 5 THEN 3
+                        WHEN RETURN_DAY = 6 THEN 4
+                        WHEN RETURN_DAY = 7 THEN 5
+                        WHEN RETURN_DAY = 8 THEN 6
+                        WHEN RETURN_DAY = 9 THEN 7
+                        ELSE 8
+                    END AS SORT_NO,
+                    1 AS CNT
+                FROM (
+                    SELECT TO_DATE(A.WK_DT, 'YYYYMMDD') - TO_DATE(E.WK_DT, 'YYYYMMDD') AS RETURN_DAY
+                    FROM TB_MODON_WK A
+                    LEFT OUTER JOIN (
+                        SELECT FARM_NO, PIG_NO, WK_DT,
+                               ROW_NUMBER() OVER (PARTITION BY FARM_NO, PIG_NO ORDER BY SEQ DESC) AS RN
+                        FROM TB_MODON_WK
+                        WHERE FARM_NO = :farm_no AND WK_GUBUN = 'E' AND USE_YN = 'Y'
+                    ) E ON E.FARM_NO = A.FARM_NO AND E.PIG_NO = A.PIG_NO AND E.RN = 1
+                    WHERE A.FARM_NO = :farm_no
+                      AND A.WK_GUBUN = 'G'
+                      AND A.USE_YN = 'Y'
+                      AND A.WK_DT >= :dt_from
+                      AND A.WK_DT <= :dt_to
+                      AND NOT (A.SANCHA = 0 AND A.GYOBAE_CNT = 1)
+                      AND E.WK_DT IS NOT NULL
+                )
+            ) D
+            WHERE D.SORT_NO = TS_INS_WEEK_SUB.SORT_NO
+        )
+        WHERE MASTER_SEQ = :master_seq
+          AND FARM_NO = :farm_no
+          AND GUBUN = 'GB'
+          AND SUB_GUBUN = 'CHART'
+        """
+
+        self.execute(update_sql, {
             'master_seq': self.master_seq,
             'farm_no': self.farm_no,
             'dt_from': dt_from,
             'dt_to': dt_to,
         })
+
+        return len(chart_periods)
 
     def _update_week(self, total_cnt: int, acc_gb_cnt: int) -> None:
         """TS_INS_WEEK 메인 테이블 업데이트"""

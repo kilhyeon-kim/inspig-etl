@@ -20,6 +20,7 @@
 ### 로컬 개발 환경
 
 ssh -i "E:/ssh key/sshkey/aws/ProdPigplanKey.pem" pigplan@10.4.35.10
+cd /data/etl/inspig
 
 ```bash
 cd C:\Projects\inspig-etl
@@ -60,6 +61,7 @@ python run_etl.py weather
 
 # 테스트 모드 (금주 데이터)
 python run_etl.py --test
+python run_etl.py --date-from 2025-11-10 --date-to 2025-12-22 --test
 
 # 특정 기준일
 python run_etl.py --base-date 2024-12-15
@@ -70,6 +72,8 @@ python run_etl.py --dry-run
 # 특정 농장 수동 실행
 python run_etl.py --manual --farm-no 12345
 python run_etl.py --manual --farm-no 12345 --dt-from 20251215 --dt-to 20251221
+
+
 ```
 
 

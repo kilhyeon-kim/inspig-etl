@@ -370,13 +370,65 @@ class ModonProcessor(BaseProcessor):
                 'code_1': parity,
             })
 
+    def _get_productivity_sangsi(self, report_year: int, report_week: int) -> Optional[float]:
+        """TS_PRODUCTIVITY에서 상시모돈 조회 (PCODE='035', C001)
+
+        Args:
+            report_year: 리포트 년도
+            report_week: 리포트 주차
+
+        Returns:
+            상시모돈수 (소수점) 또는 None
+        """
+        sql = """
+        SELECT C001
+        FROM TS_PRODUCTIVITY
+        WHERE FARM_NO = :farm_no
+          AND PCODE = '035'
+          AND STAT_YEAR = :report_year
+          AND PERIOD = 'W'
+          AND PERIOD_NO = :report_week
+        """
+        result = self.fetch_one(sql, {
+            'farm_no': self.farm_no,
+            'report_year': report_year,
+            'report_week': report_week,
+        })
+        return float(result[0]) if result and result[0] is not None else None
+
     def _update_week_totals(
         self,
         total_cnt: int,
         sangsi_cnt: int,
         prev_data: Optional[Dict[str, Any]],
     ) -> None:
-        """TS_INS_WEEK 테이블에 모돈 합계두수 UPDATE"""
+        """TS_INS_WEEK 테이블에 모돈 합계두수 UPDATE
+
+        상시모돈: TS_PRODUCTIVITY에서 조회 (PCODE='035', C001)
+        - TS_PRODUCTIVITY 데이터 있으면 사용 (소수점 2자리)
+        - 없으면 기존 방식 (MODON SUB 합계, 정수)
+        """
+        # 리포트 년도/주차 조회
+        sql_week = """
+        SELECT REPORT_YEAR, REPORT_WEEK_NO
+        FROM TS_INS_WEEK
+        WHERE MASTER_SEQ = :master_seq AND FARM_NO = :farm_no
+        """
+        week_result = self.fetch_one(sql_week, {
+            'master_seq': self.master_seq,
+            'farm_no': self.farm_no,
+        })
+
+        # TS_PRODUCTIVITY에서 상시모돈 조회
+        productivity_sangsi = None
+        if week_result:
+            report_year, report_week = week_result[0], week_result[1]
+            productivity_sangsi = self._get_productivity_sangsi(report_year, report_week)
+
+        # 상시모돈: TS_PRODUCTIVITY에서만 조회 (없으면 NULL)
+        # - MODON SUB 합계(sangsi_cnt)는 사용하지 않음 (값이 다름)
+        final_sangsi = productivity_sangsi  # None이면 NULL로 저장됨
+
         if prev_data:
             sql = """
             UPDATE TS_INS_WEEK
@@ -390,7 +442,7 @@ class ModonProcessor(BaseProcessor):
             self.execute(sql, {
                 'total_cnt': total_cnt,
                 'prev_total': prev_data['total_cnt'],
-                'sangsi_cnt': sangsi_cnt,
+                'sangsi_cnt': final_sangsi,
                 'prev_sangsi': prev_data['sangsi_cnt'],
                 'master_seq': self.master_seq,
                 'farm_no': self.farm_no,
@@ -407,7 +459,7 @@ class ModonProcessor(BaseProcessor):
             """
             self.execute(sql, {
                 'total_cnt': total_cnt,
-                'sangsi_cnt': sangsi_cnt,
+                'sangsi_cnt': final_sangsi,
                 'master_seq': self.master_seq,
                 'farm_no': self.farm_no,
             })

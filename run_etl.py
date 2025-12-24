@@ -95,7 +95,7 @@ def parse_args():
     parser.add_argument(
         '--farm-list',
         type=str,
-        default='1387,2807,4448,1456,1517',
+        default='1387,2807,4448,1456,1517,848',
         help='테스트용 농장 목록 (콤마 구분)'
     )
 
@@ -270,7 +270,7 @@ def main():
                 result = orchestrator.run(
                     base_date=run_date,
                     test_mode=args.test,
-                    skip_productivity=True,
+                    skip_productivity=False,  # 생산성 데이터 수집 (TS_PRODUCTIVITY)
                     skip_weather=True,  # 배치에서는 기상청 스킵
                     dry_run=False,
                     init_delete=is_first,  # 첫 번째만 전체 삭제
