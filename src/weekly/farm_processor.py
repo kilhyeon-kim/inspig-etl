@@ -208,17 +208,8 @@ class FarmProcessor:
             token_data = f"{self.master_seq}-{self.farm_no}-{datetime.now().strftime('%Y%m%d%H%M%S')}-{secrets.token_hex(16)}"
             share_token = hashlib.sha256(token_data.encode()).hexdigest().lower()
 
-            # DT_TO(지난주 종료일) + 7일 = 금주 일요일까지 열람 가능
-            cursor.execute("""
-                SELECT DT_TO FROM TS_INS_WEEK
-                WHERE MASTER_SEQ = :master_seq AND FARM_NO = :farm_no
-            """, {'master_seq': self.master_seq, 'farm_no': self.farm_no})
-            row = cursor.fetchone()
-            if row and row[0]:
-                dt_to = datetime.strptime(row[0], '%Y%m%d')
-                expire_dt = (dt_to + timedelta(days=7)).strftime('%Y%m%d')
-            else:
-                expire_dt = (datetime.now() + timedelta(days=7)).strftime('%Y%m%d')
+            # ETL 수행일 + 6일 = 수행일 포함 7일간 열람 가능
+            expire_dt = (datetime.now() + timedelta(days=6)).strftime('%Y%m%d')
 
             cursor.execute("""
                 UPDATE TS_INS_WEEK
