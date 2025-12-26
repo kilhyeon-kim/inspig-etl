@@ -246,8 +246,8 @@ class WeaningProcessor(BaseProcessor):
         sum_jc_ds = result[11] if result else 0
         sum_pogae = result[12] if result else 0
 
-        # 평균체중 계산 (TOTAL_KG / 이유복수)
-        avg_kg = round(sum_kg / total_cnt, 2) if total_cnt > 0 else 0
+        # 평균체중 계산 (TOTAL_KG / 총이유두수) - 이유자돈 평균체중
+        avg_kg = round(sum_kg / sum_eudusu, 2) if sum_eudusu > 0 else 0
 
         # 이유육성율 계산 (이유두수 / 실산 * 100)
         survival_rate = round(sum_eudusu / sum_silsan * 100, 1) if sum_silsan > 0 else 0

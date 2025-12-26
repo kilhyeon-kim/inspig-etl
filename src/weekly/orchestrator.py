@@ -54,6 +54,40 @@ class WeeklyReportOrchestrator:
         self.db = Database(self.config)
         self.logger = setup_logger("weekly_orchestrator", self.config.logging.get('log_path'))
 
+    def _check_schedule_enabled(self) -> bool:
+        """시스템 스케줄 실행 여부 확인
+
+        TA_SYS_CONFIG 테이블의 INS_SCHEDULE_YN 값을 확인합니다.
+        'Y'인 경우에만 True를 반환합니다.
+
+        Returns:
+            bool: INS_SCHEDULE_YN = 'Y'이면 True, 그 외 False
+        """
+        try:
+            with self.db.get_connection() as conn:
+                cursor = conn.cursor()
+                try:
+                    cursor.execute("""
+                        SELECT INS_SCHEDULE_YN
+                        FROM TA_SYS_CONFIG
+                        WHERE SEQ = 1
+                    """)
+                    result = cursor.fetchone()
+
+                    if result and result[0] == 'Y':
+                        self.logger.info("INS_SCHEDULE_YN = 'Y' - 스케줄 실행 활성화")
+                        return True
+                    else:
+                        value = result[0] if result else 'NULL'
+                        self.logger.warning(f"INS_SCHEDULE_YN = '{value}' - 스케줄 실행 비활성화")
+                        return False
+                finally:
+                    cursor.close()
+        except Exception as e:
+            self.logger.error(f"INS_SCHEDULE_YN 확인 실패: {e}")
+            # 오류 시 기본적으로 실행하지 않음 (안전 모드)
+            return False
+
     def run(
         self,
         base_date: Optional[str] = None,
@@ -79,6 +113,15 @@ class WeeklyReportOrchestrator:
         self.logger.info("=" * 60)
         self.logger.info("InsightPig Weekly ETL 시작")
         self.logger.info("=" * 60)
+
+        # INS_SCHEDULE_YN 체크 (시스템 스케줄 실행 여부)
+        if not self._check_schedule_enabled():
+            self.logger.warning("INS_SCHEDULE_YN = 'N' - 스케줄 실행이 비활성화되어 있습니다.")
+            return {
+                'status': 'skipped',
+                'reason': 'INS_SCHEDULE_YN is not Y',
+                'message': '시스템 설정(TA_SYS_CONFIG.INS_SCHEDULE_YN)이 N으로 설정되어 ETL이 실행되지 않았습니다.',
+            }
 
         # 기준 날짜 설정
         if base_date:
@@ -769,7 +812,16 @@ class WeeklyReportOrchestrator:
         return master_seq
 
     def _get_target_farms(self, cursor, farm_list: Optional[str], test_mode: bool) -> List[dict]:
-        """대상 농장 조회"""
+        """대상 농장 조회
+
+        TS_INS_SERVICE 필터링 조건:
+        - INSPIG_YN = 'Y': 인사이트피그 서비스 사용
+        - INSPIG_FROM_DT IS NOT NULL: 시작일 필수
+        - INSPIG_TO_DT IS NOT NULL: 종료일 필수
+        - INSPIG_FROM_DT <= SYSDATE: 서비스 시작일 이후
+        - SYSDATE <= LEAST(INSPIG_TO_DT, INSPIG_STOP_DT): 종료일/중지일 중 빠른 날짜 이전
+        - INSPIG_STOP_DT 기본값: 9999-12-31 (NULL이면 중지 안됨)
+        """
         sql = """
         SELECT DISTINCT F.FARM_NO, F.FARM_NM, F.PRINCIPAL_NM, F.SIGUN_CD,
                NVL(F.COUNTRY_CODE, 'KOR') AS LOCALE
@@ -778,8 +830,13 @@ class WeeklyReportOrchestrator:
         WHERE F.USE_YN = 'Y'
           AND S.INSPIG_YN = 'Y'
           AND S.USE_YN = 'Y'
-          AND (S.INSPIG_TO_DT IS NULL OR S.INSPIG_TO_DT >= TO_CHAR(SYSDATE, 'YYYYMMDD'))
-          AND S.INSPIG_STOP_DT IS NULL
+          AND S.INSPIG_FROM_DT IS NOT NULL
+          AND S.INSPIG_TO_DT IS NOT NULL
+          AND TO_CHAR(SYSDATE, 'YYYYMMDD') >= S.INSPIG_FROM_DT
+          AND TO_CHAR(SYSDATE, 'YYYYMMDD') <= LEAST(
+              S.INSPIG_TO_DT,
+              NVL(S.INSPIG_STOP_DT, '99991231')
+          )
         """
 
         if farm_list:

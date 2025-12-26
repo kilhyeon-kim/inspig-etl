@@ -95,7 +95,7 @@ def parse_args():
     parser.add_argument(
         '--farm-list',
         type=str,
-        default='1387,2807,4448,1456,1517,848',
+        default='1387,2807,848,4223,1013',
         help='테스트용 농장 목록 (콤마 구분)'
     )
 
