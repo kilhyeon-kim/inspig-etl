@@ -132,7 +132,13 @@ class WeeklyReportOrchestrator:
         # 기간 계산: 기준일의 지난주 (월~일, 7일)
         # test_mode 여부와 관계없이 항상 지난주 전체를 처리
         # 예: 기준일 2025-11-10 (월) → 지난주 2025-11-03 (월) ~ 2025-11-09 (일)
-        last_sunday = base_dt - timedelta(days=base_dt.weekday() + 1)
+        #
+        # 지난주 일요일 계산:
+        # - 일요일(weekday=6)인 경우: 7일 전이 지난주 일요일
+        # - 그 외: (weekday+1)일 전이 지난주 일요일
+        # 공식: (weekday + 1) % 7 또는 7 -> 일요일이면 7, 아니면 weekday+1
+        days_to_last_sunday = (base_dt.weekday() + 1) % 7 or 7
+        last_sunday = base_dt - timedelta(days=days_to_last_sunday)
         last_monday = last_sunday - timedelta(days=6)
         dt_from = last_monday.strftime('%Y%m%d')
         dt_to = last_sunday.strftime('%Y%m%d')
@@ -991,7 +997,9 @@ class WeeklyReportOrchestrator:
                 base_dt = datetime.strptime(dt, '%Y%m%d')
 
                 # 기준일의 지난주 (월~일) 계산
-                last_sunday = base_dt - timedelta(days=base_dt.weekday() + 1)
+                # 지난주 일요일: 일요일이면 7일 전, 그 외는 (weekday+1)일 전
+                days_to_last_sunday = (base_dt.weekday() + 1) % 7 or 7
+                last_sunday = base_dt - timedelta(days=days_to_last_sunday)
                 last_monday = last_sunday - timedelta(days=6)
                 dt_from = last_monday.strftime('%Y%m%d')
                 dt_to = last_sunday.strftime('%Y%m%d')
@@ -1079,10 +1087,13 @@ class WeeklyReportOrchestrator:
 
         self.logger.info(f"기간: {dt_from} ~ {dt_to}")
 
-        # 주차 정보 계산
-        dt_from_obj = datetime.strptime(dt_from, '%Y%m%d')
-        year = dt_from_obj.isocalendar()[0]
-        week_no = dt_from_obj.isocalendar()[1]
+        # 주차 정보 계산 (dt_to 일요일 기준으로 ISO Week 계산)
+        # 월요일(dt_from)이 아닌 일요일(dt_to)의 ISO Week를 사용해야 함
+        # 예: 2025-12-22(월)~28(일) -> 2025년 52주 (dt_to=12/28 기준)
+        # 예: 2025-12-29(월)~01/04(일) -> 2026년 1주 (dt_to=01/04 기준)
+        dt_to_obj = datetime.strptime(dt_to, '%Y%m%d')
+        year = dt_to_obj.isocalendar()[0]
+        week_no = dt_to_obj.isocalendar()[1]
 
         try:
             with self.db.get_connection() as conn:
