@@ -126,12 +126,33 @@ python run_etl.py --init --farm-list "1387,2807"
 특정 농장의 주간 리포트를 수동으로 생성:
 
 ```bash
-# 기본 실행 (지난주 기준 자동 계산)
+# 기본 실행 (오늘 기준 자동 계산)
 python run_etl.py --manual --farm-no 12345
-
-# 특정 기간 지정
-python run_etl.py --manual --farm-no 12345 --dt-from 20251215 --dt-to 20251221
 ```
+
+### 2.5 날짜 범위 배치 실행
+
+```bash
+# 2025-11-10부터 2025-12-22까지 7일 간격으로 배치 실행
+python run_etl.py --date-from 2025-11-10 --date-to 2025-12-22
+
+# 테스트 모드와 함께
+python run_etl.py --date-from 2025-11-10 --date-to 2025-12-22 --test
+```
+
+### 2.6 INS_DT(기준일) 개념
+
+ETL의 모든 날짜 파라미터는 **INS_DT(기준일)** 기준입니다:
+
+| INS_DT | 지난주(DT_FROM~DT_TO) | 금주 | REPORT_WEEK |
+|--------|----------------------|------|-------------|
+| 12/22(월)~12/28(일) | 12/15~12/21 | 12/22~12/28 | 51주 |
+| 12/29(월)~12/31(수) | 12/22~12/28 | 12/29~01/04 | 52주 |
+
+- **INS_DT**: 기준일 (ETL 실행일 또는 지정된 날짜)
+- **지난주**: INS_DT가 속한 주의 이전 주 (월~일)
+- **금주**: INS_DT가 속한 주 (월~일)
+- **REPORT_WEEK**: 지난주의 ISO Week
 
 
 ## 3. 스케줄 설정
@@ -235,23 +256,51 @@ Response:
 }
 ```
 
-### 5.2 특정 농장 수동 ETL
+### 5.2 특정 농장 수동 ETL (Python ETL API)
 
 ```
-POST /batch/manual
+POST /api/etl/run-farm
 Content-Type: application/json
 
 {
     "farmNo": 12345,
-    "dtFrom": "20251215",  // 선택
-    "dtTo": "20251221"     // 선택
+    "dayGb": "WEEK",       // WEEK, MONTH, QUARTER (기본: WEEK)
+    "insDate": "20251229"  // 선택, 기준일(INS_DT), 미입력시 오늘
 }
 
 Response:
 {
-    "success": true,
-    "message": "ETL 작업이 시작되었습니다. 농장=12345",
-    "taskId": "manual_12345_1734850000000"
+    "status": "success",
+    "farmNo": 12345,
+    "dayGb": "WEEK",
+    "shareToken": "abc123...",
+    "year": 2025,
+    "weekNo": 52,
+    "insDate": "20251229",
+    "dtFrom": "20251222",
+    "dtTo": "20251228",
+    "message": "ETL 완료"
+}
+```
+
+> **INS_DT 기준 계산**: insDate가 2025-12-29(월)이면 지난주는 12/22~12/28 (52주)
+
+### 5.3 농장 리포트 상태 조회
+
+```
+GET /api/etl/status/{farm_no}?day_gb=WEEK
+
+Response:
+{
+    "exists": true,
+    "farmNo": 12345,
+    "dayGb": "WEEK",
+    "shareToken": "abc123...",
+    "year": 2025,
+    "weekNo": 52,
+    "dtFrom": "20251222",
+    "dtTo": "20251228",
+    "statusCd": "COMPLETE"
 }
 ```
 

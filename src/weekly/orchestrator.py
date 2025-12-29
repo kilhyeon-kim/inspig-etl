@@ -1055,8 +1055,7 @@ class WeeklyReportOrchestrator:
     def run_single_farm(
         self,
         farm_no: int,
-        dt_from: Optional[str] = None,
-        dt_to: Optional[str] = None,
+        ins_date: Optional[str] = None,
     ) -> dict:
         """단일 농장 수동 ETL 실행
 
@@ -1064,36 +1063,39 @@ class WeeklyReportOrchestrator:
 
         Args:
             farm_no: 농장번호
-            dt_from: 시작일 (YYYYMMDD), None이면 지난주 월요일
-            dt_to: 종료일 (YYYYMMDD), None이면 지난주 일요일
+            ins_date: 기준일 INS_DT (YYYYMMDD), None이면 오늘
 
         Returns:
             실행 결과 딕셔너리
+            - ins_date: 기준일
+            - dt_from, dt_to: 리포트 기간 (지난주 월~일)
+            - year, week_no: ISO 주차 정보
         """
         self.logger.info("=" * 60)
         self.logger.info(f"단일 농장 수동 ETL 시작: farm_no={farm_no}")
         self.logger.info("=" * 60)
 
-        # 날짜 자동 계산 (지정되지 않은 경우, 한국 시간 기준)
-        if not dt_from or not dt_to:
-            today = now_kst()
-            # 지난주 월요일 (오늘 기준 이번주 월요일 - 7일)
-            this_monday = today - timedelta(days=today.weekday())
-            last_monday = this_monday - timedelta(days=7)
-            last_sunday = last_monday + timedelta(days=6)
+        # 기준일 (INS_DT) 설정
+        if ins_date:
+            base_dt = datetime.strptime(ins_date, '%Y%m%d')
+        else:
+            base_dt = now_kst()
+            ins_date = base_dt.strftime('%Y%m%d')
 
-            dt_from = dt_from or last_monday.strftime('%Y%m%d')
-            dt_to = dt_to or last_sunday.strftime('%Y%m%d')
+        # 지난주 계산 (INS_DT 기준)
+        # 지난주 일요일: 일요일이면 7일 전, 그 외는 (weekday+1)일 전
+        days_to_last_sunday = (base_dt.weekday() + 1) % 7 or 7
+        last_sunday = base_dt - timedelta(days=days_to_last_sunday)
+        last_monday = last_sunday - timedelta(days=6)
+        dt_from = last_monday.strftime('%Y%m%d')
+        dt_to = last_sunday.strftime('%Y%m%d')
 
-        self.logger.info(f"기간: {dt_from} ~ {dt_to}")
+        self.logger.info(f"기준일(INS_DT): {ins_date}")
+        self.logger.info(f"리포트 기간: {dt_from} ~ {dt_to}")
 
-        # 주차 정보 계산 (dt_to 일요일 기준으로 ISO Week 계산)
-        # 월요일(dt_from)이 아닌 일요일(dt_to)의 ISO Week를 사용해야 함
-        # 예: 2025-12-22(월)~28(일) -> 2025년 52주 (dt_to=12/28 기준)
-        # 예: 2025-12-29(월)~01/04(일) -> 2026년 1주 (dt_to=01/04 기준)
-        dt_to_obj = datetime.strptime(dt_to, '%Y%m%d')
-        year = dt_to_obj.isocalendar()[0]
-        week_no = dt_to_obj.isocalendar()[1]
+        # 주차 정보 계산 (지난주 일요일 기준 ISO Week)
+        year = int(last_sunday.strftime('%G'))
+        week_no = int(last_sunday.strftime('%V'))
 
         try:
             with self.db.get_connection() as conn:
@@ -1199,6 +1201,7 @@ class WeeklyReportOrchestrator:
                 'share_token': share_token,
                 'year': year,
                 'week_no': week_no,
+                'ins_date': ins_date,
                 'dt_from': dt_from,
                 'dt_to': dt_to,
             }

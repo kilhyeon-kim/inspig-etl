@@ -13,9 +13,12 @@ API:
     {
         "farmNo": 2807,
         "dayGb": "WEEK",       // WEEK, MONTH, QUARTER (default: WEEK)
-        "dtFrom": "20251223",  // optional
-        "dtTo": "20251229"     // optional
+        "insDate": "20251229"  // optional, 기준일(INS_DT), 미입력시 오늘
     }
+
+    insDate 기준으로 지난주/지난달/지난분기 리포트를 생성합니다.
+    - insDate가 2025-12-29(월)이면 → 지난주: 12/22~12/28 (52주)
+    - insDate가 2025-12-28(일)이면 → 지난주: 12/15~12/21 (51주)
 
     Response:
     {
@@ -27,8 +30,9 @@ API:
         "weekNo": 52,          // WEEK인 경우
         "monthNo": null,       // MONTH인 경우
         "quarterNo": null,     // QUARTER인 경우
-        "dtFrom": "20251223",
-        "dtTo": "20251229"
+        "insDate": "20251229",
+        "dtFrom": "20251222",
+        "dtTo": "20251228"
     }
 """
 
@@ -80,8 +84,7 @@ class RunFarmRequest(BaseModel):
     """농장별 ETL 실행 요청"""
     farmNo: int = Field(..., description="농장번호", ge=1)
     dayGb: DayGbEnum = Field(DayGbEnum.WEEK, description="리포트 구분 (WEEK, MONTH, QUARTER)")
-    dtFrom: Optional[str] = Field(None, description="리포트 시작일 (YYYYMMDD)", pattern=r"^\d{8}$")
-    dtTo: Optional[str] = Field(None, description="리포트 종료일 (YYYYMMDD)", pattern=r"^\d{8}$")
+    insDate: Optional[str] = Field(None, description="기준일 INS_DT (YYYYMMDD), 미입력시 오늘", pattern=r"^\d{8}$")
 
 
 class RunFarmResponse(BaseModel):
@@ -94,8 +97,9 @@ class RunFarmResponse(BaseModel):
     weekNo: Optional[int] = None      # WEEK인 경우
     monthNo: Optional[int] = None     # MONTH인 경우
     quarterNo: Optional[int] = None   # QUARTER인 경우
-    dtFrom: Optional[str] = None
-    dtTo: Optional[str] = None
+    insDate: Optional[str] = None     # 기준일 (INS_DT)
+    dtFrom: Optional[str] = None      # 리포트 시작일
+    dtTo: Optional[str] = None        # 리포트 종료일
     message: Optional[str] = None
     error: Optional[str] = None
 
@@ -138,16 +142,21 @@ async def run_farm_etl(request: RunFarmRequest):
 
     - farmNo: 농장번호 (필수)
     - dayGb: 리포트 구분 (WEEK, MONTH, QUARTER, 기본: WEEK)
-    - dtFrom, dtTo: 리포트 기간 (선택, 미입력시 자동 계산)
+    - insDate: 기준일 INS_DT (선택, 미입력시 오늘)
+
+    insDate 기준으로 지난주/지난달/지난분기 리포트를 생성합니다.
 
     Returns:
         - status: success/error
         - shareToken: 생성된 공유 토큰
         - year, weekNo/monthNo/quarterNo: 기간 정보
+        - insDate, dtFrom, dtTo: 날짜 정보
     """
     try:
         day_gb = request.dayGb.value
-        logger.info(f"ETL 요청 수신: farmNo={request.farmNo}, dayGb={day_gb}, dtFrom={request.dtFrom}, dtTo={request.dtTo}")
+        ins_date = request.insDate or now_kst().strftime('%Y%m%d')
+
+        logger.info(f"ETL 요청 수신: farmNo={request.farmNo}, dayGb={day_gb}, insDate={ins_date}")
 
         # 현재는 WEEK만 구현, MONTH/QUARTER는 추후 구현
         if day_gb != "WEEK":
@@ -161,11 +170,10 @@ async def run_farm_etl(request: RunFarmRequest):
 
         orchestrator = get_orchestrator()
 
-        # ETL 실행
+        # ETL 실행 (insDate 기준으로 지난주 계산은 run_single_farm 내부에서 처리)
         result = orchestrator.run_single_farm(
             farm_no=request.farmNo,
-            dt_from=request.dtFrom,
-            dt_to=request.dtTo,
+            ins_date=ins_date,
         )
 
         if result.get('status') == 'success':
@@ -176,6 +184,7 @@ async def run_farm_etl(request: RunFarmRequest):
                 shareToken=result.get('share_token'),
                 year=result.get('year'),
                 weekNo=result.get('week_no'),
+                insDate=result.get('ins_date'),
                 dtFrom=result.get('dt_from'),
                 dtTo=result.get('dt_to'),
                 message="ETL 완료"
