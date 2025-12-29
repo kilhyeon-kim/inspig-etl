@@ -1,7 +1,7 @@
 """
 InsightPig ETL REST API Server
 
-pig3.1에서 호출하여 특정 농장의 주간 리포트를 생성합니다.
+pig3.1에서 호출하여 특정 농장의 주간/월간/분기 리포트를 생성합니다.
 
 실행:
     python -m src.api.server
@@ -12,6 +12,7 @@ API:
     POST /api/etl/run-farm
     {
         "farmNo": 2807,
+        "dayGb": "WEEK",       // WEEK, MONTH, QUARTER (default: WEEK)
         "dtFrom": "20251223",  // optional
         "dtTo": "20251229"     // optional
     }
@@ -20,9 +21,12 @@ API:
     {
         "status": "success",
         "farmNo": 2807,
+        "dayGb": "WEEK",
         "shareToken": "abc123...",
         "year": 2025,
-        "weekNo": 52,
+        "weekNo": 52,          // WEEK인 경우
+        "monthNo": null,       // MONTH인 경우
+        "quarterNo": null,     // QUARTER인 경우
         "dtFrom": "20251223",
         "dtTo": "20251229"
     }
@@ -30,7 +34,8 @@ API:
 
 import logging
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Optional, Literal
+from enum import Enum
 from pydantic import BaseModel, Field
 
 from fastapi import FastAPI, HTTPException
@@ -43,14 +48,21 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from src.common import Config, setup_logger, now_kst
 from src.weekly import WeeklyReportOrchestrator
 
+
+class DayGbEnum(str, Enum):
+    """리포트 구분"""
+    WEEK = "WEEK"
+    MONTH = "MONTH"
+    QUARTER = "QUARTER"
+
 # 로거 설정
 logger = logging.getLogger(__name__)
 
 # FastAPI 앱 생성
 app = FastAPI(
     title="InsightPig ETL API",
-    description="주간 리포트 ETL 실행 API",
-    version="1.0.0",
+    description="주간/월간/분기 리포트 ETL 실행 API",
+    version="1.1.0",
 )
 
 # CORS 설정 (pig3.1 서버에서 호출 허용)
@@ -67,6 +79,7 @@ app.add_middleware(
 class RunFarmRequest(BaseModel):
     """농장별 ETL 실행 요청"""
     farmNo: int = Field(..., description="농장번호", ge=1)
+    dayGb: DayGbEnum = Field(DayGbEnum.WEEK, description="리포트 구분 (WEEK, MONTH, QUARTER)")
     dtFrom: Optional[str] = Field(None, description="리포트 시작일 (YYYYMMDD)", pattern=r"^\d{8}$")
     dtTo: Optional[str] = Field(None, description="리포트 종료일 (YYYYMMDD)", pattern=r"^\d{8}$")
 
@@ -75,9 +88,12 @@ class RunFarmResponse(BaseModel):
     """농장별 ETL 실행 응답"""
     status: str
     farmNo: int
+    dayGb: str = "WEEK"
     shareToken: Optional[str] = None
     year: Optional[int] = None
-    weekNo: Optional[int] = None
+    weekNo: Optional[int] = None      # WEEK인 경우
+    monthNo: Optional[int] = None     # MONTH인 경우
+    quarterNo: Optional[int] = None   # QUARTER인 경우
     dtFrom: Optional[str] = None
     dtTo: Optional[str] = None
     message: Optional[str] = None
@@ -118,18 +134,30 @@ async def health_check():
 @app.post("/api/etl/run-farm", response_model=RunFarmResponse)
 async def run_farm_etl(request: RunFarmRequest):
     """
-    특정 농장의 주간 리포트 ETL 실행
+    특정 농장의 주간/월간/분기 리포트 ETL 실행
 
     - farmNo: 농장번호 (필수)
-    - dtFrom, dtTo: 리포트 기간 (선택, 미입력시 지난주 자동 계산)
+    - dayGb: 리포트 구분 (WEEK, MONTH, QUARTER, 기본: WEEK)
+    - dtFrom, dtTo: 리포트 기간 (선택, 미입력시 자동 계산)
 
     Returns:
         - status: success/error
         - shareToken: 생성된 공유 토큰
-        - year, weekNo: 주차 정보
+        - year, weekNo/monthNo/quarterNo: 기간 정보
     """
     try:
-        logger.info(f"ETL 요청 수신: farmNo={request.farmNo}, dtFrom={request.dtFrom}, dtTo={request.dtTo}")
+        day_gb = request.dayGb.value
+        logger.info(f"ETL 요청 수신: farmNo={request.farmNo}, dayGb={day_gb}, dtFrom={request.dtFrom}, dtTo={request.dtTo}")
+
+        # 현재는 WEEK만 구현, MONTH/QUARTER는 추후 구현
+        if day_gb != "WEEK":
+            return RunFarmResponse(
+                status="error",
+                farmNo=request.farmNo,
+                dayGb=day_gb,
+                error=f"{day_gb} 리포트는 아직 구현되지 않았습니다.",
+                message="현재 WEEK 리포트만 지원됩니다."
+            )
 
         orchestrator = get_orchestrator()
 
@@ -144,6 +172,7 @@ async def run_farm_etl(request: RunFarmRequest):
             return RunFarmResponse(
                 status="success",
                 farmNo=request.farmNo,
+                dayGb=day_gb,
                 shareToken=result.get('share_token'),
                 year=result.get('year'),
                 weekNo=result.get('week_no'),
@@ -155,6 +184,7 @@ async def run_farm_etl(request: RunFarmRequest):
             return RunFarmResponse(
                 status="error",
                 farmNo=request.farmNo,
+                dayGb=day_gb,
                 error=result.get('error', 'Unknown error'),
                 message=result.get('message')
             )
@@ -165,56 +195,76 @@ async def run_farm_etl(request: RunFarmRequest):
 
 
 @app.get("/api/etl/status/{farm_no}")
-async def get_etl_status(farm_no: int):
+async def get_etl_status(farm_no: int, day_gb: str = "WEEK"):
     """
-    농장의 최신 주간 리포트 상태 조회
+    농장의 최신 리포트 상태 조회
+
+    - farm_no: 농장번호
+    - day_gb: 리포트 구분 (WEEK, MONTH, QUARTER, 기본: WEEK)
 
     Returns:
         - exists: 리포트 존재 여부
         - shareToken: 공유 토큰 (있는 경우)
-        - year, weekNo: 주차 정보
+        - year, weekNo/monthNo/quarterNo: 기간 정보
     """
     try:
+        day_gb = day_gb.upper()
+        if day_gb not in ["WEEK", "MONTH", "QUARTER"]:
+            raise HTTPException(status_code=400, detail=f"잘못된 day_gb: {day_gb}")
+
         orchestrator = get_orchestrator()
+
+        # 테이블/컬럼 매핑
+        table_map = {
+            "WEEK": ("TS_INS_WEEK", "REPORT_WEEK_NO", "weekNo"),
+            "MONTH": ("TS_INS_MONTH", "REPORT_MONTH_NO", "monthNo"),
+            "QUARTER": ("TS_INS_QUARTER", "REPORT_QUARTER_NO", "quarterNo"),
+        }
+        table_name, period_col, period_key = table_map[day_gb]
 
         # DB에서 최신 리포트 조회
         with orchestrator.db.get_connection() as conn:
             cursor = conn.cursor()
             try:
-                cursor.execute("""
-                    SELECT W.SHARE_TOKEN, W.REPORT_YEAR, W.REPORT_WEEK_NO,
+                cursor.execute(f"""
+                    SELECT W.SHARE_TOKEN, W.REPORT_YEAR, W.{period_col},
                            W.DT_FROM, W.DT_TO, W.STATUS_CD
-                    FROM TS_INS_WEEK W
+                    FROM {table_name} W
                     INNER JOIN TS_INS_MASTER M ON W.MASTER_SEQ = M.SEQ
                     WHERE W.FARM_NO = :farm_no
-                      AND M.DAY_GB = 'WEEK'
+                      AND M.DAY_GB = :day_gb
                       AND M.STATUS_CD = 'COMPLETE'
                       AND W.STATUS_CD = 'COMPLETE'
-                    ORDER BY W.REPORT_YEAR DESC, W.REPORT_WEEK_NO DESC
+                    ORDER BY W.REPORT_YEAR DESC, W.{period_col} DESC
                     FETCH FIRST 1 ROWS ONLY
-                """, {'farm_no': farm_no})
+                """, {'farm_no': farm_no, 'day_gb': day_gb})
                 row = cursor.fetchone()
 
                 if row:
-                    return {
+                    result = {
                         "exists": True,
                         "farmNo": farm_no,
+                        "dayGb": day_gb,
                         "shareToken": row[0],
                         "year": row[1],
-                        "weekNo": row[2],
                         "dtFrom": row[3],
                         "dtTo": row[4],
                         "statusCd": row[5]
                     }
+                    result[period_key] = row[2]
+                    return result
                 else:
                     return {
                         "exists": False,
                         "farmNo": farm_no,
-                        "message": "주간 리포트가 없습니다."
+                        "dayGb": day_gb,
+                        "message": f"{day_gb} 리포트가 없습니다."
                     }
             finally:
                 cursor.close()
 
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"상태 조회 오류: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))

@@ -58,8 +58,16 @@ def parse_args():
         'command',
         nargs='?',
         default='all',
-        choices=['all', 'weekly', 'weather', 'productivity'],
+        choices=['all', 'weekly', 'monthly', 'quarterly', 'weather', 'productivity'],
         help='실행할 ETL 작업 (기본: all)'
+    )
+
+    parser.add_argument(
+        '--day-gb',
+        type=str,
+        default='WEEK',
+        choices=['WEEK', 'MONTH', 'QUARTER'],
+        help='리포트 구분 (WEEK, MONTH, QUARTER, 기본: WEEK)'
     )
 
     parser.add_argument(
@@ -171,8 +179,15 @@ def main():
             print("수동 ETL 실행 모드")
             print("=" * 60)
             print(f"농장번호: {args.farm_no}")
+            print(f"리포트구분: {args.day_gb}")
             print(f"기간: {args.dt_from or 'auto'} ~ {args.dt_to or 'auto'}")
             print()
+
+            # 현재는 WEEK만 구현
+            if args.day_gb != 'WEEK':
+                print(f"ERROR: {args.day_gb} 리포트는 아직 구현되지 않았습니다.")
+                print("       현재 WEEK 리포트만 지원됩니다.")
+                sys.exit(1)
 
             orchestrator = WeeklyReportOrchestrator(config)
             result = orchestrator.run_single_farm(
