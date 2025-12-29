@@ -276,7 +276,14 @@ class ProductivityCollector(BaseCollector):
         return result
 
     def _get_farm_list(self) -> List[Dict]:
-        """DB에서 대상 농장 목록 조회"""
+        """DB에서 대상 농장 목록 조회
+
+        TS_INS_SERVICE 필터링 조건 (orchestrator._get_target_farms와 동일):
+        - INSPIG_YN = 'Y': 인사이트피그 서비스 사용
+        - INSPIG_FROM_DT <= SYSDATE: 서비스 시작일 이후
+        - SYSDATE <= LEAST(INSPIG_TO_DT, INSPIG_STOP_DT): 종료일/중지일 중 빠른 날짜 이전
+        - INSPIG_STOP_DT 기본값: 9999-12-31 (NULL이면 중지 안됨)
+        """
         sql = """
             SELECT DISTINCT F.FARM_NO
             FROM TA_FARM F
@@ -284,8 +291,13 @@ class ProductivityCollector(BaseCollector):
             WHERE F.USE_YN = 'Y'
               AND S.INSPIG_YN = 'Y'
               AND S.USE_YN = 'Y'
-              AND (S.INSPIG_TO_DT IS NULL OR S.INSPIG_TO_DT >= TO_CHAR(SYSDATE, 'YYYYMMDD'))
-              AND S.INSPIG_STOP_DT IS NULL
+              AND S.INSPIG_FROM_DT IS NOT NULL
+              AND S.INSPIG_TO_DT IS NOT NULL
+              AND TO_CHAR(SYSDATE, 'YYYYMMDD') >= S.INSPIG_FROM_DT
+              AND TO_CHAR(SYSDATE, 'YYYYMMDD') <= LEAST(
+                  S.INSPIG_TO_DT,
+                  NVL(S.INSPIG_STOP_DT, '99991231')
+              )
             ORDER BY F.FARM_NO
         """
         return self.db.fetch_dict(sql)
