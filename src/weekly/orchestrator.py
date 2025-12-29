@@ -14,7 +14,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from typing import List, Optional
 
-from ..common import Config, Database, setup_logger, now_kst, get_service_farms
+from ..common import Config, Database, setup_logger, now_kst
+from ..common.farm_service import SERVICE_FARM_SQL
 from ..collectors import WeatherCollector, ProductivityCollector
 
 logger = logging.getLogger(__name__)
@@ -820,13 +821,24 @@ class WeeklyReportOrchestrator:
     def _get_target_farms(self, cursor, farm_list: Optional[str], test_mode: bool) -> List[dict]:
         """대상 농장 조회
 
-        공통 함수 get_service_farms()를 사용하여 일관성 보장.
-        SQL은 src/common/farm_service.py에서 중앙 관리.
-
-        Note:
-            cursor 파라미터는 기존 API 호환성을 위해 유지 (미사용)
+        SQL은 src/common/farm_service.py의 SERVICE_FARM_SQL 사용 (중앙 관리).
+        기존 cursor를 사용하여 연결 일관성 유지.
         """
-        return get_service_farms(self.db, farm_list)
+        sql = SERVICE_FARM_SQL
+
+        if farm_list:
+            # 농장 목록이 지정된 경우 필터링
+            farm_nos = [int(f.strip()) for f in farm_list.split(',') if f.strip()]
+            placeholders = ', '.join([f':f{i}' for i in range(len(farm_nos))])
+            sql = sql.replace('ORDER BY F.FARM_NO', f'AND F.FARM_NO IN ({placeholders})\n    ORDER BY F.FARM_NO')
+
+            params = {f'f{i}': f for i, f in enumerate(farm_nos)}
+            cursor.execute(sql, params)
+        else:
+            cursor.execute(sql)
+
+        columns = [col[0] for col in cursor.description]
+        return [dict(zip(columns, row)) for row in cursor.fetchall()]
 
     def _create_week_records(
         self,
