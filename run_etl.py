@@ -315,8 +315,8 @@ def main():
             result = orchestrator.run(
                 base_date=base_date,
                 test_mode=args.test,
-                skip_productivity=True,  # 현재 스킵
-                skip_weather=args.skip_weather or args.command == 'weekly',
+                skip_productivity=False,  # 생산성 수집 활성화
+                skip_weather=True,  # 기상청 수집 스킵 (별도 API 사용)
                 dry_run=args.dry_run,
             )
             print(f"결과: {result}")
