@@ -25,7 +25,7 @@ from src.api import run_server
 def main():
     parser = argparse.ArgumentParser(description='InsightPig ETL API 서버')
     parser.add_argument('--host', default='0.0.0.0', help='바인드 호스트 (기본: 0.0.0.0)')
-    parser.add_argument('--port', type=int, default=8000, help='포트 (기본: 8000)')
+    parser.add_argument('--port', type=int, default=8001, help='포트 (기본: 8001)')
 
     args = parser.parse_args()
     run_server(host=args.host, port=args.port)

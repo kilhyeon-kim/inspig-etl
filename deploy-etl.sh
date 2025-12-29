@@ -33,9 +33,11 @@ echo "   대상: $REMOTE_USER@$REMOTE_HOST:$REMOTE_PATH"
 # 배포할 파일 목록 (필수 파일만)
 FILES=(
     "run_etl.py"
+    "run_api.py"
     "run_weekly.sh"
     "requirements.txt"
     "config.ini.example"
+    "inspig-etl-api.service"
 )
 
 DIRS=(
@@ -73,11 +75,22 @@ done
 
 echo ""
 echo -e "${YELLOW}5. 실행 권한 설정${NC}"
-ssh -i "$SSH_KEY" "$REMOTE_USER@$REMOTE_HOST" "chmod +x $REMOTE_PATH/run_weekly.sh $REMOTE_PATH/run_etl.py"
+ssh -i "$SSH_KEY" "$REMOTE_USER@$REMOTE_HOST" "chmod +x $REMOTE_PATH/run_weekly.sh $REMOTE_PATH/run_etl.py $REMOTE_PATH/run_api.py"
 
 echo ""
 echo -e "${YELLOW}6. 배포 확인${NC}"
 ssh -i "$SSH_KEY" "$REMOTE_USER@$REMOTE_HOST" "ls -la $REMOTE_PATH/"
+
+echo ""
+echo -e "${YELLOW}7. API 서버 재기동${NC}"
+# sudo 권한이 필요하므로 pigplan 계정으로는 직접 실행 불가
+# root 계정으로 재기동하거나, sudoers 설정 필요
+ssh -i "$SSH_KEY" "$REMOTE_USER@$REMOTE_HOST" "sudo systemctl restart inspig-etl-api 2>/dev/null && echo 'API 서버 재기동 완료' || echo 'API 서버 재기동 실패 (수동 재기동 필요)'"
+
+echo ""
+echo -e "${YELLOW}8. API 서버 상태 확인${NC}"
+sleep 2
+curl -s --connect-timeout 5 "http://$REMOTE_HOST:8001/health" && echo "" || echo "헬스체크 실패"
 
 echo ""
 echo -e "${GREEN}========================================${NC}"
@@ -94,15 +107,26 @@ echo "   cd $REMOTE_PATH"
 echo "   cp config.ini.example config.ini"
 echo "   vi config.ini  # DB 패스워드, API 키 입력"
 echo ""
-echo "3. Conda 환경 설정:"
-echo "   conda create -n inspig-etl python=3.8"
-echo "   conda activate inspig-etl"
+echo "3. Python 가상환경 설정:"
+echo "   cd $REMOTE_PATH"
+echo "   python3 -m venv venv"
+echo "   source venv/bin/activate"
 echo "   pip install -r requirements.txt"
 echo ""
 echo "4. 테스트 실행:"
 echo "   python run_etl.py --dry-run"
 echo "   python run_etl.py --test"
 echo ""
-echo "5. Crontab 등록:"
+echo "5. Crontab 등록 (주간 배치):"
 echo "   crontab -e"
 echo "   0 2 * * 1 $REMOTE_PATH/run_weekly.sh"
+echo ""
+echo "6. API 서버 자동 기동 설정 (systemd):"
+echo "   sudo cp $REMOTE_PATH/inspig-etl-api.service /etc/systemd/system/"
+echo "   sudo systemctl daemon-reload"
+echo "   sudo systemctl enable inspig-etl-api"
+echo "   sudo systemctl start inspig-etl-api"
+echo "   sudo systemctl status inspig-etl-api"
+echo ""
+echo "7. API 서버 확인:"
+echo "   curl http://localhost:8001/health"
