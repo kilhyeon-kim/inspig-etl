@@ -59,10 +59,13 @@ class WeeklyReportOrchestrator:
         """시스템 스케줄 실행 여부 확인
 
         TA_SYS_CONFIG 테이블의 INS_SCHEDULE_YN 값을 확인합니다.
-        'Y'인 경우에만 True를 반환합니다.
+        'Y' 또는 'T'인 경우 True를 반환합니다.
+        - 'Y': 운영 모드
+        - 'T': 테스트 모드 (현재는 'Y'와 동일하게 동작, 향후 분기 예정)
+        - 'N': 비활성화
 
         Returns:
-            bool: INS_SCHEDULE_YN = 'Y'이면 True, 그 외 False
+            bool: INS_SCHEDULE_YN = 'Y' 또는 'T'이면 True, 그 외 False
         """
         try:
             with self.db.get_connection() as conn:
@@ -75,8 +78,9 @@ class WeeklyReportOrchestrator:
                     """)
                     result = cursor.fetchone()
 
-                    if result and result[0] == 'Y':
-                        self.logger.info("INS_SCHEDULE_YN = 'Y' - 스케줄 실행 활성화")
+                    if result and result[0] in ('Y', 'T'):
+                        mode = '운영' if result[0] == 'Y' else '테스트'
+                        self.logger.info(f"INS_SCHEDULE_YN = '{result[0]}' - 스케줄 실행 활성화 ({mode} 모드)")
                         return True
                     else:
                         value = result[0] if result else 'NULL'
@@ -120,7 +124,7 @@ class WeeklyReportOrchestrator:
             self.logger.warning("INS_SCHEDULE_YN = 'N' - 스케줄 실행이 비활성화되어 있습니다.")
             return {
                 'status': 'skipped',
-                'reason': 'INS_SCHEDULE_YN is not Y',
+                'reason': 'INS_SCHEDULE_YN is N',
                 'message': '시스템 설정(TA_SYS_CONFIG.INS_SCHEDULE_YN)이 N으로 설정되어 ETL이 실행되지 않았습니다.',
             }
 

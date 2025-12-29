@@ -95,17 +95,30 @@
 ```sql
 CREATE TABLE TA_SYS_CONFIG (
     SEQ             NUMBER DEFAULT 1,           -- 일련번호 (항상 1)
-    MODON_HIST_YN   VARCHAR2(1) DEFAULT 'N',    -- 모돈이력제 연계여부
-    EKAPE_YN        VARCHAR2(1) DEFAULT 'N',    -- 축평원 연계여부
-    INS_SCHEDULE_YN VARCHAR2(1) DEFAULT 'Y',    -- ETL 스케줄 실행여부
-    LOG_INS_DT      DATE DEFAULT SYSDATE,
-    LOG_UPT_DT      DATE DEFAULT SYSDATE,
+    MODON_HIST_YN   VARCHAR2(1) DEFAULT 'N',    -- 모돈이력제 연계여부 (Y/N)
+    EKAPE_YN        VARCHAR2(1) DEFAULT 'N',    -- 축평원 등급판정 연계여부 (Y/N)
+    INS_SCHEDULE_YN VARCHAR2(1) DEFAULT 'Y',    -- 인사이트피그플랜 실행여부 (Y/N), 테스트(T)
+    TEST_TEL        VARCHAR2(18),               -- 테스트 SMS수신번호
+    SISAE_YN        CHAR(1) DEFAULT 'Y',        -- 축평원 도축시세 연계 여부 (Y/N)
+    WEATHER_YN      CHAR(1) DEFAULT 'Y',        -- 기상청 API 연계 여부 (Y/N), 테스트(T)
+    LOG_INS_DT      DATE DEFAULT SYSDATE,       -- 생성일
+    LOG_UPT_DT      DATE DEFAULT SYSDATE,       -- 수정일
     CONSTRAINT PK_TA_SYS_CONFIG PRIMARY KEY (SEQ)
 );
 
 -- 초기 데이터
 INSERT INTO TA_SYS_CONFIG (SEQ, INS_SCHEDULE_YN) VALUES (1, 'Y');
 ```
+
+### INS_SCHEDULE_YN 값
+
+| 값 | 설명 | ETL 배치 | 웹 API | 알림톡 발송 번호 |
+|----|------|---------|--------|-----------------|
+| Y | 운영 모드 | 정상 실행 | 정상 | TA_MEMBER.HP_NUM |
+| T | 테스트 모드 | 정상 실행 | 정상 | TA_SYS_CONFIG.TEST_TEL |
+| N | 비활성화 | 스킵 | 비활성화 | - |
+
+**참고:** `T` 모드에서 ETL과 웹 API는 `Y`와 동일하게 동작하며, 알림톡만 `TEST_TEL`로 발송됩니다.
 
 ---
 
