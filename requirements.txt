@@ -21,3 +21,8 @@ python-dotenv>=1.0.0
 
 # 날짜 계산
 python-dateutil>=2.8.0
+
+# REST API 서버
+fastapi>=0.104.0
+uvicorn>=0.24.0
+pydantic>=2.0.0

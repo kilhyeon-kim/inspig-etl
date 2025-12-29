@@ -1159,14 +1159,35 @@ class WeeklyReportOrchestrator:
                 finally:
                     cursor.close()
 
+            # 8. 생성된 SHARE_TOKEN 조회
+            share_token = None
+            if result.get('status') == 'success':
+                with self.db.get_connection() as conn:
+                    cursor = conn.cursor()
+                    try:
+                        cursor.execute("""
+                            SELECT SHARE_TOKEN FROM TS_INS_WEEK
+                            WHERE MASTER_SEQ = :master_seq AND FARM_NO = :farm_no
+                        """, {'master_seq': master_seq, 'farm_no': farm_no})
+                        row = cursor.fetchone()
+                        if row:
+                            share_token = row[0]
+                    finally:
+                        cursor.close()
+
             self.logger.info("=" * 60)
             self.logger.info(f"단일 농장 수동 ETL 완료: farm_no={farm_no}, status={result.get('status')}")
+            if share_token:
+                self.logger.info(f"SHARE_TOKEN: {share_token}")
             self.logger.info("=" * 60)
 
             return {
                 'status': result.get('status', 'success'),
                 'farm_no': farm_no,
                 'master_seq': master_seq,
+                'share_token': share_token,
+                'year': year,
+                'week_no': week_no,
                 'dt_from': dt_from,
                 'dt_to': dt_to,
             }
