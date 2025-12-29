@@ -223,13 +223,15 @@ WeeklyReportOrchestrator.run()
        │
        ├──▶ Step 1: 외부 데이터 수집 (병렬 처리)
        │         ├── ProductivityCollector (생산성 API)
+       │         │     └── get_service_farm_nos() ← 공통 농장 조회
+       │         │
        │         └── WeatherCollector (기상청 API)
        │
        └──▶ Step 2: 주간 리포트 생성
               │
               ├── 전국 탕박 평균 단가 계산
-              ├── TS_INS_MASTER 생성
-              ├── 대상 농장 조회
+              ├── TS_INS_MASTER 생성(주차정보)
+              ├── get_service_farms() ← 공통 농장 조회
               │
               └── 농장별 병렬 처리 (ThreadPoolExecutor)
                      │
@@ -248,6 +250,8 @@ WeeklyReportOrchestrator.run()
                                  ├── 8. CullingProcessor   (도태폐사)
                                  ├── 9. ShipmentProcessor  (출하)
                                  └── 10. ScheduleProcessor (금주예정)
+
+※ 농장 목록 조회 SQL은 src/common/farm_service.py에서 중앙 관리
 ```
 
 

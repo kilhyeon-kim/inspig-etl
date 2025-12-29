@@ -14,7 +14,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from typing import List, Optional
 
-from ..common import Config, Database, setup_logger, now_kst
+from ..common import Config, Database, setup_logger, now_kst, get_service_farms
 from ..collectors import WeatherCollector, ProductivityCollector
 
 logger = logging.getLogger(__name__)
@@ -820,44 +820,13 @@ class WeeklyReportOrchestrator:
     def _get_target_farms(self, cursor, farm_list: Optional[str], test_mode: bool) -> List[dict]:
         """대상 농장 조회
 
-        TS_INS_SERVICE 필터링 조건:
-        - INSPIG_YN = 'Y': 인사이트피그 서비스 사용
-        - INSPIG_FROM_DT IS NOT NULL: 시작일 필수
-        - INSPIG_TO_DT IS NOT NULL: 종료일 필수
-        - INSPIG_FROM_DT <= SYSDATE: 서비스 시작일 이후
-        - SYSDATE <= LEAST(INSPIG_TO_DT, INSPIG_STOP_DT): 종료일/중지일 중 빠른 날짜 이전
-        - INSPIG_STOP_DT 기본값: 9999-12-31 (NULL이면 중지 안됨)
+        공통 함수 get_service_farms()를 사용하여 일관성 보장.
+        SQL은 src/common/farm_service.py에서 중앙 관리.
+
+        Note:
+            cursor 파라미터는 기존 API 호환성을 위해 유지 (미사용)
         """
-        sql = """
-        SELECT DISTINCT F.FARM_NO, F.FARM_NM, F.PRINCIPAL_NM, F.SIGUN_CD,
-               NVL(F.COUNTRY_CODE, 'KOR') AS LOCALE
-        FROM TA_FARM F
-        INNER JOIN TS_INS_SERVICE S ON F.FARM_NO = S.FARM_NO
-        WHERE F.USE_YN = 'Y'
-          AND S.INSPIG_YN = 'Y'
-          AND S.USE_YN = 'Y'
-          AND S.INSPIG_FROM_DT IS NOT NULL
-          AND S.INSPIG_TO_DT IS NOT NULL
-          AND TO_CHAR(SYSDATE, 'YYYYMMDD') >= S.INSPIG_FROM_DT
-          AND TO_CHAR(SYSDATE, 'YYYYMMDD') <= LEAST(
-              S.INSPIG_TO_DT,
-              NVL(S.INSPIG_STOP_DT, '99991231')
-          )
-        """
-
-        if farm_list:
-            # 농장 목록이 지정된 경우 필터링
-            farm_nos = [int(f.strip()) for f in farm_list.split(',') if f.strip()]
-            placeholders = ', '.join([f':f{i}' for i in range(len(farm_nos))])
-            sql += f" AND F.FARM_NO IN ({placeholders})"
-
-            params = {f'f{i}': f for i, f in enumerate(farm_nos)}
-            cursor.execute(sql + " ORDER BY F.FARM_NO", params)
-        else:
-            cursor.execute(sql + " ORDER BY F.FARM_NO")
-
-        columns = [col[0] for col in cursor.description]
-        return [dict(zip(columns, row)) for row in cursor.fetchall()]
+        return get_service_farms(self.db, farm_list)
 
     def _create_week_records(
         self,

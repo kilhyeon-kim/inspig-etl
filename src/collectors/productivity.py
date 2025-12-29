@@ -53,7 +53,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from .base import BaseCollector
-from ..common import Config, Database, today_kst
+from ..common import Config, Database, today_kst, get_service_farm_nos
 
 logger = logging.getLogger(__name__)
 
@@ -278,29 +278,10 @@ class ProductivityCollector(BaseCollector):
     def _get_farm_list(self) -> List[Dict]:
         """DB에서 대상 농장 목록 조회
 
-        TS_INS_SERVICE 필터링 조건 (orchestrator._get_target_farms와 동일):
-        - INSPIG_YN = 'Y': 인사이트피그 서비스 사용
-        - INSPIG_FROM_DT <= SYSDATE: 서비스 시작일 이후
-        - SYSDATE <= LEAST(INSPIG_TO_DT, INSPIG_STOP_DT): 종료일/중지일 중 빠른 날짜 이전
-        - INSPIG_STOP_DT 기본값: 9999-12-31 (NULL이면 중지 안됨)
+        공통 함수 get_service_farm_nos()를 사용하여 일관성 보장.
+        SQL은 src/common/farm_service.py에서 중앙 관리.
         """
-        sql = """
-            SELECT DISTINCT F.FARM_NO
-            FROM TA_FARM F
-            INNER JOIN TS_INS_SERVICE S ON F.FARM_NO = S.FARM_NO
-            WHERE F.USE_YN = 'Y'
-              AND S.INSPIG_YN = 'Y'
-              AND S.USE_YN = 'Y'
-              AND S.INSPIG_FROM_DT IS NOT NULL
-              AND S.INSPIG_TO_DT IS NOT NULL
-              AND TO_CHAR(SYSDATE, 'YYYYMMDD') >= S.INSPIG_FROM_DT
-              AND TO_CHAR(SYSDATE, 'YYYYMMDD') <= LEAST(
-                  S.INSPIG_TO_DT,
-                  NVL(S.INSPIG_STOP_DT, '99991231')
-              )
-            ORDER BY F.FARM_NO
-        """
-        return self.db.fetch_dict(sql)
+        return get_service_farm_nos(self.db)
 
     def _process_response(
         self, farm_no: int, stat_date: str, period: str, period_info: Dict, data: Dict
