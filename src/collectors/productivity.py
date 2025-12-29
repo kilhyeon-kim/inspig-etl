@@ -53,7 +53,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from .base import BaseCollector
-from ..common import Config, Database
+from ..common import Config, Database, today_kst
 
 logger = logging.getLogger(__name__)
 
@@ -217,7 +217,7 @@ class ProductivityCollector(BaseCollector):
             return []
 
         if stat_date is None:
-            stat_date = datetime.now().strftime('%Y%m%d')
+            stat_date = today_kst()  # 한국 시간 기준
 
         # 년도, 기간차수 계산
         period_info = self._calculate_period_info(stat_date, period)

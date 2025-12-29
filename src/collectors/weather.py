@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 from .base import BaseCollector
-from ..common import Config, Database
+from ..common import Config, Database, now_kst
 
 logger = logging.getLogger(__name__)
 
@@ -54,7 +54,7 @@ class WeatherCollector(BaseCollector):
         Returns:
             (base_date, base_time) 튜플
         """
-        now = datetime.now()
+        now = now_kst()  # 기상청 API는 한국 시간 기준
         # 발표 시간 목록
         announce_hours = [2, 5, 8, 11, 14, 17, 20, 23]
 

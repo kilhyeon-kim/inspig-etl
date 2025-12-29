@@ -20,6 +20,8 @@ from typing import Any, Dict, List, Optional, Callable
 from dataclasses import dataclass
 from enum import Enum
 
+from ..common import now_kst
+
 logger = logging.getLogger(__name__)
 
 
@@ -281,11 +283,13 @@ class AsyncFarmProcessor:
         """완료 상태 + 공유 토큰 생성"""
         cursor = self.conn.cursor()
         try:
-            token_data = f"{self.master_seq}-{self.farm_no}-{datetime.now().strftime('%Y%m%d%H%M%S')}-{secrets.token_hex(16)}"
+            # 토큰 생성 (한국 시간 기준)
+            kst_now = now_kst()
+            token_data = f"{self.master_seq}-{self.farm_no}-{kst_now.strftime('%Y%m%d%H%M%S')}-{secrets.token_hex(16)}"
             share_token = hashlib.sha256(token_data.encode()).hexdigest().lower()
 
-            # ETL 수행일 + 6일 = 수행일 포함 7일간 열람 가능
-            expire_dt = (datetime.now() + timedelta(days=6)).strftime('%Y%m%d')
+            # ETL 수행일 + 6일 = 수행일 포함 7일간 열람 가능 (한국 시간 기준)
+            expire_dt = (kst_now + timedelta(days=6)).strftime('%Y%m%d')
 
             cursor.execute("""
                 UPDATE TS_INS_WEEK

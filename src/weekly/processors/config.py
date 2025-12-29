@@ -13,6 +13,7 @@ from datetime import datetime
 from dateutil.relativedelta import relativedelta
 from typing import Any, Dict, Optional
 
+from ...common import now_kst
 from .base import BaseProcessor
 
 logger = logging.getLogger(__name__)
@@ -155,8 +156,8 @@ class ConfigProcessor(BaseProcessor):
         wean_period = config_values.get('140003', 21)
         ship_offset = ship_day - wean_period
 
-        # 기간 계산 (최근 6개월, 당월 제외)
-        today = datetime.now()
+        # 기간 계산 (최근 6개월, 당월 제외, 한국 시간 기준)
+        today = now_kst()
         month_start = today.replace(day=1)
         rate_from = (month_start - relativedelta(months=6)).strftime('%y.%m')
         rate_to = (month_start - relativedelta(months=1)).strftime('%y.%m')

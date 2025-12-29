@@ -14,7 +14,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from typing import List, Optional
 
-from ..common import Config, Database, setup_logger
+from ..common import Config, Database, setup_logger, now_kst
 from ..collectors import WeatherCollector, ProductivityCollector
 
 logger = logging.getLogger(__name__)
@@ -123,11 +123,11 @@ class WeeklyReportOrchestrator:
                 'message': '시스템 설정(TA_SYS_CONFIG.INS_SCHEDULE_YN)이 N으로 설정되어 ETL이 실행되지 않았습니다.',
             }
 
-        # 기준 날짜 설정
+        # 기준 날짜 설정 (한국 시간 기준)
         if base_date:
             base_dt = datetime.strptime(base_date, '%Y%m%d')
         else:
-            base_dt = datetime.now()
+            base_dt = now_kst()
 
         # 기간 계산: 기준일의 지난주 (월~일, 7일)
         # test_mode 여부와 관계없이 항상 지난주 전체를 처리
@@ -1066,9 +1066,9 @@ class WeeklyReportOrchestrator:
         self.logger.info(f"단일 농장 수동 ETL 시작: farm_no={farm_no}")
         self.logger.info("=" * 60)
 
-        # 날짜 자동 계산 (지정되지 않은 경우)
+        # 날짜 자동 계산 (지정되지 않은 경우, 한국 시간 기준)
         if not dt_from or not dt_to:
-            today = datetime.now()
+            today = now_kst()
             # 지난주 월요일 (오늘 기준 이번주 월요일 - 7일)
             this_monday = today - timedelta(days=today.weekday())
             last_monday = this_monday - timedelta(days=7)
