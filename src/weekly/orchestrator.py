@@ -239,6 +239,33 @@ class WeeklyReportOrchestrator:
             self.logger.error(f"기상청 데이터 수집 실패: {e}", exc_info=True)
             return {'status': 'error', 'error': str(e), 'count': 0}
 
+    def _collect_single_farm_productivity(self, farm_no: int, stat_date: str) -> dict:
+        """단일 농장 생산성 데이터 수집
+
+        btnInsSmsCreate 등에서 단일 농장의 리포트 생성 시 호출
+
+        Args:
+            farm_no: 농장번호
+            stat_date: 기준 날짜 (YYYYMMDD)
+
+        Returns:
+            수집 결과 딕셔너리
+        """
+        try:
+            collector = ProductivityCollector(self.config, self.db)
+            # 단일 농장만 수집
+            farm_list = [{'FARM_NO': farm_no}]
+            data = collector.collect(farm_list=farm_list, stat_date=stat_date, period='W')
+            if data:
+                count = collector.save(data)
+                return {'status': 'success', 'count': count}
+            else:
+                return {'status': 'success', 'count': 0, 'message': 'no data'}
+        except Exception as e:
+            self.logger.error(f"단일 농장 생산성 수집 실패 (farm_no={farm_no}): {e}", exc_info=True)
+            # 생산성 수집 실패해도 ETL은 계속 진행
+            return {'status': 'error', 'error': str(e), 'count': 0}
+
     def _collect_external_data(
         self,
         stat_date: str,
@@ -1041,6 +1068,7 @@ class WeeklyReportOrchestrator:
         self,
         farm_no: int,
         ins_date: Optional[str] = None,
+        skip_productivity: bool = False,
     ) -> dict:
         """단일 농장 수동 ETL 실행
 
@@ -1049,6 +1077,7 @@ class WeeklyReportOrchestrator:
         Args:
             farm_no: 농장번호
             ins_date: 기준일 INS_DT (YYYYMMDD), None이면 오늘
+            skip_productivity: 생산성 수집 스킵 여부 (기본: False)
 
         Returns:
             실행 결과 딕셔너리
@@ -1083,6 +1112,13 @@ class WeeklyReportOrchestrator:
         week_no = int(last_sunday.strftime('%V'))
 
         try:
+            # 0. 생산성 데이터 수집 (단일 농장)
+            if not skip_productivity:
+                self.logger.info("-" * 40)
+                self.logger.info("Step 0: 생산성 데이터 수집 (단일 농장)")
+                productivity_result = self._collect_single_farm_productivity(farm_no, dt_to)
+                self.logger.info(f"생산성 수집 결과: {productivity_result}")
+
             with self.db.get_connection() as conn:
                 cursor = conn.cursor()
                 try:
