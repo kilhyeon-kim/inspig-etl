@@ -47,11 +47,19 @@
 │  - MASTER_SEQ 연결         │     │  - 리포트 조회 이력         │
 └───────────────────────────┘     └───────────────────────────┘
 
-┌───────────────────────────┐     ┌───────────────────────────┐
-│   TS_PSY_DELAY_HEATMAP    │     │      TM_WEATHER           │
-│  - PSY/지연일 분포 히트맵   │     │  - 기상청 날씨 데이터       │
-│  - MASTER_SEQ 연결         │     │  - SIGUNGU_CD 기준         │
-└───────────────────────────┘     └───────────────────────────┘
+┌───────────────────────────┐     ┌───────────────────────────────────────────┐
+│   TS_PSY_DELAY_HEATMAP    │     │           TM_WEATHER (일별)               │
+│  - PSY/지연일 분포 히트맵   │     │  - 기상청 격자(NX, NY) 기준                 │
+│  - MASTER_SEQ 연결         │     │  - 1주일 예보 + 당일 실측                   │
+└───────────────────────────┘     │  - UK: NX + NY + WK_DATE                   │
+                                  └──────────────────────┬────────────────────┘
+                                                         │ NX + NY + WK_DATE (1:N)
+┌───────────────────────────┐                            ▼
+│        TA_FARM            │     ┌───────────────────────────────────────────┐
+│  - WEATHER_NX, WEATHER_NY │────▶│       TM_WEATHER_HOURLY (시간별)           │
+│  - 농장 좌표로 격자 변환    │     │  - 당일 시간별 상세 예보                     │
+│  - N:1 관계 (다수 농장→1날씨)│     │  - UK: NX + NY + WK_DATE + WK_TIME        │
+└───────────────────────────┘     └───────────────────────────────────────────┘
 
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                       TS_PRODUCTIVITY (생산성 데이터)                         │
@@ -75,7 +83,8 @@
 | TS_INS_WEEK_SUB | 리포트 상세 | 팝업/상세 데이터 |
 | TS_INS_MGMT | 관리포인트 | 주요 포인트/추천 콘텐츠 |
 | TS_INS_ACCESS_LOG | 접속 로그 | 사용자 접속 로그 |
-| TM_WEATHER | 날씨 정보 | 기상청 API 데이터 |
+| TM_WEATHER | 날씨 정보 (일별) | 읍/면/동 기준 일별 날씨 |
+| TM_WEATHER_HOURLY | 날씨 정보 (시간별) | 읍/면/동 기준 시간별 날씨 |
 | TS_PSY_DELAY_HEATMAP | PSY 히트맵 | 농장 분포 히트맵 |
 | TS_PRODUCTIVITY | 생산성 데이터 | 외부 API 수집 (PCODE별 통합) |
 
@@ -405,28 +414,71 @@ CREATE TABLE TS_INS_WEEK_SUB (
 
 ## 7. 부가 테이블
 
-### TM_WEATHER (날씨)
+### TM_WEATHER (일별 날씨)
+
+기상청 격자(NX, NY) 기준 일별 날씨 데이터
+
+- **UK**: NX + NY + WK_DATE
+- **관계**: TA_FARM N:1 TM_WEATHER (다수 농장 → 1개 날씨)
+- **격자 변환**: TA_FARM.MAP_X/Y → WEATHER_NX/NY (5km 단위)
+
+> DDL: [TM_WEATHER.sql](../ddl/TM_WEATHER.sql)
+
+### TM_WEATHER_HOURLY (시간별 날씨)
+
+기상청 격자(NX, NY) 기준 시간별 날씨 데이터 (당일 상세 예보)
+
+- **UK**: NX + NY + WK_DATE + WK_TIME
+
+> DDL: [TM_WEATHER.sql](../ddl/TM_WEATHER.sql)
+
+### TA_FARM 확장
 
 ```sql
-CREATE TABLE TM_WEATHER (
-    SEQ             NUMBER NOT NULL,
-    WK_DATE         VARCHAR2(8) NOT NULL,       -- YYYYMMDD
-    SIGUNGU_CD      VARCHAR2(10) NOT NULL,      -- 시군구코드
-    SIGUNGU_NM      VARCHAR2(100),
-    NX              INTEGER NOT NULL,           -- 격자 X
-    NY              INTEGER NOT NULL,           -- 격자 Y
-    WEATHER_CD      VARCHAR2(20),               -- sunny/cloudy/rainy/snow
-    TEMP_HIGH       NUMBER(4,1),
-    TEMP_LOW        NUMBER(4,1),
-    RAIN_PROB       INTEGER DEFAULT 0,
-    HUMIDITY        INTEGER,
-    WIND_SPEED      NUMBER(4,1),
-    LOG_INS_DT      DATE DEFAULT SYSDATE,
-    CONSTRAINT PK_TM_WEATHER PRIMARY KEY (SEQ)
-);
+ALTER TABLE TA_FARM ADD WEATHER_NX INTEGER;
+ALTER TABLE TA_FARM ADD WEATHER_NY INTEGER;
 
-CREATE UNIQUE INDEX UK_TM_WEATHER_01 ON TM_WEATHER(SIGUNGU_CD, WK_DATE);
+COMMENT ON COLUMN TA_FARM.MAP_X IS 'WGS84 경도 (longitude) - Kakao API로 조회된 좌표';
+COMMENT ON COLUMN TA_FARM.MAP_Y IS 'WGS84 위도 (latitude) - Kakao API로 조회된 좌표';
+COMMENT ON COLUMN TA_FARM.WEATHER_NX IS '기상청 격자 X좌표 (5km 단위, MAP_X/MAP_Y로부터 변환)';
+COMMENT ON COLUMN TA_FARM.WEATHER_NY IS '기상청 격자 Y좌표 (5km 단위, MAP_X/MAP_Y로부터 변환)';
+
+CREATE INDEX IDX_TA_FARM_WEATHER ON TA_FARM(WEATHER_NX, WEATHER_NY);
 ```
+
+### 좌표 컬럼 비교
+
+| 항목 | MAP_X, MAP_Y | WEATHER_NX, WEATHER_NY |
+|------|--------------|------------------------|
+| **좌표계** | WGS84 (위경도) | 기상청 Lambert 격자 |
+| **단위** | 도(degree) | 격자 번호 (정수) |
+| **예시** | 126.8979, 36.5767 | 63, 89 |
+| **정밀도** | 미터 단위 | 5km 단위 |
+| **출처** | Kakao API | MAP_X/Y 변환 결과 |
+
+### 날씨 코드 정의
+
+| WEATHER_CD | WEATHER_NM | SKY_CD | PTY_CD |
+|------------|------------|--------|--------|
+| sunny | 맑음 | 1 | 0 |
+| cloudy | 구름많음 | 3 | 0 |
+| overcast | 흐림 | 4 | 0 |
+| rainy | 비 | - | 1 |
+| rain_snow | 비/눈 | - | 2 |
+| snow | 눈 | - | 3 |
+| shower | 소나기 | - | 4 |
+
+### 기상청 API 정보
+
+| 항목 | 값 |
+|------|-----|
+| API | 기상청 단기예보 API (공공데이터포털) |
+| 격자 | 5km x 5km (Lambert Conformal Conic) |
+| 예보 범위 | 당일 ~ +7일 |
+| 갱신 주기 | 3시간 (02, 05, 08, 11, 14, 17, 20, 23시) |
+| API 키 관리 | TS_API_KEY_INFO 테이블 (REQ_CNT 기반 로드밸런싱) |
+
+> 격자 변환 함수: `latlon_to_grid()` - [weather.py](../../src/collectors/weather.py)
 
 ### TS_PSY_DELAY_HEATMAP (히트맵)
 
