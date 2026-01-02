@@ -465,3 +465,89 @@ INSERT INTO TS_INS_JOB_LOG (
 | SP_INS_WEEK_DOPE | CullingProcessor | 완료 |
 | SP_INS_WEEK_SHIP | ShipmentProcessor | 완료 |
 | SP_INS_WEEK_SCHEDULE | ScheduleProcessor | 완료 |
+
+
+## 9. API 응답 필드
+
+### 9.1 ETL 실행 응답 (POST /api/run-farm)
+
+```json
+{
+    "status": "success",
+    "farmNo": 2807,
+    "dayGb": "WEEK",
+    "masterSeq": 123,
+    "shareToken": "abc123...",
+    "year": 2025,
+    "weekNo": 52,
+    "insDate": "20251229",
+    "dtFrom": "20251222",
+    "dtTo": "20251228"
+}
+```
+
+### 9.2 masterSeq 필드 설명
+
+| 필드 | 설명 |
+|------|------|
+| `masterSeq` | TS_INS_MASTER.SEQ (PK) |
+
+**masterSeq가 필요한 이유:**
+- 동일 농장/년도/주차에 리포트가 재생성될 수 있음
+- 예: 데이터 오류로 TS_INS_* 테이블 삭제 후 재생성
+- 정확한 리포트 식별을 위해 PK(masterSeq) 사용
+
+**masterSeq 사용처:**
+- SMS/알림톡 발송 시 필수 파라미터
+- `selectInsWeeklyReportForManual(farmNo, reportYear, reportWeekNo, masterSeq)`
+- masterSeq가 없으면 "마스터 시퀀스가 필요합니다." 에러 발생
+
+### 9.3 pig3.1 연동 흐름
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                           masterSeq 전달 흐름                                    │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                 │
+│  [1] ETL API 서버 (inspig-etl)                                                  │
+│  ┌─────────────────────────────────────────────────────────────────────────┐    │
+│  │  POST /api/run-farm                                                     │    │
+│  │         │                                                               │    │
+│  │         ▼                                                               │    │
+│  │  RunFarmResponse {                                                      │    │
+│  │      status: "success",                                                 │    │
+│  │      masterSeq: 123,      ← TS_INS_MASTER.SEQ 반환                       │    │
+│  │      shareToken: "abc...",                                              │    │
+│  │      ...                                                                │    │
+│  │  }                                                                      │    │
+│  └─────────────────────────────────────────────────────────────────────────┘    │
+│                              │                                                  │
+│                              ▼                                                  │
+│  [2] pig3.1 서버 (InsEtlApiController)                                          │
+│  ┌─────────────────────────────────────────────────────────────────────────┐    │
+│  │  POST /officers/api/ins/getOrCreateWeeklyReport.json                    │    │
+│  │         │                                                               │    │
+│  │         ▼                                                               │    │
+│  │  result.put("masterSeq", reportResult.get("masterSeq"));                │    │
+│  │  result.put("shareToken", reportResult.get("shareToken"));              │    │
+│  │  ...                                                                    │    │
+│  └─────────────────────────────────────────────────────────────────────────┘    │
+│                              │                                                  │
+│                              ▼                                                  │
+│  [3] 프론트엔드 (JSP)                                                           │
+│  ┌─────────────────────────────────────────────────────────────────────────┐    │
+│  │  var masterSeq = result.masterSeq;                                      │    │
+│  │  var shareToken = result.shareToken;                                    │    │
+│  │                                                                         │    │
+│  │  // SMS 발송 시 masterSeq 전달                                           │    │
+│  │  sendSms({                                                              │    │
+│  │      farmNo: farmNo,                                                    │    │
+│  │      masterSeq: masterSeq,       ← 필수                                  │    │
+│  │      reportYear: year,                                                  │    │
+│  │      reportWeekNo: weekNo,                                              │    │
+│  │      toTel: phoneNumber                                                 │    │
+│  │  });                                                                    │    │
+│  └─────────────────────────────────────────────────────────────────────────┘    │
+│                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
