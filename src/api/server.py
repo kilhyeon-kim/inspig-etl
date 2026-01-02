@@ -25,6 +25,7 @@ API:
         "status": "success",
         "farmNo": 2807,
         "dayGb": "WEEK",
+        "masterSeq": 123,      // TS_INS_MASTER.SEQ
         "shareToken": "abc123...",
         "year": 2025,
         "weekNo": 52,          // WEEK인 경우
@@ -92,6 +93,7 @@ class RunFarmResponse(BaseModel):
     status: str
     farmNo: int
     dayGb: str = "WEEK"
+    masterSeq: Optional[int] = None   # TS_INS_MASTER.SEQ
     shareToken: Optional[str] = None
     year: Optional[int] = None
     weekNo: Optional[int] = None      # WEEK인 경우
@@ -181,6 +183,7 @@ async def run_farm_etl(request: RunFarmRequest):
                 status="success",
                 farmNo=request.farmNo,
                 dayGb=day_gb,
+                masterSeq=result.get('master_seq'),
                 shareToken=result.get('share_token'),
                 year=result.get('year'),
                 weekNo=result.get('week_no'),
