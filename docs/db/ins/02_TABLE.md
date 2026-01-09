@@ -15,7 +15,8 @@
 
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                       TS_INS_SERVICE (서비스 신청)                           │
-│  - 농장별 인사이트피그 서비스 신청 정보                                        │
+│  - 농장별 인사이트피그 서비스 신청 정보 (이력 관리)                             │
+│  - PK: FARM_NO + INSPIG_REG_DT (복합키 - 농장당 N건 이력)                     │
 │  - INSPIG_YN='Y' 농장만 리포트 생성 대상                                      │
 └──────────────────────────────────┬──────────────────────────────────────────┘
                                    │ FARM_NO (1:N)
@@ -133,22 +134,35 @@ INSERT INTO TA_SYS_CONFIG (SEQ, INS_SCHEDULE_YN) VALUES (1, 'Y');
 
 ## 2. TS_INS_SERVICE (서비스 신청)
 
+농장별 인사이트피그 서비스 구독 이력 관리 테이블
+
 ```sql
 CREATE TABLE TS_INS_SERVICE (
-    FARM_NO         INTEGER NOT NULL,           -- 농장번호 (PK, FK)
+    FARM_NO         INTEGER NOT NULL,           -- 농장번호 (PK 일부, FK)
+    INSPIG_REG_DT   VARCHAR2(8) NOT NULL,       -- 등록일 (PK 일부, YYYYMMDD)
     INSPIG_YN       VARCHAR2(1) DEFAULT 'N',    -- 서비스 신청여부
-    INSPIG_REG_DT   VARCHAR2(8),                -- 신청일 (YYYYMMDD)
     INSPIG_FROM_DT  VARCHAR2(8),                -- 시작일 (YYYYMMDD)
     INSPIG_TO_DT    VARCHAR2(8),                -- 종료일 (YYYYMMDD)
     INSPIG_STOP_DT  VARCHAR2(8),                -- 중단일 (YYYYMMDD)
     WEB_PAY_YN      VARCHAR2(1) DEFAULT 'N',    -- 웹결재 여부
     REG_TYPE        VARCHAR2(10) DEFAULT 'AUTO', -- AUTO/MANUAL
     USE_YN          VARCHAR2(1) DEFAULT 'Y',
+    BIGO            VARCHAR2(500),              -- 비고
     LOG_INS_DT      DATE DEFAULT SYSDATE,
     LOG_UPT_DT      DATE DEFAULT SYSDATE,
-    CONSTRAINT PK_TS_INS_SERVICE PRIMARY KEY (FARM_NO)
+    CONSTRAINT PK_TS_INS_SERVICE PRIMARY KEY (FARM_NO, INSPIG_REG_DT)
 );
+
+-- 인덱스
+CREATE INDEX IDX_TS_INS_SERVICE_01 ON TS_INS_SERVICE(FARM_NO, INSPIG_REG_DT DESC);
+CREATE INDEX IDX_TS_INS_SERVICE_02 ON TS_INS_SERVICE(FARM_NO, INSPIG_FROM_DT, INSPIG_TO_DT);
 ```
+
+### PK 구조
+
+- **FARM_NO + INSPIG_REG_DT**: 복합키 (농장당 N건 이력 관리)
+- 동일 농장에 여러 구독 기간 저장 가능
+- 현재 유효한 구독은 `INSPIG_YN='Y'`, `USE_YN='Y'`, 기간 조건 충족 건 중 최신 `INSPIG_REG_DT`
 
 ### REG_TYPE 값
 
@@ -156,6 +170,38 @@ CREATE TABLE TS_INS_SERVICE (
 |----|------|
 | AUTO | 정기 스케줄 대상 (기본값) |
 | MANUAL | 수동 등록 (테스트/개별 실행) |
+
+### 유효 서비스 조회 조건
+
+```sql
+-- 현재 유효한 서비스 조회 (ETL에서 사용)
+SELECT S1.FARM_NO, S1.INSPIG_REG_DT, ...
+FROM TS_INS_SERVICE S1
+WHERE S1.INSPIG_YN = 'Y'
+  AND S1.USE_YN = 'Y'
+  AND S1.INSPIG_FROM_DT IS NOT NULL
+  AND S1.INSPIG_TO_DT IS NOT NULL
+  AND TO_CHAR(SYSDATE, 'YYYYMMDD') >= S1.INSPIG_FROM_DT
+  AND TO_CHAR(SYSDATE, 'YYYYMMDD') <= LEAST(
+      S1.INSPIG_TO_DT,
+      NVL(S1.INSPIG_STOP_DT, '99991231')
+  )
+  -- 같은 농장 중 유효한 최신 건만 조회
+  AND S1.INSPIG_REG_DT = (
+      SELECT MAX(S2.INSPIG_REG_DT)
+      FROM TS_INS_SERVICE S2
+      WHERE S2.FARM_NO = S1.FARM_NO
+        AND S2.INSPIG_YN = 'Y'
+        AND S2.USE_YN = 'Y'
+        AND S2.INSPIG_FROM_DT IS NOT NULL
+        AND S2.INSPIG_TO_DT IS NOT NULL
+        AND TO_CHAR(SYSDATE, 'YYYYMMDD') >= S2.INSPIG_FROM_DT
+        AND TO_CHAR(SYSDATE, 'YYYYMMDD') <= LEAST(
+            S2.INSPIG_TO_DT,
+            NVL(S2.INSPIG_STOP_DT, '99991231')
+        )
+  )
+```
 
 ---
 
@@ -229,6 +275,7 @@ CREATE TABLE TS_INS_JOB_LOG (
     PROC_CNT        INTEGER DEFAULT 0,          -- 처리 건수
     ERROR_CD        VARCHAR2(20),
     ERROR_MSG       VARCHAR2(4000),
+    ERROR_STACK     CLOB,                       -- 스택 트레이스
 
     LOG_INS_DT      DATE DEFAULT SYSDATE,
     CONSTRAINT PK_TS_INS_JOB_LOG PRIMARY KEY (SEQ)
