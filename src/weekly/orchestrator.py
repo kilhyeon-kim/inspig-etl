@@ -100,7 +100,10 @@ class WeeklyReportOrchestrator:
         skip_productivity: bool = False,  # 생산성 수집 활성화 (테이블 생성 필요)
         skip_weather: bool = False,
         dry_run: bool = False,
-        init_delete: bool = True,  # 전체 삭제 여부 (배치 실행 시 첫 번째만 True)
+        init_all: bool = False,  # 전체 삭제 여부 (--test --init-all)
+        init_week: bool = False,  # 해당 주차만 삭제 여부 (--test --init-week)
+        farm_list: Optional[str] = None,  # 처리할 농장 목록 (콤마 구분)
+        exclude_farms: Optional[str] = None,  # 제외할 농장 목록 (콤마 구분)
     ) -> dict:
         """ETL 파이프라인 실행
 
@@ -110,7 +113,12 @@ class WeeklyReportOrchestrator:
             skip_productivity: 생산성 수집 스킵 (테이블 생성 후 False로 설정)
             skip_weather: 기상청 수집 스킵
             dry_run: 실제 실행 없이 설정만 확인
-            init_delete: 전체 삭제 여부 (test_mode=True일 때만 적용, 배치 실행 시 첫 번째만 True)
+            init_all: 전체 데이터 삭제 (test_mode=True일 때만 적용, --test --init-all)
+            init_week: 해당 주차 데이터만 삭제 (test_mode=True일 때만 적용, --test --init-week)
+            farm_list: 처리할 농장 목록 (콤마 구분, 예: "1387,2807")
+                      지정하면 해당 농장만 삭제/수집/리포트 생성
+            exclude_farms: 제외할 농장 목록 (콤마 구분, 예: "848,1234")
+                          farm_list가 지정되면 무시됨
 
         Returns:
             실행 결과 딕셔너리
@@ -182,8 +190,12 @@ class WeeklyReportOrchestrator:
             # Step 1: 외부 데이터 수집 (생산성 + 기상청 병렬 처리)
             self.logger.info("-" * 40)
             self.logger.info("Step 1: 외부 데이터 수집 (병렬 처리)")
+            if farm_list:
+                self.logger.info(f"  대상 농장: {farm_list}")
+            if exclude_farms:
+                self.logger.info(f"  제외 농장: {exclude_farms}")
             collect_result = self._collect_external_data(
-                dt_to, skip_productivity, skip_weather
+                dt_to, skip_productivity, skip_weather, farm_list, exclude_farms
             )
             result['steps']['productivity'] = collect_result.get('productivity', 'skipped')
             result['steps']['weather'] = collect_result.get('weather', 'skipped')
@@ -192,7 +204,9 @@ class WeeklyReportOrchestrator:
             self.logger.info("-" * 40)
             self.logger.info("Step 2: 주간 리포트 생성")
             report_result = self._generate_weekly_report(
-                year, week_no, dt_from, dt_to, test_mode, init_delete
+                year, week_no, dt_from, dt_to, test_mode,
+                init_all=init_all, init_week=init_week,
+                farm_list=farm_list, exclude_farms=exclude_farms
             )
             result['steps']['weekly_report'] = report_result
 
@@ -208,21 +222,39 @@ class WeeklyReportOrchestrator:
 
         return result
 
-    def _collect_productivity(self, stat_date: str) -> dict:
+    def _collect_productivity(
+        self,
+        stat_date: str,
+        farm_list: Optional[str] = None,
+        exclude_farms: Optional[str] = None,
+    ) -> dict:
         """생산성 데이터 수집
 
         Args:
             stat_date: 기준 날짜 (YYYYMMDD)
+            farm_list: 수집 대상 농장 목록 (콤마 구분, 예: "1387,2807")
+                      None이면 전체 서비스 농장 대상
+            exclude_farms: 제외할 농장 목록 (콤마 구분, 예: "848,1234")
 
         Returns:
             수집 결과 딕셔너리
 
         Note:
             API 파라미터 중 statDate 외에는 고정값 사용 (period=Y 등)
+            farm_list가 지정되면 해당 농장만 수집, exclude_farms는 무시됨
         """
         try:
             collector = ProductivityCollector(self.config, self.db)
-            count = collector.run(stat_date=stat_date)
+
+            # farm_list가 지정되면 해당 농장만 수집
+            if farm_list:
+                farm_nos = [int(f.strip()) for f in farm_list.split(',') if f.strip()]
+                farm_list_dict = [{'FARM_NO': f} for f in farm_nos]
+                self.logger.info(f"생산성 수집 대상 농장: {farm_nos}")
+                count = collector.run(stat_date=stat_date, farm_list=farm_list_dict)
+            else:
+                count = collector.run(stat_date=stat_date, exclude_farms=exclude_farms)
+
             return {'status': 'success', 'count': count}
         except Exception as e:
             self.logger.error(f"생산성 데이터 수집 실패: {e}", exc_info=True)
@@ -271,6 +303,8 @@ class WeeklyReportOrchestrator:
         stat_date: str,
         skip_productivity: bool = False,
         skip_weather: bool = False,
+        farm_list: Optional[str] = None,
+        exclude_farms: Optional[str] = None,
     ) -> dict:
         """외부 데이터 수집 (생산성 + 기상청 병렬 처리)
 
@@ -278,6 +312,10 @@ class WeeklyReportOrchestrator:
             stat_date: 기준 날짜 (YYYYMMDD)
             skip_productivity: 생산성 수집 스킵
             skip_weather: 기상청 수집 스킵
+            farm_list: 수집 대상 농장 목록 (콤마 구분, 예: "1387,2807")
+                      None이면 전체 서비스 농장 대상
+            exclude_farms: 제외할 농장 목록 (콤마 구분, 예: "848,1234")
+                          farm_list가 지정되면 무시됨
 
         Returns:
             수집 결과 딕셔너리
@@ -298,7 +336,7 @@ class WeeklyReportOrchestrator:
 
         if skip_weather:
             self.logger.info("  생산성 데이터 수집 (기상청 스킵)")
-            result['productivity'] = self._collect_productivity(stat_date)
+            result['productivity'] = self._collect_productivity(stat_date, farm_list, exclude_farms)
             result['weather'] = 'skipped'
             return result
 
@@ -307,7 +345,7 @@ class WeeklyReportOrchestrator:
 
         with ThreadPoolExecutor(max_workers=2) as executor:
             # 병렬로 두 작업 제출
-            future_productivity = executor.submit(self._collect_productivity, stat_date)
+            future_productivity = executor.submit(self._collect_productivity, stat_date, farm_list, exclude_farms)
             future_weather = executor.submit(self._collect_weather)
 
             # 결과 수집
@@ -335,10 +373,12 @@ class WeeklyReportOrchestrator:
         dt_from: str,
         dt_to: str,
         test_mode: bool,
-        init_delete: bool = True,
+        init_all: bool = False,
+        init_week: bool = False,
         use_python: bool = True,
         use_async: bool = True,  # 병렬 처리 활성화 (연결 풀 사용으로 thread-safe 보장)
         farm_list: Optional[str] = None,
+        exclude_farms: Optional[str] = None,
     ) -> dict:
         """주간 리포트 생성
 
@@ -350,19 +390,21 @@ class WeeklyReportOrchestrator:
             dt_from: 시작일
             dt_to: 종료일
             test_mode: 테스트 모드
-            init_delete: 전체 삭제 여부 (배치 실행 시 첫 번째만 True)
+            init_all: 전체 데이터 삭제 (--test --init-all)
+            init_week: 해당 주차 데이터만 삭제 (--test --init-week)
             use_python: Python 프로세서 사용 여부 (False면 Oracle 프로시저 호출)
             use_async: 비동기 병렬 처리 사용 여부
             farm_list: 처리할 농장 목록 (콤마 구분, None이면 전체)
+            exclude_farms: 제외할 농장 목록 (콤마 구분, 예: "848,1234")
 
         Returns:
             처리 결과 딕셔너리
         """
         if use_python:
             if use_async:
-                return self._generate_weekly_report_async(year, week_no, dt_from, dt_to, test_mode, init_delete, farm_list)
+                return self._generate_weekly_report_async(year, week_no, dt_from, dt_to, test_mode, init_all, init_week, farm_list, exclude_farms)
             else:
-                return self._generate_weekly_report_python(year, week_no, dt_from, dt_to, test_mode, init_delete, farm_list)
+                return self._generate_weekly_report_python(year, week_no, dt_from, dt_to, test_mode, init_all, init_week, farm_list, exclude_farms)
         else:
             return self._generate_weekly_report_procedure(test_mode)
 
@@ -399,16 +441,23 @@ class WeeklyReportOrchestrator:
         dt_from: str,
         dt_to: str,
         test_mode: bool,
-        init_delete: bool = True,
+        init_all: bool = False,
+        init_week: bool = False,
         farm_list: Optional[str] = None,
+        exclude_farms: Optional[str] = None,
     ) -> dict:
         """Python 프로세서를 사용한 주간 리포트 생성
 
         SP_INS_WEEK_MAIN 프로시저의 Python 버전
+
+        Args:
+            exclude_farms: 제외할 농장 목록 (콤마 구분, 예: "848,1234")
         """
         from .farm_processor import FarmProcessor
 
         self.logger.info(f"Python ETL 실행: {year}년 {week_no}주, 기간={dt_from}~{dt_to}")
+        if exclude_farms:
+            self.logger.info(f"제외 농장: {exclude_farms}")
 
         target_cnt = 0
         complete_cnt = 0
@@ -422,8 +471,8 @@ class WeeklyReportOrchestrator:
                 national_price = self._get_national_price(cursor, dt_from, dt_to)
                 self.logger.info(f"전국 탕박 평균 단가: {national_price}원")
 
-                # 2. 기존 테스트 데이터 삭제 (테스트 모드+init_delete: 전체 삭제, 그 외: 동일 연도/주차만)
-                self._delete_existing_master(cursor, year, week_no, farm_list, test_mode, init_delete)
+                # 2. 기존 데이터 삭제 (test_mode + init_all/init_week에 따라)
+                self._delete_existing_master(cursor, year, week_no, farm_list, test_mode, init_all, init_week)
                 conn.commit()
 
                 # 3. 마스터 레코드 생성
@@ -431,7 +480,7 @@ class WeeklyReportOrchestrator:
                 self.logger.info(f"마스터 SEQ: {master_seq}")
 
                 # 4. 대상 농장 조회
-                farms = self._get_target_farms(cursor, farm_list, test_mode)
+                farms = self._get_target_farms(cursor, farm_list, test_mode, exclude_farms)
                 target_cnt = len(farms)
                 self.logger.info(f"대상 농장: {target_cnt}개")
 
@@ -489,8 +538,10 @@ class WeeklyReportOrchestrator:
         dt_from: str,
         dt_to: str,
         test_mode: bool,
-        init_delete: bool = True,
+        init_all: bool = False,
+        init_week: bool = False,
         farm_list: Optional[str] = None,
+        exclude_farms: Optional[str] = None,
     ) -> dict:
         """비동기 병렬 처리를 사용한 주간 리포트 생성
 
@@ -502,8 +553,10 @@ class WeeklyReportOrchestrator:
             dt_from: 시작일
             dt_to: 종료일
             test_mode: 테스트 모드
-            init_delete: 전체 삭제 여부 (배치 실행 시 첫 번째만 True)
+            init_all: 전체 데이터 삭제 (--test --init-all)
+            init_week: 해당 주차 데이터만 삭제 (--test --init-week)
             farm_list: 처리할 농장 목록 (콤마 구분, None이면 전체)
+            exclude_farms: 제외할 농장 목록 (콤마 구분, 예: "848,1234")
 
         Returns:
             처리 결과 딕셔너리
@@ -511,6 +564,8 @@ class WeeklyReportOrchestrator:
         from .async_processor import AsyncFarmProcessor
 
         self.logger.info(f"Python ETL (비동기) 실행: {year}년 {week_no}주, 기간={dt_from}~{dt_to}")
+        if exclude_farms:
+            self.logger.info(f"제외 농장: {exclude_farms}")
 
         # 설정에서 병렬 처리 설정 가져오기
         max_farm_workers = self.config.processing.get('max_farm_workers', 4)
@@ -536,8 +591,8 @@ class WeeklyReportOrchestrator:
                     national_price = self._get_national_price(cursor, dt_from, dt_to)
                     self.logger.info(f"전국 탕박 평균 단가: {national_price}원")
 
-                    # 2. 기존 테스트 데이터 삭제 (테스트 모드+init_delete: 전체 삭제, 그 외: 동일 연도/주차만)
-                    self._delete_existing_master(cursor, year, week_no, farm_list, test_mode, init_delete)
+                    # 2. 기존 데이터 삭제 (test_mode + init_all/init_week에 따라)
+                    self._delete_existing_master(cursor, year, week_no, farm_list, test_mode, init_all, init_week)
                     conn.commit()
 
                     # 3. 마스터 레코드 생성
@@ -545,7 +600,7 @@ class WeeklyReportOrchestrator:
                     self.logger.info(f"마스터 SEQ: {master_seq}")
 
                     # 4. 대상 농장 조회
-                    farms = self._get_target_farms(cursor, farm_list, test_mode)
+                    farms = self._get_target_farms(cursor, farm_list, test_mode, exclude_farms)
                     target_cnt = len(farms)
                     self.logger.info(f"대상 농장: {target_cnt}개")
 
@@ -663,44 +718,83 @@ class WeeklyReportOrchestrator:
         result = cursor.fetchone()
         return result[0] if result and result[0] else 0
 
-    def _delete_all_test_data(self, cursor) -> dict:
+    def _delete_all_test_data(self, cursor, farm_list: Optional[str] = None) -> dict:
         """테스트 모드: 전체 테스트 데이터 삭제
 
         테스트 시 깨끗한 상태에서 시작하기 위해 전체 데이터를 삭제합니다.
+        farm_list가 지정되면 해당 농장의 전체 데이터만 삭제합니다.
         삭제 순서: TS_INS_WEEK_SUB → TS_INS_JOB_LOG → TS_INS_WEEK → TS_INS_MASTER
+
+        Args:
+            cursor: DB 커서
+            farm_list: 농장 목록 (콤마 구분, None이면 전체)
 
         Returns:
             삭제된 건수 딕셔너리
         """
         deleted = {'master': 0, 'week': 0, 'week_sub': 0, 'job_log': 0}
 
-        # 1. TS_INS_WEEK_SUB 전체 삭제
-        cursor.execute("DELETE FROM TS_INS_WEEK_SUB")
-        deleted['week_sub'] = cursor.rowcount
+        # farm_list가 지정된 경우 해당 농장만 삭제
+        if farm_list:
+            farm_nos = [int(f.strip()) for f in farm_list.split(',') if f.strip()]
+            farm_placeholders = ', '.join([f':f{i}' for i in range(len(farm_nos))])
+            farm_params = {f'f{i}': f for i, f in enumerate(farm_nos)}
 
-        # 2. TS_INS_JOB_LOG 전체 삭제
-        cursor.execute("DELETE FROM TS_INS_JOB_LOG")
-        deleted['job_log'] = cursor.rowcount
+            self.logger.info(f"지정 농장 전체 데이터 삭제 시작: {farm_nos}")
 
-        # 3. TS_INS_WEEK 전체 삭제
-        cursor.execute("DELETE FROM TS_INS_WEEK")
-        deleted['week'] = cursor.rowcount
+            # 1. TS_INS_WEEK_SUB 삭제 (해당 농장만)
+            cursor.execute(f"DELETE FROM TS_INS_WEEK_SUB WHERE FARM_NO IN ({farm_placeholders})", farm_params)
+            deleted['week_sub'] = cursor.rowcount
 
-        # 4. TS_INS_MASTER 전체 삭제
-        cursor.execute("DELETE FROM TS_INS_MASTER")
-        deleted['master'] = cursor.rowcount
+            # 2. TS_INS_JOB_LOG 삭제 (해당 농장만)
+            cursor.execute(f"DELETE FROM TS_INS_JOB_LOG WHERE FARM_NO IN ({farm_placeholders})", farm_params)
+            deleted['job_log'] = cursor.rowcount
 
-        self.logger.info(f"테스트 데이터 전체 삭제 완료: {deleted}")
+            # 3. TS_INS_WEEK 삭제 (해당 농장만)
+            cursor.execute(f"DELETE FROM TS_INS_WEEK WHERE FARM_NO IN ({farm_placeholders})", farm_params)
+            deleted['week'] = cursor.rowcount
+
+            # 4. TS_INS_MASTER는 삭제하지 않음 (다른 농장 데이터 존재 가능)
+            # 빈 마스터는 별도 정리 필요 시 처리
+
+            self.logger.info(f"지정 농장 전체 데이터 삭제 완료: {deleted}")
+        else:
+            # farm_list 없으면 전체 삭제
+            self.logger.info("전체 테스트 데이터 삭제 시작")
+
+            # 1. TS_INS_WEEK_SUB 전체 삭제
+            cursor.execute("DELETE FROM TS_INS_WEEK_SUB")
+            deleted['week_sub'] = cursor.rowcount
+
+            # 2. TS_INS_JOB_LOG 전체 삭제
+            cursor.execute("DELETE FROM TS_INS_JOB_LOG")
+            deleted['job_log'] = cursor.rowcount
+
+            # 3. TS_INS_WEEK 전체 삭제
+            cursor.execute("DELETE FROM TS_INS_WEEK")
+            deleted['week'] = cursor.rowcount
+
+            # 4. TS_INS_MASTER 전체 삭제
+            cursor.execute("DELETE FROM TS_INS_MASTER")
+            deleted['master'] = cursor.rowcount
+
+            self.logger.info(f"테스트 데이터 전체 삭제 완료: {deleted}")
+
         return deleted
 
     def _delete_existing_master(
         self, cursor, year: int, week_no: int, farm_list: Optional[str] = None,
-        test_mode: bool = False, init_delete: bool = True
+        test_mode: bool = False, init_all: bool = False, init_week: bool = False
     ) -> dict:
-        """기존 테스트 데이터 삭제 (동일 연도/주차)
+        """기존 테스트 데이터 삭제
 
         테스트 시 중복 오류 방지를 위해 기존 데이터를 삭제합니다.
-        test_mode=True AND init_delete=True이면 전체 데이터를 삭제합니다.
+
+        삭제 정책:
+        - test_mode=False: 삭제하지 않음 (운영 데이터 보호)
+        - test_mode=True AND init_all=False AND init_week=False: 삭제하지 않음
+        - test_mode=True AND init_all=True: 전체 테스트 데이터 삭제 (farm_list 있으면 해당 농장만)
+        - test_mode=True AND init_week=True: 해당 주차 데이터만 삭제 (farm_list 있으면 해당 농장만)
 
         Args:
             cursor: DB 커서
@@ -708,15 +802,28 @@ class WeeklyReportOrchestrator:
             week_no: 주차
             farm_list: 농장 목록 (콤마 구분, None이면 전체)
             test_mode: 테스트 모드 여부
-            init_delete: 전체 삭제 여부 (배치 실행 시 첫 번째만 True)
+            init_all: 전체 데이터 삭제 (--test --init-all)
+            init_week: 해당 주차 데이터만 삭제 (--test --init-week)
 
         Returns:
             삭제된 건수 딕셔너리
         """
-        # 테스트 모드이고 init_delete=True이면 전체 삭제
-        if test_mode and init_delete:
-            return self._delete_all_test_data(cursor)
+        # 테스트 모드가 아니면 삭제하지 않음 (운영 데이터 보호)
+        if not test_mode:
+            self.logger.info("운영 모드: 기존 데이터 삭제 스킵 (test_mode=False)")
+            return {'master': 0, 'week': 0, 'week_sub': 0, 'job_log': 0}
 
+        # init_all과 init_week 둘 다 False이면 삭제하지 않음 (--test만 사용한 경우)
+        if not init_all and not init_week:
+            self.logger.info("테스트 모드: 기존 데이터 삭제 스킵 (init_all=False, init_week=False)")
+            return {'master': 0, 'week': 0, 'week_sub': 0, 'job_log': 0}
+
+        # --test --init-all: 전체 테스트 데이터 삭제 (farm_list 있으면 해당 농장만)
+        if init_all:
+            return self._delete_all_test_data(cursor, farm_list)
+
+        # --test --init-week: 해당 주차 데이터만 삭제
+        self.logger.info(f"해당 주차 데이터 삭제 시작: {year}년 {week_no}주")
         deleted = {'master': 0, 'week': 0, 'week_sub': 0, 'job_log': 0}
 
         # 1. 해당 연도/주차의 마스터 SEQ 조회
@@ -803,6 +910,66 @@ class WeeklyReportOrchestrator:
         self.logger.info(f"기존 데이터 삭제 완료: {deleted}")
         return deleted
 
+    def _delete_single_farm_data(
+        self, cursor, year: int, week_no: int, farm_no: int
+    ) -> dict:
+        """단일 농장 데이터 삭제 (동일 연도/주차, 해당 농장만)
+
+        run_single_farm에서 특정 농장의 주간 리포트를 수동 재생성할 때 사용.
+        해당 농장의 기존 데이터만 삭제합니다.
+
+        Args:
+            cursor: DB 커서
+            year: 연도
+            week_no: 주차
+            farm_no: 농장번호
+
+        Returns:
+            삭제된 건수 딕셔너리
+        """
+        deleted = {'week': 0, 'week_sub': 0, 'job_log': 0}
+
+        # 1. 해당 연도/주차의 마스터 SEQ 조회
+        cursor.execute("""
+            SELECT SEQ FROM TS_INS_MASTER
+            WHERE REPORT_YEAR = :year AND REPORT_WEEK_NO = :week_no AND DAY_GB = 'WEEK'
+        """, {'year': year, 'week_no': week_no})
+        master_rows = cursor.fetchall()
+
+        if not master_rows:
+            self.logger.info(f"삭제할 기존 데이터 없음: {year}년 {week_no}주")
+            return deleted
+
+        master_seqs = [row[0] for row in master_rows]
+        self.logger.info(f"단일 농장 삭제 대상 마스터 SEQ: {master_seqs}, 농장: {farm_no}")
+
+        for master_seq in master_seqs:
+            params = {'master_seq': master_seq, 'farm_no': farm_no}
+
+            # 2. TS_INS_WEEK_SUB 삭제
+            cursor.execute("""
+                DELETE FROM TS_INS_WEEK_SUB
+                WHERE MASTER_SEQ = :master_seq AND FARM_NO = :farm_no
+            """, params)
+            deleted['week_sub'] += cursor.rowcount
+
+            # 3. TS_INS_JOB_LOG 삭제
+            cursor.execute("""
+                DELETE FROM TS_INS_JOB_LOG
+                WHERE MASTER_SEQ = :master_seq AND FARM_NO = :farm_no
+            """, params)
+            deleted['job_log'] += cursor.rowcount
+
+            # 4. TS_INS_WEEK 삭제
+            cursor.execute("""
+                DELETE FROM TS_INS_WEEK
+                WHERE MASTER_SEQ = :master_seq AND FARM_NO = :farm_no
+            """, params)
+            deleted['week'] += cursor.rowcount
+
+        self.logger.info(f"단일 농장 데이터 삭제 완료: farm_no={farm_no}, {deleted}")
+        return deleted
+
     def _create_master(self, cursor, year: int, week_no: int, dt_from: str, dt_to: str) -> int:
         """TS_INS_MASTER 레코드 생성 또는 기존 레코드 재사용
 
@@ -849,21 +1016,42 @@ class WeeklyReportOrchestrator:
 
         return master_seq
 
-    def _get_target_farms(self, cursor, farm_list: Optional[str], test_mode: bool) -> List[dict]:
+    def _get_target_farms(
+        self,
+        cursor,
+        farm_list: Optional[str],
+        test_mode: bool,
+        exclude_farms: Optional[str] = None,
+    ) -> List[dict]:
         """대상 농장 조회
 
         SQL은 src/common/farm_service.py의 SERVICE_FARM_SQL 사용 (중앙 관리).
         기존 cursor를 사용하여 연결 일관성 유지.
+
+        Args:
+            cursor: DB 커서
+            farm_list: 처리할 농장 목록 (콤마 구분, None이면 전체)
+            test_mode: 테스트 모드 여부
+            exclude_farms: 제외할 농장 목록 (콤마 구분, 예: "848,1234")
         """
         sql = SERVICE_FARM_SQL
+        params = {}
 
+        # 포함 필터링 (IN)
         if farm_list:
-            # 농장 목록이 지정된 경우 필터링
             farm_nos = [int(f.strip()) for f in farm_list.split(',') if f.strip()]
             placeholders = ', '.join([f':f{i}' for i in range(len(farm_nos))])
             sql = sql.replace('ORDER BY F.FARM_NO', f'AND F.FARM_NO IN ({placeholders})\n    ORDER BY F.FARM_NO')
+            params.update({f'f{i}': f for i, f in enumerate(farm_nos)})
 
-            params = {f'f{i}': f for i, f in enumerate(farm_nos)}
+        # 제외 필터링 (NOT IN)
+        if exclude_farms:
+            exclude_nos = [int(f.strip()) for f in exclude_farms.split(',') if f.strip()]
+            exclude_placeholders = ', '.join([f':ex{i}' for i in range(len(exclude_nos))])
+            sql = sql.replace('ORDER BY F.FARM_NO', f'AND F.FARM_NO NOT IN ({exclude_placeholders})\n    ORDER BY F.FARM_NO')
+            params.update({f'ex{i}': f for i, f in enumerate(exclude_nos)})
+
+        if params:
             cursor.execute(sql, params)
         else:
             cursor.execute(sql)
@@ -976,6 +1164,7 @@ class WeeklyReportOrchestrator:
         farm_list: str = TEST_FARM_LIST,
         dates: Optional[List[str]] = None,
         parallel: int = 4,  # noqa: ARG002 - 호환성 유지용
+        exclude_farms: Optional[str] = None,
     ) -> dict:
         """테스트용 배치 실행
 
@@ -986,6 +1175,7 @@ class WeeklyReportOrchestrator:
             farm_list: 테스트 농장 목록 (콤마 구분)
             dates: 실행할 날짜 목록 (YYYYMMDD), None이면 기본 테스트 날짜 사용
             parallel: 미사용 (기존 API 호환성 유지)
+            exclude_farms: 제외할 농장 목록 (콤마 구분, 예: "848,1234")
 
         Returns:
             실행 결과 딕셔너리
@@ -997,6 +1187,8 @@ class WeeklyReportOrchestrator:
         self.logger.info("테스트 배치 실행 시작 (Python 프로세서)")
         self.logger.info(f"  날짜 수: {len(dates)}")
         self.logger.info(f"  농장 목록: {farm_list}")
+        if exclude_farms:
+            self.logger.info(f"  제외 농장: {exclude_farms}")
         self.logger.info("=" * 60)
 
         results = []
@@ -1036,6 +1228,7 @@ class WeeklyReportOrchestrator:
                     use_python=True,
                     use_async=True,
                     farm_list=farm_list,
+                    exclude_farms=exclude_farms,
                 )
 
                 self.logger.info(f"  완료: {dt}")
@@ -1151,7 +1344,8 @@ class WeeklyReportOrchestrator:
                     self.logger.info(f"전국 탕박 평균 단가: {national_price:,}원")
 
                     # 3. 기존 데이터 삭제 (동일 연도/주차, 해당 농장만)
-                    self._delete_existing_master(cursor, year, week_no, str(farm_no))
+                    # run_single_farm은 단일 농장 수동 재생성이므로 해당 농장만 삭제
+                    self._delete_single_farm_data(cursor, year, week_no, farm_no)
                     conn.commit()
 
                     # 4. 마스터 레코드 생성
@@ -1232,5 +1426,107 @@ class WeeklyReportOrchestrator:
             return {
                 'status': 'error',
                 'farm_no': farm_no,
+                'error': str(e),
+            }
+
+    def run_all_farms(
+        self,
+        base_date: Optional[str] = None,
+        exclude_farms: Optional[str] = None,
+        skip_productivity: bool = True,
+        skip_weather: bool = True,
+    ) -> dict:
+        """전체 서비스 농장 대상 ETL 실행 (특정 농장 제외 가능)
+
+        1회성 전체 농장 ETL 실행 시 사용
+        예: 848 농장 제외하고 전체 농장 데이터 생성
+
+        Args:
+            base_date: 기준 날짜 (YYYYMMDD), None이면 오늘
+            exclude_farms: 제외할 농장 목록 (콤마 구분, 예: "848,1234")
+            skip_productivity: 생산성 수집 스킵 (기본: True)
+            skip_weather: 기상청 수집 스킵 (기본: True)
+
+        Returns:
+            실행 결과 딕셔너리
+
+        Usage:
+            # 848 농장 제외하고 전체 농장 ETL 실행
+            orchestrator.run_all_farms(exclude_farms="848")
+
+            # 특정 날짜 기준, 848, 1234 농장 제외
+            orchestrator.run_all_farms(base_date="20260106", exclude_farms="848,1234")
+        """
+        self.logger.info("=" * 60)
+        self.logger.info("전체 농장 ETL 실행 (exclude_farms 지원)")
+        if exclude_farms:
+            self.logger.info(f"  제외 농장: {exclude_farms}")
+        self.logger.info("=" * 60)
+
+        # 기준 날짜 설정 (한국 시간 기준)
+        if base_date:
+            base_dt = datetime.strptime(base_date, '%Y%m%d')
+        else:
+            base_dt = now_kst()
+
+        # 지난주 계산 (기준일의 지난주 월~일)
+        days_to_last_sunday = (base_dt.weekday() + 1) % 7 or 7
+        last_sunday = base_dt - timedelta(days=days_to_last_sunday)
+        last_monday = last_sunday - timedelta(days=6)
+        dt_from = last_monday.strftime('%Y%m%d')
+        dt_to = last_sunday.strftime('%Y%m%d')
+
+        # 주차 계산 (ISO Week)
+        year = int(last_sunday.strftime('%G'))
+        week_no = int(last_sunday.strftime('%V'))
+
+        self.logger.info(f"  기준일: {base_dt.strftime('%Y-%m-%d')}")
+        self.logger.info(f"  리포트 기간: {dt_from} ~ {dt_to}")
+        self.logger.info(f"  주차: {year}년 {week_no}주")
+
+        try:
+            # 외부 데이터 수집 (옵션)
+            if not skip_productivity or not skip_weather:
+                self.logger.info("-" * 40)
+                self.logger.info("외부 데이터 수집")
+                self._collect_external_data(dt_to, skip_productivity, skip_weather)
+
+            # 주간 리포트 생성 (전체 농장, exclude_farms 적용)
+            self.logger.info("-" * 40)
+            self.logger.info("주간 리포트 생성")
+
+            report_result = self._generate_weekly_report(
+                year=year,
+                week_no=week_no,
+                dt_from=dt_from,
+                dt_to=dt_to,
+                test_mode=False,
+                init_delete=False,  # 전체 삭제 안함
+                use_python=True,
+                use_async=True,
+                farm_list=None,  # 전체 농장
+                exclude_farms=exclude_farms,  # 제외 농장
+            )
+
+            self.logger.info("=" * 60)
+            self.logger.info(f"전체 농장 ETL 완료: {report_result.get('complete_cnt', 0)}/{report_result.get('target_cnt', 0)}")
+            self.logger.info("=" * 60)
+
+            return {
+                'status': report_result.get('status', 'success'),
+                'year': year,
+                'week_no': week_no,
+                'dt_from': dt_from,
+                'dt_to': dt_to,
+                'exclude_farms': exclude_farms,
+                'target_cnt': report_result.get('target_cnt', 0),
+                'complete_cnt': report_result.get('complete_cnt', 0),
+                'error_cnt': report_result.get('error_cnt', 0),
+            }
+
+        except Exception as e:
+            self.logger.error(f"전체 농장 ETL 실패: {e}", exc_info=True)
+            return {
+                'status': 'error',
                 'error': str(e),
             }

@@ -182,6 +182,7 @@ class ProductivityCollector(BaseCollector):
         farm_list: Optional[List[Dict]] = None,
         stat_date: Optional[str] = None,
         period: str = 'W',
+        exclude_farms: Optional[str] = None,
         **kwargs
     ) -> List[Dict[str, Any]]:
         """생산성 데이터 수집
@@ -193,6 +194,7 @@ class ProductivityCollector(BaseCollector):
                       None이면 현재 날짜
             period: 기간 구분 (W:주간, M:월간, Q:분기)
                    기본값 'W' (주간)
+            exclude_farms: 제외할 농장 목록 (콤마 구분, 예: "848,1234")
 
         Returns:
             수집된 데이터 리스트
@@ -210,7 +212,7 @@ class ProductivityCollector(BaseCollector):
             raise ValueError(f"잘못된 period 값: {period}. 허용값: {self.VALID_PERIODS}")
 
         if farm_list is None:
-            farm_list = self._get_farm_list()
+            farm_list = self._get_farm_list(exclude_farms=exclude_farms)
 
         if not farm_list:
             self.logger.warning("수집 대상 농장이 없습니다.")
@@ -249,6 +251,11 @@ class ProductivityCollector(BaseCollector):
                 return []
 
         # 병렬 처리로 API 호출
+        total_farms = len(farm_list)
+        processed_cnt = 0
+
+        self.logger.info(f"생산성 수집 시작: 총 {total_farms}개 농장")
+
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             future_to_farm = {
                 executor.submit(fetch_single_farm, farm): farm
@@ -258,30 +265,34 @@ class ProductivityCollector(BaseCollector):
             for future in as_completed(future_to_farm):
                 farm = future_to_farm[future]
                 farm_no = farm.get('FARM_NO')
+                processed_cnt += 1
 
                 try:
                     farm_data = future.result()
                     if farm_data:
                         result.extend(farm_data)
                         success_cnt += 1
-                        self.logger.debug(f"농장 {farm_no}: 수집 완료 ({len(farm_data)}건)")
+                        self.logger.info(f"  [{processed_cnt}/{total_farms}] 농장 {farm_no}: OK ({len(farm_data)}건)")
                     else:
                         error_cnt += 1
-                        self.logger.warning(f"농장 {farm_no}: 데이터 없음")
+                        self.logger.warning(f"  [{processed_cnt}/{total_farms}] 농장 {farm_no}: 데이터 없음")
                 except Exception as e:
                     error_cnt += 1
-                    self.logger.error(f"농장 {farm_no} 처리 예외: {e}")
+                    self.logger.error(f"  [{processed_cnt}/{total_farms}] 농장 {farm_no}: 실패 - {e}")
 
         self.logger.info(f"수집 완료: 성공 {success_cnt}개, 실패 {error_cnt}개, 총 레코드 {len(result)}건")
         return result
 
-    def _get_farm_list(self) -> List[Dict]:
+    def _get_farm_list(self, exclude_farms: Optional[str] = None) -> List[Dict]:
         """DB에서 대상 농장 목록 조회
 
         공통 함수 get_service_farm_nos()를 사용하여 일관성 보장.
         SQL은 src/common/farm_service.py에서 중앙 관리.
+
+        Args:
+            exclude_farms: 제외할 농장 목록 (콤마 구분, 예: "848,1234")
         """
-        return get_service_farm_nos(self.db)
+        return get_service_farm_nos(self.db, exclude_farms=exclude_farms)
 
     def _process_response(
         self, farm_no: int, stat_date: str, period: str, period_info: Dict, data: Dict

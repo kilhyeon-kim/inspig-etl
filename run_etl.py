@@ -34,15 +34,16 @@ def parse_args():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 예시:
-  python run_etl.py                    # 전체 ETL (기본)
+  python run_etl.py                    # 운영 모드 ETL (기본, 크론 등록용)
   python run_etl.py weekly             # 주간 리포트만
   python run_etl.py weather            # 기상청 수집만
-  python run_etl.py --test             # 테스트 모드 (금주 데이터)
+  python run_etl.py --test             # 테스트 모드 (기존 데이터 삭제 안함)
+  python run_etl.py --test --init-week # 테스트 + 해당 주차 데이터만 삭제
+  python run_etl.py --test --init-all  # 테스트 + 전체 데이터 삭제
   python run_etl.py --base-date 2024-12-15  # 특정 기준일
   python run_etl.py --dry-run          # 설정 확인만
-  python run_etl.py --init             # 테스트 데이터 초기화 후 배치 실행
-  python run_etl.py --init --dry-run   # 초기화 설정만 확인
-  python run_etl.py --init --farm-list "1387,2807"  # 특정 농장만 테스트
+  python run_etl.py --exclude 848      # 848 농장 제외하고 ETL 실행
+  python run_etl.py --exclude "848,1234"  # 여러 농장 제외
 
 날짜 범위 배치 실행 (주간 단위):
   python run_etl.py --date-from 2025-11-10 --date-to 2025-12-22 --test
@@ -51,6 +52,12 @@ def parse_args():
 수동 실행 (웹시스템에서 호출):
   python run_etl.py --manual --farm-no 12345
   python run_etl.py --manual --farm-no 12345 --dt-from 20251215 --dt-to 20251221
+
+데이터 삭제 정책:
+  - 운영 모드 (옵션 없음): 기존 데이터 삭제 안함
+  - --test: 기존 데이터 삭제 안함
+  - --test --init-week: 해당 주차 데이터만 삭제
+  - --test --init-all: 전체 테스트 데이터 삭제
         """
     )
 
@@ -97,7 +104,19 @@ def parse_args():
     parser.add_argument(
         '--init',
         action='store_true',
-        help='테스트 데이터 초기화 후 배치 실행 (테스트용)'
+        help='초기화 배치 실행 (테이블 초기화 + 테스트 배치 실행)'
+    )
+
+    parser.add_argument(
+        '--init-all',
+        action='store_true',
+        help='--test와 함께 사용시 전체 테스트 데이터 삭제'
+    )
+
+    parser.add_argument(
+        '--init-week',
+        action='store_true',
+        help='--test와 함께 사용시 해당 주차 데이터만 삭제'
     )
 
     parser.add_argument(
@@ -105,6 +124,13 @@ def parse_args():
         type=str,
         default='1387,2807,848,4223,1013',
         help='테스트용 농장 목록 (콤마 구분)'
+    )
+
+    parser.add_argument(
+        '--exclude',
+        type=str,
+        default=None,
+        help='제외할 농장번호 (콤마 구분, 예: "848,1234")'
     )
 
     # 수동 실행 관련 인자
@@ -190,10 +216,15 @@ def main():
                 sys.exit(1)
 
             orchestrator = WeeklyReportOrchestrator(config)
+
+            # run_single_farm은 ins_date(기준일)을 받아 자동으로 지난주를 계산
+            # --dt-from, --dt-to 옵션은 현재 무시됨 (추후 확장 가능)
+            # --base-date가 있으면 기준일로 사용
+            ins_date = base_date  # YYYYMMDD 형식 또는 None
+
             result = orchestrator.run_single_farm(
                 farm_no=args.farm_no,
-                dt_from=args.dt_from,
-                dt_to=args.dt_to,
+                ins_date=ins_date,
             )
             print(f"결과: {result}")
 
@@ -274,13 +305,17 @@ def main():
             orchestrator = WeeklyReportOrchestrator(config)
             results = []
 
+            # farm_list: --test 모드에서만 사용
+            batch_farm_list = args.farm_list if args.test else None
+
             for i, run_date in enumerate(date_list, 1):
                 print("-" * 40)
                 print(f"[{i}/{len(date_list)}] 기준일: {run_date}")
                 print("-" * 40)
 
-                # 첫 번째 실행에서만 전체 삭제 (init_delete=True)
-                # 이후 실행에서는 해당 주차만 삭제 (init_delete=False)
+                # 첫 번째 실행에서만 전체 삭제 (init_all=True)
+                # 이후 실행에서는 해당 주차만 삭제 (init_week=True)
+                # 주의: --test 모드에서만 삭제 적용 (운영 모드에서는 test_mode=False로 삭제 차단됨)
                 is_first = (i == 1)
                 result = orchestrator.run(
                     base_date=run_date,
@@ -288,7 +323,10 @@ def main():
                     skip_productivity=False,  # 생산성 데이터 수집 (TS_PRODUCTIVITY)
                     skip_weather=True,  # 배치에서는 기상청 스킵
                     dry_run=False,
-                    init_delete=is_first,  # 첫 번째만 전체 삭제
+                    init_all=is_first and args.test,  # 첫 번째 + 테스트 모드만 전체 삭제
+                    init_week=(not is_first) and args.test,  # 이후 + 테스트 모드만 해당 주차 삭제
+                    farm_list=batch_farm_list,  # 대상 농장 (--test 모드, 콤마 구분)
+                    exclude_farms=args.exclude,  # 제외할 농장 (콤마 구분)
                 )
                 results.append({
                     'date': run_date,
@@ -312,12 +350,20 @@ def main():
         if args.command == 'all' or args.command == 'weekly':
             # 주간 리포트 ETL (전체 또는 weekly)
             orchestrator = WeeklyReportOrchestrator(config)
+
+            # farm_list: --test 모드에서만 사용
+            farm_list = args.farm_list if args.test else None
+
             result = orchestrator.run(
                 base_date=base_date,
                 test_mode=args.test,
                 skip_productivity=False,  # 생산성 수집 활성화
                 skip_weather=True,  # 기상청 수집 스킵 (별도 API 사용)
                 dry_run=args.dry_run,
+                init_all=args.init_all,  # --test --init-all: 전체 데이터 삭제
+                init_week=args.init_week,  # --test --init-week: 해당 주차만 삭제
+                farm_list=farm_list,  # 대상 농장 (--test 모드, 콤마 구분)
+                exclude_farms=args.exclude,  # 제외할 농장 (콤마 구분)
             )
             print(f"결과: {result}")
 
