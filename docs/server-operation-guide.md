@@ -8,7 +8,7 @@
 | ETL API 포트 | 8001 |
 | 설치 경로 | /data/etl/inspig |
 | 계정 | pigplan |
-| Python 가상환경 | /data/etl/inspig/venv |
+| Conda 환경 | inspig-etl |
 
 ---
 
@@ -27,11 +27,11 @@ mkdir -p /data/etl/inspig/logs
 cd /data/etl/inspig
 ```
 
-### 2.3 Python 가상환경 설정
+### 2.3 Conda 환경 설정
 
 ```bash
-python3 -m venv venv
-source venv/bin/activate
+source /data/anaconda/anaconda3/etc/profile.d/conda.sh
+conda activate inspig-etl
 pip install -r requirements.txt
 ```
 
@@ -45,7 +45,8 @@ vi config.ini  # DB 패스워드, API 키 입력
 ### 2.5 ETL 테스트
 
 ```bash
-source venv/bin/activate
+source /data/anaconda/anaconda3/etc/profile.d/conda.sh
+conda activate inspig-etl
 python run_etl.py --dry-run
 python run_etl.py --test
 ```
@@ -134,7 +135,8 @@ curl http://localhost:8001/health
 
 ```bash
 cd /data/etl/inspig
-source venv/bin/activate
+source /data/anaconda/anaconda3/etc/profile.d/conda.sh
+conda activate inspig-etl
 
 # 전체 농장 주간 리포트 생성
 python run_etl.py
@@ -220,8 +222,9 @@ sudo journalctl -u inspig-etl-api -n 50
 ### 8.2 ETL 실행 오류
 
 ```bash
-# 가상환경 활성화 확인
-source /data/etl/inspig/venv/bin/activate
+# Conda 환경 활성화 확인
+source /data/anaconda/anaconda3/etc/profile.d/conda.sh
+conda activate inspig-etl
 which python
 
 # 의존성 재설치

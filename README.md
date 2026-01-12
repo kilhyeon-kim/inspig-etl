@@ -19,15 +19,12 @@
 
 ### 로컬 개발 환경
 
-ssh -i "E:/ssh key/sshkey/aws/ProdPigplanKey.pem" pigplan@10.4.35.10
-cd /data/etl/inspig
-
 ```bash
 cd C:\Projects\inspig-etl
 
-# 가상환경 생성
-python -m venv venv
-venv\Scripts\activate
+# Conda 환경 생성 (최초 1회)
+conda create -n inspig-etl python=3.8
+conda activate inspig-etl
 
 # 의존성 설치
 pip install oracledb requests python-dotenv
@@ -38,6 +35,13 @@ cp config.ini.example config.ini
 
 # 테스트 실행 (dry-run)
 python run_etl.py --dry-run
+```
+
+### 운영 서버 접속
+
+```bash
+ssh -i "E:/ssh key/sshkey/aws/ProdPigplanKey.pem" pigplan@10.4.35.10
+cd /data/etl/inspig
 ```
 
 ### 운영 서버 배포

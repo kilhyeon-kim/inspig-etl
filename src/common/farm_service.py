@@ -3,87 +3,39 @@
 
 농장 목록 조회 SQL을 한 곳에서 관리하여 일관성을 보장합니다.
 ProductivityCollector, WeatherCollector, orchestrator 등에서 공통으로 사용합니다.
+
+VW_INS_SERVICE_ACTIVE View 사용:
+- inspig, inspig-etl, pig3.1 공통 사용
+- TS_INS_SERVICE에서 현재 유효한 최신 구독만 조회
+
+REG_TYPE 필터링:
+- 정기 배치: REG_TYPE='AUTO' (기본값)만 대상
+- 수동 ETL: REG_TYPE 무관 (farm_list로 직접 지정)
 """
 from typing import List, Dict, Optional
 
 
-# 서비스 대상 농장 조회 SQL (공통)
-# TS_INS_SERVICE 필터링 조건 (PK: FARM_NO + INSPIG_REG_DT - 이력 관리):
-# - INSPIG_YN = 'Y': 인사이트피그 서비스 사용
-# - INSPIG_FROM_DT <= SYSDATE: 서비스 시작일 이후
-# - SYSDATE <= LEAST(INSPIG_TO_DT, INSPIG_STOP_DT): 종료일/중지일 중 빠른 날짜 이전
-# - INSPIG_STOP_DT 기본값: 9999-12-31 (NULL이면 중지 안됨)
-# - 같은 농장 중 유효한 최신 건(INSPIG_REG_DT 기준)만 조인
-# 주의: DB가 UTC이므로 SYSDATE + 9/24로 KST 변환
+# 서비스 대상 농장 조회 SQL (정기 배치용)
+# VW_INS_SERVICE_ACTIVE View 사용 + REG_TYPE='AUTO' 필터
+# MANUAL 등록은 정기 배치 대상에서 제외
 SERVICE_FARM_SQL = """
     SELECT DISTINCT F.FARM_NO, F.FARM_NM, F.PRINCIPAL_NM, F.SIGUN_CD,
            NVL(F.COUNTRY_CODE, 'KOR') AS LOCALE
     FROM TA_FARM F
-    INNER JOIN (
-        SELECT S1.FARM_NO, S1.INSPIG_REG_DT
-        FROM TS_INS_SERVICE S1
-        WHERE S1.INSPIG_YN = 'Y'
-          AND S1.USE_YN = 'Y'
-          AND S1.INSPIG_FROM_DT IS NOT NULL
-          AND S1.INSPIG_TO_DT IS NOT NULL
-          AND TO_CHAR(SYSDATE + 9/24, 'YYYYMMDD') >= S1.INSPIG_FROM_DT
-          AND TO_CHAR(SYSDATE + 9/24, 'YYYYMMDD') <= LEAST(
-              S1.INSPIG_TO_DT,
-              NVL(S1.INSPIG_STOP_DT, '99991231')
-          )
-          AND S1.INSPIG_REG_DT = (
-              SELECT MAX(S2.INSPIG_REG_DT)
-              FROM TS_INS_SERVICE S2
-              WHERE S2.FARM_NO = S1.FARM_NO
-                AND S2.INSPIG_YN = 'Y'
-                AND S2.USE_YN = 'Y'
-                AND S2.INSPIG_FROM_DT IS NOT NULL
-                AND S2.INSPIG_TO_DT IS NOT NULL
-                AND TO_CHAR(SYSDATE + 9/24, 'YYYYMMDD') >= S2.INSPIG_FROM_DT
-                AND TO_CHAR(SYSDATE + 9/24, 'YYYYMMDD') <= LEAST(
-                    S2.INSPIG_TO_DT,
-                    NVL(S2.INSPIG_STOP_DT, '99991231')
-                )
-          )
-    ) S ON F.FARM_NO = S.FARM_NO
+    INNER JOIN VW_INS_SERVICE_ACTIVE S ON F.FARM_NO = S.FARM_NO
     WHERE F.USE_YN = 'Y'
+      AND NVL(S.REG_TYPE, 'AUTO') = 'AUTO'
     ORDER BY F.FARM_NO
 """
 
 # 농장번호만 조회하는 SQL (ProductivityCollector 등에서 사용)
-# PK: FARM_NO + INSPIG_REG_DT (이력 관리) - 유효한 최신 건만 조인
-# 주의: DB가 UTC이므로 SYSDATE + 9/24로 KST 변환
+# VW_INS_SERVICE_ACTIVE View 사용 + REG_TYPE='AUTO' 필터
 SERVICE_FARM_NO_SQL = """
     SELECT DISTINCT F.FARM_NO
     FROM TA_FARM F
-    INNER JOIN (
-        SELECT S1.FARM_NO, S1.INSPIG_REG_DT
-        FROM TS_INS_SERVICE S1
-        WHERE S1.INSPIG_YN = 'Y'
-          AND S1.USE_YN = 'Y'
-          AND S1.INSPIG_FROM_DT IS NOT NULL
-          AND S1.INSPIG_TO_DT IS NOT NULL
-          AND TO_CHAR(SYSDATE + 9/24, 'YYYYMMDD') >= S1.INSPIG_FROM_DT
-          AND TO_CHAR(SYSDATE + 9/24, 'YYYYMMDD') <= LEAST(
-              S1.INSPIG_TO_DT,
-              NVL(S1.INSPIG_STOP_DT, '99991231')
-          )
-          AND S1.INSPIG_REG_DT = (
-              SELECT MAX(S2.INSPIG_REG_DT)
-              FROM TS_INS_SERVICE S2
-              WHERE S2.FARM_NO = S1.FARM_NO
-                AND S2.INSPIG_YN = 'Y'
-                AND S2.USE_YN = 'Y'
-                AND S2.INSPIG_FROM_DT IS NOT NULL
-                AND S2.INSPIG_TO_DT IS NOT NULL
-                AND TO_CHAR(SYSDATE + 9/24, 'YYYYMMDD') >= S2.INSPIG_FROM_DT
-                AND TO_CHAR(SYSDATE + 9/24, 'YYYYMMDD') <= LEAST(
-                    S2.INSPIG_TO_DT,
-                    NVL(S2.INSPIG_STOP_DT, '99991231')
-                )
-          )
-    ) S ON F.FARM_NO = S.FARM_NO
+    INNER JOIN VW_INS_SERVICE_ACTIVE S ON F.FARM_NO = S.FARM_NO
     WHERE F.USE_YN = 'Y'
+      AND NVL(S.REG_TYPE, 'AUTO') = 'AUTO'
     ORDER BY F.FARM_NO
 """
 

@@ -25,7 +25,7 @@
 | ETL API 포트 | 8001 |
 | 설치 경로 | /data/etl/inspig |
 | 계정 | pigplan |
-| Python 가상환경 | /data/etl/inspig/venv |
+| Conda 환경 | inspig-etl |
 
 ---
 
@@ -43,9 +43,9 @@ ssh -i "E:/ssh key/sshkey/aws/ProdPigplanKey.pem" pigplan@10.4.35.10
 # 디렉토리 이동
 cd /data/etl/inspig
 
-# Python 가상환경 설정
-python3 -m venv venv
-source venv/bin/activate
+# Conda 환경 활성화
+source /data/anaconda/anaconda3/etc/profile.d/conda.sh
+conda activate inspig-etl
 pip install -r requirements.txt
 
 # 설정 파일 생성
@@ -56,7 +56,8 @@ vi config.ini  # DB 패스워드, API 키 입력
 ### 2.3 테스트
 
 ```bash
-source venv/bin/activate
+source /data/anaconda/anaconda3/etc/profile.d/conda.sh
+conda activate inspig-etl
 python run_etl.py --dry-run
 ```
 

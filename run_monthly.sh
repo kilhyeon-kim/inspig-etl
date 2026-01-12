@@ -31,16 +31,10 @@ echo "========================================" >> "$LOG_FILE"
 echo "InsightPig Monthly ETL 시작: $(TZ='Asia/Seoul' date)" >> "$LOG_FILE"
 echo "========================================" >> "$LOG_FILE"
 
-# Conda 환경 활성화 (운영 서버)
-if [ -f "/home/pigplan/anaconda3/etc/profile.d/conda.sh" ]; then
-    source /home/pigplan/anaconda3/etc/profile.d/conda.sh
-    conda activate inspig-etl
-    echo "Conda 환경: inspig-etl" >> "$LOG_FILE"
-elif [ -f "/data/anaconda/anaconda3/etc/profile.d/conda.sh" ]; then
-    source /data/anaconda/anaconda3/etc/profile.d/conda.sh
-    conda activate inspig-etl
-    echo "Conda 환경: inspig-etl (data)" >> "$LOG_FILE"
-fi
+# Conda 환경 활성화
+source /data/anaconda/anaconda3/etc/profile.d/conda.sh
+conda activate inspig-etl
+echo "Conda 환경: inspig-etl" >> "$LOG_FILE"
 
 # Python 버전 확인
 python --version >> "$LOG_FILE" 2>&1

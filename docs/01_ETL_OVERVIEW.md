@@ -158,9 +158,9 @@ base_url = https://apis.data.go.kr/1360000/VilageFcstInfoService_2.0
 ```bash
 cd C:\Projects\inspig-etl
 
-# 가상환경 생성
-python -m venv venv
-venv\Scripts\activate
+# Conda 환경 생성 (최초 1회)
+conda create -n inspig-etl python=3.8
+conda activate inspig-etl
 
 # 의존성 설치
 pip install oracledb requests python-dotenv
