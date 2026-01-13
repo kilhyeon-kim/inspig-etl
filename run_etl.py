@@ -133,6 +133,14 @@ def parse_args():
         help='제외할 농장번호 (콤마 구분, 예: "848,1234")'
     )
 
+    parser.add_argument(
+        '--schedule-group',
+        type=str,
+        choices=['AM7', 'PM2'],
+        default=None,
+        help='스케줄 그룹 필터 (AM7:오전7시, PM2:오후2시, 미지정 시 전체)'
+    )
+
     # 수동 실행 관련 인자
     parser.add_argument(
         '--manual',
@@ -364,6 +372,7 @@ def main():
                 init_week=args.init_week,  # --test --init-week: 해당 주차만 삭제
                 farm_list=farm_list,  # 대상 농장 (--test 모드, 콤마 구분)
                 exclude_farms=args.exclude,  # 제외할 농장 (콤마 구분)
+                schedule_group=args.schedule_group,  # 스케줄 그룹 (AM7, PM2)
             )
             print(f"결과: {result}")
 

@@ -161,3 +161,14 @@ class Database:
             self._connection.commit()
         logger.info(f"함수 완료: {func_name}, result={result}")
         return result
+
+    def commit(self) -> None:
+        """트랜잭션 커밋"""
+        if self._connection:
+            self._connection.commit()
+
+    def rollback(self) -> None:
+        """트랜잭션 롤백"""
+        if self._connection:
+            self._connection.rollback()
+            logger.debug("트랜잭션 롤백 완료")

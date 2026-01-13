@@ -677,6 +677,30 @@ WHERE STAT_YEAR = 2024 AND PERIOD = 'M' AND PERIOD_NO = 12 AND PCODE = '034';
 
 ---
 
+## 레거시 Oracle 프로시저 (참조용)
+
+Python ETL 작성 기준이 된 Oracle 프로시저/JOB 백업 파일:
+
+| 파일 | 프로시저/JOB | 설명 |
+|------|-------------|------|
+| `inspig-docs-shared/db/sql/ins/backup/01_SP_INS_WEEK_MAIN.sql` | SP_INS_WEEK_MAIN | 주간 ETL 메인 (→ orchestrator.py) |
+| `inspig-docs-shared/db/sql/ins/backup/02_SP_INS_WEEK_CONFIG.sql` | SP_INS_WEEK_CONFIG | 설정 처리 (→ ConfigProcessor) |
+| `inspig-docs-shared/db/sql/ins/backup/11_SP_INS_WEEK_MODON_POPUP.sql` | SP_INS_WEEK_MODON_POPUP | 모돈현황 (→ SowStatusProcessor) |
+| `inspig-docs-shared/db/sql/ins/backup/12_SP_INS_WEEK_ALERT_POPUP.sql` | SP_INS_WEEK_ALERT_POPUP | 관리대상 (→ AlertProcessor) |
+| `inspig-docs-shared/db/sql/ins/backup/21_SP_INS_WEEK_GB_POPUP.sql` | SP_INS_WEEK_GB_POPUP | 교배 (→ MatingProcessor) |
+| `inspig-docs-shared/db/sql/ins/backup/22_SP_INS_WEEK_BM_POPUP.sql` | SP_INS_WEEK_BM_POPUP | 분만 (→ FarrowingProcessor) |
+| `inspig-docs-shared/db/sql/ins/backup/23_SP_INS_WEEK_EU_POPUP.sql` | SP_INS_WEEK_EU_POPUP | 이유 (→ WeaningProcessor) |
+| `inspig-docs-shared/db/sql/ins/backup/31_SP_INS_WEEK_SG_POPUP.sql` | SP_INS_WEEK_SG_POPUP | 사고 (→ AccidentProcessor) |
+| `inspig-docs-shared/db/sql/ins/backup/32_SP_INS_WEEK_DOPE_POPUP.sql` | SP_INS_WEEK_DOPE_POPUP | 도폐 (→ CullingProcessor) |
+| `inspig-docs-shared/db/sql/ins/backup/41_SP_INS_WEEK_SHIP_POPUP.sql` | SP_INS_WEEK_SHIP_POPUP | 출하 (→ ShipmentProcessor) |
+| `inspig-docs-shared/db/sql/ins/backup/51_SP_INS_WEEK_SCHEDULE_POPUP.sql` | SP_INS_WEEK_SCHEDULE_POPUP | 예정 (→ ScheduleProcessor) |
+| `inspig-docs-shared/db/sql/ins/backup/99_JOB_INS_WEEKLY.sql` | JOB_INS_WEEKLY | Oracle JOB (→ run_weekly.sh) |
+| `inspig-docs-shared/db/sql/ins/backup/11_SP_INS_COM_LOG.sql` | SP_INS_COM_LOG_* | 로그 프로시저 |
+
+> **Note**: 현재 운영은 Python ETL(`run_etl.py weekly`)로 수행됩니다. 위 SQL은 참조용 백업입니다.
+
+---
+
 ## 성능 최적화 인덱스 (운영 DB)
 
 ```sql

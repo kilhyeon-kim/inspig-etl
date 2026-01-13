@@ -104,6 +104,7 @@ class WeeklyReportOrchestrator:
         init_week: bool = False,  # 해당 주차만 삭제 여부 (--test --init-week)
         farm_list: Optional[str] = None,  # 처리할 농장 목록 (콤마 구분)
         exclude_farms: Optional[str] = None,  # 제외할 농장 목록 (콤마 구분)
+        schedule_group: Optional[str] = None,  # 스케줄 그룹 (AM7, PM2)
     ) -> dict:
         """ETL 파이프라인 실행
 
@@ -119,6 +120,8 @@ class WeeklyReportOrchestrator:
                       지정하면 해당 농장만 삭제/수집/리포트 생성
             exclude_farms: 제외할 농장 목록 (콤마 구분, 예: "848,1234")
                           farm_list가 지정되면 무시됨
+            schedule_group: 스케줄 그룹 필터 (AM7, PM2, None=전체)
+                           TS_INS_SERVICE.SCHEDULE_GROUP_WEEK 기준 필터링
 
         Returns:
             실행 결과 딕셔너리
@@ -206,7 +209,8 @@ class WeeklyReportOrchestrator:
             report_result = self._generate_weekly_report(
                 year, week_no, dt_from, dt_to, test_mode,
                 init_all=init_all, init_week=init_week,
-                farm_list=farm_list, exclude_farms=exclude_farms
+                farm_list=farm_list, exclude_farms=exclude_farms,
+                schedule_group=schedule_group
             )
             result['steps']['weekly_report'] = report_result
 
@@ -375,14 +379,12 @@ class WeeklyReportOrchestrator:
         test_mode: bool,
         init_all: bool = False,
         init_week: bool = False,
-        use_python: bool = True,
         use_async: bool = True,  # 병렬 처리 활성화 (연결 풀 사용으로 thread-safe 보장)
         farm_list: Optional[str] = None,
         exclude_farms: Optional[str] = None,
+        schedule_group: Optional[str] = None,  # 스케줄 그룹 (AM7, PM2)
     ) -> dict:
         """주간 리포트 생성
-
-        Python 프로세서 또는 Oracle 프로시저 사용
 
         Args:
             year: 연도
@@ -392,47 +394,18 @@ class WeeklyReportOrchestrator:
             test_mode: 테스트 모드
             init_all: 전체 데이터 삭제 (--test --init-all)
             init_week: 해당 주차 데이터만 삭제 (--test --init-week)
-            use_python: Python 프로세서 사용 여부 (False면 Oracle 프로시저 호출)
             use_async: 비동기 병렬 처리 사용 여부
             farm_list: 처리할 농장 목록 (콤마 구분, None이면 전체)
             exclude_farms: 제외할 농장 목록 (콤마 구분, 예: "848,1234")
+            schedule_group: 스케줄 그룹 필터 (AM7, PM2, None=전체)
 
         Returns:
             처리 결과 딕셔너리
         """
-        if use_python:
-            if use_async:
-                return self._generate_weekly_report_async(year, week_no, dt_from, dt_to, test_mode, init_all, init_week, farm_list, exclude_farms)
-            else:
-                return self._generate_weekly_report_python(year, week_no, dt_from, dt_to, test_mode, init_all, init_week, farm_list, exclude_farms)
+        if use_async:
+            return self._generate_weekly_report_async(year, week_no, dt_from, dt_to, test_mode, init_all, init_week, farm_list, exclude_farms, schedule_group)
         else:
-            return self._generate_weekly_report_procedure(test_mode)
-
-    def _generate_weekly_report_procedure(self, test_mode: bool) -> dict:
-        """Oracle 프로시저를 사용한 주간 리포트 생성 (레거시)"""
-        test_yn = 'Y' if test_mode else 'N'
-        parallel = self.config.processing.get('parallel', 4)
-
-        self.logger.info(f"SP_INS_WEEK_MAIN 호출: WEEK, parallel={parallel}, test={test_yn}")
-
-        try:
-            self.db.call_procedure(
-                'SP_INS_WEEK_MAIN',
-                ['WEEK', None, parallel, test_yn]
-            )
-
-            return {
-                'status': 'complete',
-                'method': 'procedure',
-                'proc_name': 'SP_INS_WEEK_MAIN',
-            }
-
-        except Exception as e:
-            self.logger.error(f"주간 리포트 생성 실패: {e}")
-            return {
-                'status': 'error',
-                'error': str(e),
-            }
+            return self._generate_weekly_report_python(year, week_no, dt_from, dt_to, test_mode, init_all, init_week, farm_list, exclude_farms, schedule_group)
 
     def _generate_weekly_report_python(
         self,
@@ -445,10 +418,9 @@ class WeeklyReportOrchestrator:
         init_week: bool = False,
         farm_list: Optional[str] = None,
         exclude_farms: Optional[str] = None,
+        schedule_group: Optional[str] = None,
     ) -> dict:
-        """Python 프로세서를 사용한 주간 리포트 생성
-
-        SP_INS_WEEK_MAIN 프로시저의 Python 버전
+        """주간 리포트 생성 (동기 처리)
 
         Args:
             exclude_farms: 제외할 농장 목록 (콤마 구분, 예: "848,1234")
@@ -480,9 +452,9 @@ class WeeklyReportOrchestrator:
                 self.logger.info(f"마스터 SEQ: {master_seq}")
 
                 # 4. 대상 농장 조회
-                farms = self._get_target_farms(cursor, farm_list, test_mode, exclude_farms)
+                farms = self._get_target_farms(cursor, farm_list, test_mode, exclude_farms, schedule_group)
                 target_cnt = len(farms)
-                self.logger.info(f"대상 농장: {target_cnt}개")
+                self.logger.info(f"대상 농장: {target_cnt}개" + (f" (스케줄 그룹: {schedule_group})" if schedule_group else ""))
 
                 if target_cnt == 0:
                     self.logger.warning("대상 농장이 없습니다.")
@@ -542,6 +514,7 @@ class WeeklyReportOrchestrator:
         init_week: bool = False,
         farm_list: Optional[str] = None,
         exclude_farms: Optional[str] = None,
+        schedule_group: Optional[str] = None,
     ) -> dict:
         """비동기 병렬 처리를 사용한 주간 리포트 생성
 
@@ -600,9 +573,9 @@ class WeeklyReportOrchestrator:
                     self.logger.info(f"마스터 SEQ: {master_seq}")
 
                     # 4. 대상 농장 조회
-                    farms = self._get_target_farms(cursor, farm_list, test_mode, exclude_farms)
+                    farms = self._get_target_farms(cursor, farm_list, test_mode, exclude_farms, schedule_group)
                     target_cnt = len(farms)
-                    self.logger.info(f"대상 농장: {target_cnt}개")
+                    self.logger.info(f"대상 농장: {target_cnt}개" + (f" (스케줄 그룹: {schedule_group})" if schedule_group else ""))
 
                     if target_cnt == 0:
                         self.logger.warning("대상 농장이 없습니다.")
@@ -1022,6 +995,7 @@ class WeeklyReportOrchestrator:
         farm_list: Optional[str],
         test_mode: bool,
         exclude_farms: Optional[str] = None,
+        schedule_group: Optional[str] = None,
     ) -> List[dict]:
         """대상 농장 조회
 
@@ -1033,6 +1007,7 @@ class WeeklyReportOrchestrator:
             farm_list: 처리할 농장 목록 (콤마 구분, None이면 전체)
             test_mode: 테스트 모드 여부
             exclude_farms: 제외할 농장 목록 (콤마 구분, 예: "848,1234")
+            schedule_group: 스케줄 그룹 필터 (AM7, PM2, None=전체)
         """
         sql = SERVICE_FARM_SQL
         params = {}
@@ -1050,6 +1025,11 @@ class WeeklyReportOrchestrator:
             exclude_placeholders = ', '.join([f':ex{i}' for i in range(len(exclude_nos))])
             sql = sql.replace('ORDER BY F.FARM_NO', f'AND F.FARM_NO NOT IN ({exclude_placeholders})\n    ORDER BY F.FARM_NO')
             params.update({f'ex{i}': f for i, f in enumerate(exclude_nos)})
+
+        # 스케줄 그룹 필터링 (AM7, PM2)
+        if schedule_group:
+            sql = sql.replace('ORDER BY F.FARM_NO', f"AND NVL(S.SCHEDULE_GROUP_WEEK, 'AM7') = :schedule_group\n    ORDER BY F.FARM_NO")
+            params['schedule_group'] = schedule_group
 
         if params:
             cursor.execute(sql, params)
@@ -1069,14 +1049,19 @@ class WeeklyReportOrchestrator:
         dt_from: str,
         dt_to: str,
     ) -> None:
-        """TS_INS_WEEK 초기 레코드 생성"""
+        """TS_INS_WEEK 초기 레코드 생성
+
+        SCHEDULE_GROUP: ETL 시점의 스케줄 그룹 스냅샷 저장
+        - pig3.1 카카오 발송 시 TS_INS_WEEK.SCHEDULE_GROUP 기준으로 필터링
+        - ETL 시점과 발송 시점 사이에 설정 변경되어도 정확한 발송 보장
+        """
         sql = """
         INSERT INTO TS_INS_WEEK (
             MASTER_SEQ, FARM_NO, REPORT_YEAR, REPORT_WEEK_NO,
-            DT_FROM, DT_TO, FARM_NM, OWNER_NM, SIGUNGU_CD, STATUS_CD
+            DT_FROM, DT_TO, FARM_NM, OWNER_NM, SIGUNGU_CD, STATUS_CD, SCHEDULE_GROUP
         ) VALUES (
             :master_seq, :farm_no, :year, :week_no,
-            :dt_from, :dt_to, :farm_nm, :owner_nm, :sigun_cd, 'READY'
+            :dt_from, :dt_to, :farm_nm, :owner_nm, :sigun_cd, 'READY', :schedule_group
         )
         """
 
@@ -1091,6 +1076,7 @@ class WeeklyReportOrchestrator:
                 'farm_nm': farm.get('FARM_NM', ''),
                 'owner_nm': farm.get('PRINCIPAL_NM', ''),
                 'sigun_cd': farm.get('SIGUN_CD', ''),
+                'schedule_group': farm.get('SCHEDULE_GROUP_WEEK', 'AM7'),
             })
 
         # 마스터 대상 농장수 업데이트
@@ -1168,8 +1154,7 @@ class WeeklyReportOrchestrator:
     ) -> dict:
         """테스트용 배치 실행
 
-        지정된 날짜들에 대해 Python 프로세서로 주간 리포트 생성
-        (Oracle SP_INS_WEEK_MAIN 대신 Python 프로세서 사용)
+        지정된 날짜들에 대해 주간 리포트 생성
 
         Args:
             farm_list: 테스트 농장 목록 (콤마 구분)
@@ -1225,7 +1210,6 @@ class WeeklyReportOrchestrator:
                     dt_to=dt_to,
                     test_mode=True,
                     init_delete=init_delete,
-                    use_python=True,
                     use_async=True,
                     farm_list=farm_list,
                     exclude_farms=exclude_farms,
@@ -1315,11 +1299,14 @@ class WeeklyReportOrchestrator:
             with self.db.get_connection() as conn:
                 cursor = conn.cursor()
                 try:
-                    # 1. 농장 정보 조회
+                    # 1. 농장 정보 조회 (SCHEDULE_GROUP_WEEK 포함)
                     cursor.execute("""
-                        SELECT FARM_NO, FARM_NM, PRINCIPAL_NM, SIGUN_CD,
-                               NVL(COUNTRY_CODE, 'KOR') AS LOCALE
-                        FROM TA_FARM WHERE FARM_NO = :farm_no AND USE_YN = 'Y'
+                        SELECT F.FARM_NO, F.FARM_NM, F.PRINCIPAL_NM, F.SIGUN_CD,
+                               NVL(F.COUNTRY_CODE, 'KOR') AS LOCALE,
+                               NVL(S.SCHEDULE_GROUP_WEEK, 'AM7') AS SCHEDULE_GROUP_WEEK
+                        FROM TA_FARM F
+                        LEFT JOIN VW_INS_SERVICE_ACTIVE S ON F.FARM_NO = S.FARM_NO
+                        WHERE F.FARM_NO = :farm_no AND F.USE_YN = 'Y'
                     """, {'farm_no': farm_no})
                     farm_row = cursor.fetchone()
 
@@ -1335,6 +1322,7 @@ class WeeklyReportOrchestrator:
                         'PRINCIPAL_NM': farm_row[2],
                         'SIGUN_CD': farm_row[3],
                         'LOCALE': farm_row[4],
+                        'SCHEDULE_GROUP_WEEK': farm_row[5],
                     }
 
                     self.logger.info(f"농장 정보: {farm_info['FARM_NM']} ({farm_no})")
@@ -1502,7 +1490,6 @@ class WeeklyReportOrchestrator:
                 dt_to=dt_to,
                 test_mode=False,
                 init_delete=False,  # 전체 삭제 안함
-                use_python=True,
                 use_async=True,
                 farm_list=None,  # 전체 농장
                 exclude_farms=exclude_farms,  # 제외 농장

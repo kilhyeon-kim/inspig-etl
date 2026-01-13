@@ -1,8 +1,23 @@
 """
 기상청 데이터 수집기
-- 기상청 단기예보 API를 통한 날씨 데이터 수집
+- 기상청 단기예보 API를 통한 날씨 데이터 수집 (예보)
+- 초단기실황 API를 통한 실시간 관측 데이터 수집 (시간별 실측)
+- ASOS 일자료 API를 통한 일별 실측 데이터 수집
 - 격자(NX, NY) 기반 날씨 정보 조회 및 TM_WEATHER, TM_WEATHER_HOURLY 저장
 - TS_API_KEY_INFO 테이블에서 API 키 관리 (호출 횟수 기반 로드밸런싱)
+
+수집 전략:
+  [1] TM_WEATHER (일별)
+      - 단기예보(getVilageFcst): 오늘 ~ +3일 예보 (IS_FORECAST='Y')
+      - ASOS 일자료: 어제까지 실측으로 덮어쓰기 (IS_FORECAST='N')
+
+  [2] TM_WEATHER_HOURLY (시간별)
+      - 초단기실황(getUltraSrtNcst): 현재 시각 실측 (IS_FORECAST='N')
+      - 단기예보(getVilageFcst): 오늘 ~ +3일 예보 (IS_FORECAST='Y')
+
+ASOS 관측소:
+  - TM_WEATHER_ASOS 테이블에서 관측소 정보 조회
+  - TA_FARM.ASOS_STN_ID 캐싱으로 중복 Haversine 계산 방지
 """
 import logging
 import math
@@ -14,6 +29,146 @@ from .base import BaseCollector
 from ..common import Config, Database, now_kst, ApiKeyManager
 
 logger = logging.getLogger(__name__)
+
+# ASOS 관측소 캐시 (DB에서 로드)
+_asos_stations_cache: List[Tuple[int, str, float, float]] = []
+
+
+def _haversine_distance(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Haversine 공식으로 두 좌표 간 거리 계산 (km)"""
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = math.sin(dlat/2)**2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon/2)**2
+    c = 2 * math.asin(math.sqrt(a))
+    return 6371 * c  # 지구 반경 km
+
+
+def load_asos_stations(db: Database) -> List[Tuple[int, str, float, float]]:
+    """TM_WEATHER_ASOS 테이블에서 ASOS 관측소 정보 로드
+
+    Args:
+        db: Database 인스턴스
+
+    Returns:
+        [(STN_ID, STN_NM, LAT, LON), ...] 리스트
+    """
+    global _asos_stations_cache
+
+    if _asos_stations_cache:
+        return _asos_stations_cache
+
+    sql = """
+        SELECT STN_ID, STN_NM, LAT, LON
+        FROM TM_WEATHER_ASOS
+        WHERE USE_YN = 'Y'
+        ORDER BY STN_ID
+    """
+    rows = db.fetch_dict(sql)
+
+    _asos_stations_cache = [
+        (int(row['STN_ID']), row['STN_NM'], float(row['LAT']), float(row['LON']))
+        for row in rows
+    ]
+
+    logger.info(f"ASOS 관측소 로드: {len(_asos_stations_cache)}개")
+    return _asos_stations_cache
+
+
+def find_nearest_asos_station(lat: float, lon: float,
+                              stations: Optional[List[Tuple[int, str, float, float]]] = None) -> Tuple[int, str, float]:
+    """위경도에서 가장 가까운 ASOS 관측소 찾기
+
+    Args:
+        lat: 위도
+        lon: 경도
+        stations: ASOS 관측소 리스트 (None이면 캐시 사용)
+
+    Returns:
+        (관측소번호, 관측소명, 거리km) 튜플
+    """
+    if stations is None:
+        stations = _asos_stations_cache
+
+    if not stations:
+        raise ValueError("ASOS 관측소 목록이 비어있습니다. load_asos_stations()를 먼저 호출하세요.")
+
+    min_dist = float('inf')
+    nearest = (stations[0][0], stations[0][1], 0.0)
+
+    for stn_id, stn_name, stn_lat, stn_lon in stations:
+        dist = _haversine_distance(lat, lon, stn_lat, stn_lon)
+
+        if dist < min_dist:
+            min_dist = dist
+            nearest = (stn_id, stn_name, dist)
+
+    return nearest
+
+
+def update_farm_asos_mapping(db: Database) -> int:
+    """TA_FARM의 ASOS_STN_ID 업데이트 (캐싱)
+
+    ASOS_STN_ID가 없는 농장에 대해 가장 가까운 ASOS 관측소 매핑
+
+    Args:
+        db: Database 인스턴스
+
+    Returns:
+        업데이트된 농장 수
+    """
+    # ASOS 관측소 로드
+    stations = load_asos_stations(db)
+    if not stations:
+        logger.warning("ASOS 관측소 정보가 없습니다.")
+        return 0
+
+    # ASOS_STN_ID가 없는 농장 조회
+    sql = """
+        SELECT FARM_NO, MAP_X_N AS LON, MAP_Y_N AS LAT
+        FROM TA_FARM
+        WHERE USE_YN = 'Y'
+          AND MAP_X_N IS NOT NULL
+          AND MAP_Y_N IS NOT NULL
+          AND ASOS_STN_ID IS NULL
+    """
+    rows = db.fetch_dict(sql)
+
+    if not rows:
+        logger.info("ASOS 매핑이 필요한 농장 없음")
+        return 0
+
+    update_sql = """
+        UPDATE TA_FARM
+        SET ASOS_STN_ID = :ASOS_STN_ID,
+            ASOS_STN_NM = :ASOS_STN_NM,
+            ASOS_DIST_KM = :ASOS_DIST_KM,
+            LOG_UPT_DT = SYSDATE
+        WHERE FARM_NO = :FARM_NO
+    """
+
+    updates = []
+    for row in rows:
+        try:
+            lat = float(row['LAT'])
+            lon = float(row['LON'])
+            stn_id, stn_nm, dist = find_nearest_asos_station(lat, lon, stations)
+
+            updates.append({
+                'FARM_NO': row['FARM_NO'],
+                'ASOS_STN_ID': stn_id,
+                'ASOS_STN_NM': stn_nm,
+                'ASOS_DIST_KM': round(dist, 2),
+            })
+            logger.debug(f"농장 {row['FARM_NO']}: ASOS {stn_id} ({stn_nm}), {dist:.1f}km")
+        except (ValueError, TypeError) as e:
+            logger.warning(f"농장 {row['FARM_NO']} ASOS 매핑 실패: {e}")
+
+    if updates:
+        db.execute_many(update_sql, updates)
+        db.commit()
+        logger.info(f"TA_FARM ASOS 매핑 업데이트: {len(updates)}건")
+
+    return len(updates)
 
 
 def latlon_to_grid(lat: float, lon: float) -> Tuple[int, int]:
@@ -125,9 +280,238 @@ class WeatherCollector(BaseCollector):
         super().__init__(config, db)
         self.weather_config = self.config.weather
         self.base_url = self.weather_config.get('base_url', 'https://apis.data.go.kr/1360000/VilageFcstInfoService_2.0')
+        self.asos_hourly_url = 'https://apis.data.go.kr/1360000/AsosHourlyInfoService/getWthrDataList'
+        self.asos_daily_url = 'https://apis.data.go.kr/1360000/AsosDalyInfoService/getWthrDataList'
 
         # API 키 관리자
         self.key_manager = ApiKeyManager(self.db)
+
+    def _get_ncst_base_datetime(self) -> Tuple[str, str]:
+        """초단기실황 API 호출용 기준 날짜/시간 계산
+
+        초단기실황: 매시 정각 발표, 40분 후 API 제공
+        예: 12:00 발표 -> 12:40 이후 조회 가능
+
+        Returns:
+            (base_date, base_time) 튜플
+        """
+        now = now_kst()
+        # 40분 이전 데이터 조회
+        adjusted = now - timedelta(minutes=40)
+        base_date = adjusted.strftime('%Y%m%d')
+        base_time = f"{adjusted.hour:02d}00"
+        return base_date, base_time
+
+    def _fetch_ultra_srt_ncst(self, nx: int, ny: int, base_date: str, base_time: str) -> List[Dict]:
+        """초단기실황 API 호출 (격자 기반 실측 데이터)
+
+        Args:
+            nx: 격자 X 좌표
+            ny: 격자 Y 좌표
+            base_date: 기준 날짜 (YYYYMMDD)
+            base_time: 기준 시간 (HHMM)
+
+        Returns:
+            실황 데이터 리스트
+        """
+        url = f"{self.base_url}/getUltraSrtNcst"
+
+        while self.key_manager.has_available_key():
+            api_key = self.key_manager.get_current_key()
+            if not api_key:
+                break
+
+            params = {
+                'serviceKey': api_key,
+                'pageNo': 1,
+                'numOfRows': 100,
+                'dataType': 'JSON',
+                'base_date': base_date,
+                'base_time': base_time,
+                'nx': nx,
+                'ny': ny,
+            }
+
+            try:
+                self.logger.debug(f"초단기실황 API 호출: NX={nx}, NY={ny}, base={base_date} {base_time}")
+                response = requests.get(url, params=params, timeout=30)
+
+                # HTTP 에러 (401, 403, 429 등) - 다음 키로 재시도
+                if response.status_code in (401, 403, 429):
+                    self.logger.warning(f"초단기실황 API 키 인증/제한 오류 ({response.status_code}), 다음 키로 재시도")
+                    self.key_manager.mark_key_exhausted(api_key)
+                    continue
+
+                response.raise_for_status()
+
+                data = response.json()
+                result_code = data.get('response', {}).get('header', {}).get('resultCode')
+                result_msg = data.get('response', {}).get('header', {}).get('resultMsg', '')
+
+                if result_code == '00':
+                    self.key_manager.increment_count(api_key)
+                    items = data.get('response', {}).get('body', {}).get('items', {}).get('item', [])
+                    return items
+
+                elif result_code in ApiKeyManager.LIMIT_ERROR_CODES:
+                    self.logger.warning(f"초단기실황 API 호출 제한: {result_code} - {result_msg}")
+                    self.key_manager.mark_key_exhausted(api_key)
+                    continue
+
+                else:
+                    self.logger.error(f"초단기실황 API 오류: {result_code} - {result_msg}")
+                    return []
+
+            except requests.RequestException as e:
+                self.logger.error(f"초단기실황 API 호출 실패: {e}")
+                return []
+            except (KeyError, ValueError) as e:
+                self.logger.error(f"초단기실황 API 응답 파싱 실패: {e}")
+                return []
+
+        self.logger.error("모든 API 키가 소진되었습니다. (초단기실황)")
+        return []
+
+    def _fetch_asos_hourly(self, stn_id: int, start_dt: str, start_hh: str,
+                           end_dt: str, end_hh: str) -> List[Dict]:
+        """ASOS 시간자료 API 호출 (관측소 기반 실측 데이터)
+
+        Args:
+            stn_id: ASOS 관측소 지점번호
+            start_dt: 조회 시작일 (YYYYMMDD)
+            start_hh: 조회 시작시 (HH)
+            end_dt: 조회 종료일 (YYYYMMDD)
+            end_hh: 조회 종료시 (HH)
+
+        Returns:
+            시간별 관측 데이터 리스트
+        """
+        while self.key_manager.has_available_key():
+            api_key = self.key_manager.get_current_key()
+            if not api_key:
+                break
+
+            params = {
+                'serviceKey': api_key,
+                'pageNo': 1,
+                'numOfRows': 100,
+                'dataType': 'JSON',
+                'dataCd': 'ASOS',
+                'dateCd': 'HR',
+                'startDt': start_dt,
+                'startHh': start_hh,
+                'endDt': end_dt,
+                'endHh': end_hh,
+                'stnIds': stn_id,
+            }
+
+            try:
+                self.logger.debug(f"ASOS 시간자료 API 호출: stnId={stn_id}, {start_dt} {start_hh}시 ~ {end_dt} {end_hh}시")
+                response = requests.get(self.asos_hourly_url, params=params, timeout=30)
+
+                # HTTP 에러 (401, 403, 429 등) - 다음 키로 재시도
+                if response.status_code in (401, 403, 429):
+                    self.logger.warning(f"ASOS 시간자료 API 키 인증/제한 오류 ({response.status_code}), 다음 키로 재시도")
+                    self.key_manager.mark_key_exhausted(api_key)
+                    continue
+
+                response.raise_for_status()
+
+                data = response.json()
+                result_code = data.get('response', {}).get('header', {}).get('resultCode')
+                result_msg = data.get('response', {}).get('header', {}).get('resultMsg', '')
+
+                if result_code == '00':
+                    self.key_manager.increment_count(api_key)
+                    items = data.get('response', {}).get('body', {}).get('items', {}).get('item', [])
+                    return items if isinstance(items, list) else [items] if items else []
+
+                elif result_code in ApiKeyManager.LIMIT_ERROR_CODES:
+                    self.logger.warning(f"ASOS 시간자료 API 호출 제한: {result_code} - {result_msg}")
+                    self.key_manager.mark_key_exhausted(api_key)
+                    continue
+
+                else:
+                    self.logger.error(f"ASOS 시간자료 API 오류: {result_code} - {result_msg}")
+                    return []
+
+            except requests.RequestException as e:
+                self.logger.error(f"ASOS 시간자료 API 호출 실패: {e}")
+                return []
+            except (KeyError, ValueError) as e:
+                self.logger.error(f"ASOS 시간자료 API 응답 파싱 실패: {e}")
+                return []
+
+        self.logger.error("모든 API 키가 소진되었습니다. (ASOS 시간자료)")
+        return []
+
+    def _fetch_asos_daily(self, stn_id: int, start_dt: str, end_dt: str) -> List[Dict]:
+        """ASOS 일자료 API 호출 (관측소 기반 일별 실측 데이터)
+
+        Args:
+            stn_id: ASOS 관측소 지점번호
+            start_dt: 조회 시작일 (YYYYMMDD)
+            end_dt: 조회 종료일 (YYYYMMDD)
+
+        Returns:
+            일별 관측 데이터 리스트
+        """
+        while self.key_manager.has_available_key():
+            api_key = self.key_manager.get_current_key()
+            if not api_key:
+                break
+
+            params = {
+                'serviceKey': api_key,
+                'pageNo': 1,
+                'numOfRows': 100,
+                'dataType': 'JSON',
+                'dataCd': 'ASOS',
+                'dateCd': 'DAY',
+                'startDt': start_dt,
+                'endDt': end_dt,
+                'stnIds': stn_id,
+            }
+
+            try:
+                self.logger.debug(f"ASOS 일자료 API 호출: stnId={stn_id}, {start_dt} ~ {end_dt}")
+                response = requests.get(self.asos_daily_url, params=params, timeout=30)
+
+                # HTTP 에러 (401, 403, 429 등) - 다음 키로 재시도
+                if response.status_code in (401, 403, 429):
+                    self.logger.warning(f"ASOS 일자료 API 키 인증/제한 오류 ({response.status_code}), 다음 키로 재시도")
+                    self.key_manager.mark_key_exhausted(api_key)
+                    continue
+
+                response.raise_for_status()
+
+                data = response.json()
+                result_code = data.get('response', {}).get('header', {}).get('resultCode')
+                result_msg = data.get('response', {}).get('header', {}).get('resultMsg', '')
+
+                if result_code == '00':
+                    self.key_manager.increment_count(api_key)
+                    items = data.get('response', {}).get('body', {}).get('items', {}).get('item', [])
+                    return items if isinstance(items, list) else [items] if items else []
+
+                elif result_code in ApiKeyManager.LIMIT_ERROR_CODES:
+                    self.logger.warning(f"ASOS 일자료 API 호출 제한: {result_code} - {result_msg}")
+                    self.key_manager.mark_key_exhausted(api_key)
+                    continue
+
+                else:
+                    self.logger.error(f"ASOS 일자료 API 오류: {result_code} - {result_msg}")
+                    return []
+
+            except requests.RequestException as e:
+                self.logger.error(f"ASOS 일자료 API 호출 실패: {e}")
+                return []
+            except (KeyError, ValueError) as e:
+                self.logger.error(f"ASOS 일자료 API 응답 파싱 실패: {e}")
+                return []
+
+        self.logger.error("모든 API 키가 소진되었습니다. (ASOS 일자료)")
+        return []
 
     def _get_base_datetime(self) -> Tuple[str, str]:
         """API 호출용 기준 날짜/시간 계산
@@ -194,6 +578,13 @@ class WeatherCollector(BaseCollector):
             try:
                 self.logger.debug(f"API 호출: NX={nx}, NY={ny}, base={base_date} {base_time}")
                 response = requests.get(url, params=params, timeout=30)
+
+                # HTTP 에러 (401, 403, 429 등) - 다음 키로 재시도
+                if response.status_code in (401, 403, 429):
+                    self.logger.warning(f"API 키 인증/제한 오류 ({response.status_code}), 다음 키로 재시도")
+                    self.key_manager.mark_key_exhausted(api_key)
+                    continue
+
                 response.raise_for_status()
 
                 data = response.json()
@@ -226,7 +617,7 @@ class WeatherCollector(BaseCollector):
                 self.logger.error(f"기상청 API 응답 파싱 실패: {e}")
                 return []
 
-        self.logger.error("모든 API 키가 limit 상태입니다.")
+        self.logger.error("모든 API 키가 소진되었습니다. (401/403/429 또는 호출제한)")
         return []
 
     def _parse_forecast_items(self, items: List[Dict], nx: int, ny: int) -> Tuple[Dict, List[Dict]]:
@@ -416,59 +807,349 @@ class WeatherCollector(BaseCollector):
 
         return hourly_data
 
+    def _parse_ncst_items(self, items: List[Dict], nx: int, ny: int,
+                          base_date: str, base_time: str) -> Dict:
+        """초단기실황 데이터 파싱 (시간별 실측)
+
+        Args:
+            items: API 응답 아이템 목록
+            nx: 격자 X
+            ny: 격자 Y
+            base_date: 기준 날짜
+            base_time: 기준 시간
+
+        Returns:
+            시간별 실측 레코드 (단일)
+        """
+        record = {
+            'WK_DATE': base_date,
+            'WK_TIME': base_time,
+            'NX': nx,
+            'NY': ny,
+            'TEMP': None,
+            'RAIN_PROB': None,  # 실황에는 강수확률 없음
+            'RAIN_AMT': 0,
+            'HUMIDITY': None,
+            'WIND_SPEED': None,
+            'WIND_DIR': None,
+            'SKY_CD': None,
+            'PTY_CD': None,
+            'WEATHER_CD': 'unknown',
+            'WEATHER_NM': '알수없음',
+            'IS_FORECAST': 'N',  # 실측
+        }
+
+        for item in items:
+            category = item.get('category')
+            value = item.get('obsrValue')
+
+            if category == 'T1H':  # 기온
+                try:
+                    record['TEMP'] = float(value)
+                except (ValueError, TypeError):
+                    pass
+            elif category == 'RN1':  # 1시간 강수량
+                try:
+                    if value not in ('강수없음', ''):
+                        record['RAIN_AMT'] = float(str(value).replace('mm', '').strip())
+                except (ValueError, TypeError):
+                    pass
+            elif category == 'REH':  # 습도
+                try:
+                    record['HUMIDITY'] = int(value)
+                except (ValueError, TypeError):
+                    pass
+            elif category == 'WSD':  # 풍속
+                try:
+                    record['WIND_SPEED'] = float(value)
+                except (ValueError, TypeError):
+                    pass
+            elif category == 'VEC':  # 풍향
+                try:
+                    record['WIND_DIR'] = int(value)
+                except (ValueError, TypeError):
+                    pass
+            elif category == 'SKY':  # 하늘상태
+                record['SKY_CD'] = str(value)
+            elif category == 'PTY':  # 강수형태
+                record['PTY_CD'] = str(value)
+
+        # 날씨 코드 결정
+        pty_cd = record.get('PTY_CD', '0')
+        sky_cd = record.get('SKY_CD', '1')
+        if pty_cd and pty_cd != '0':
+            record['WEATHER_CD'], record['WEATHER_NM'] = self.PTY_CODES.get(pty_cd, ('unknown', '알수없음'))
+        else:
+            record['WEATHER_CD'], record['WEATHER_NM'] = self.SKY_CODES.get(sky_cd, ('unknown', '알수없음'))
+
+        return record
+
+    def _parse_asos_daily_items(self, items: List[Dict], nx: int, ny: int) -> List[Dict]:
+        """ASOS 일자료 파싱 (일별 실측)
+
+        Args:
+            items: ASOS API 응답 아이템 목록
+            nx: 격자 X (저장용)
+            ny: 격자 Y (저장용)
+
+        Returns:
+            일별 실측 레코드 리스트
+        """
+        result = []
+
+        for item in items:
+            tm = item.get('tm', '')  # YYYY-MM-DD 형식
+            wk_date = tm.replace('-', '') if tm else ''
+
+            if not wk_date:
+                continue
+
+            # 날씨 코드 결정 (하늘상태/강수 정보 없으므로 기본값)
+            weather_cd = 'sunny'
+            weather_nm = '맑음'
+
+            # 강수량이 있으면 비로 표시
+            sum_rn = item.get('sumRn')
+            if sum_rn and float(sum_rn) > 0:
+                weather_cd = 'rainy'
+                weather_nm = '비'
+
+            record = {
+                'WK_DATE': wk_date,
+                'NX': nx,
+                'NY': ny,
+                'TEMP_AVG': None,
+                'TEMP_HIGH': None,
+                'TEMP_LOW': None,
+                'RAIN_PROB': None,
+                'RAIN_AMT': None,
+                'HUMIDITY': None,
+                'WIND_SPEED': None,
+                'WEATHER_CD': weather_cd,
+                'WEATHER_NM': weather_nm,
+                'SKY_CD': '1',
+                'IS_FORECAST': 'N',  # 실측
+            }
+
+            # 기온
+            try:
+                if item.get('avgTa'):
+                    record['TEMP_AVG'] = round(float(item['avgTa']), 1)
+            except (ValueError, TypeError):
+                pass
+            try:
+                if item.get('maxTa'):
+                    record['TEMP_HIGH'] = round(float(item['maxTa']), 1)
+            except (ValueError, TypeError):
+                pass
+            try:
+                if item.get('minTa'):
+                    record['TEMP_LOW'] = round(float(item['minTa']), 1)
+            except (ValueError, TypeError):
+                pass
+
+            # 강수량
+            try:
+                if item.get('sumRn'):
+                    record['RAIN_AMT'] = round(float(item['sumRn']), 1)
+            except (ValueError, TypeError):
+                pass
+
+            # 습도
+            try:
+                if item.get('avgRhm'):
+                    record['HUMIDITY'] = int(float(item['avgRhm']))
+            except (ValueError, TypeError):
+                pass
+
+            # 풍속
+            try:
+                if item.get('avgWs'):
+                    record['WIND_SPEED'] = round(float(item['avgWs']), 1)
+            except (ValueError, TypeError):
+                pass
+
+            result.append(record)
+
+        return result
+
+    def _parse_asos_hourly_items(self, items: List[Dict], nx: int, ny: int) -> List[Dict]:
+        """ASOS 시간자료 파싱 (시간별 실측)
+
+        Args:
+            items: ASOS API 응답 아이템 목록
+            nx: 격자 X (저장용)
+            ny: 격자 Y (저장용)
+
+        Returns:
+            시간별 실측 레코드 리스트
+        """
+        result = []
+
+        for item in items:
+            tm = item.get('tm', '')  # YYYY-MM-DD HH:MM 형식
+            if not tm:
+                continue
+
+            parts = tm.split(' ')
+            if len(parts) < 2:
+                continue
+
+            wk_date = parts[0].replace('-', '')
+            wk_time = parts[1].replace(':', '')[:4]  # HHMM
+
+            record = {
+                'WK_DATE': wk_date,
+                'WK_TIME': wk_time,
+                'NX': nx,
+                'NY': ny,
+                'TEMP': None,
+                'RAIN_PROB': None,
+                'RAIN_AMT': 0,
+                'HUMIDITY': None,
+                'WIND_SPEED': None,
+                'WIND_DIR': None,
+                'SKY_CD': None,
+                'PTY_CD': None,
+                'WEATHER_CD': 'sunny',
+                'WEATHER_NM': '맑음',
+                'IS_FORECAST': 'N',  # 실측
+            }
+
+            # 기온
+            try:
+                if item.get('ta'):
+                    record['TEMP'] = float(item['ta'])
+            except (ValueError, TypeError):
+                pass
+
+            # 강수량
+            try:
+                if item.get('rn') and item['rn'] != '':
+                    rn = float(item['rn'])
+                    record['RAIN_AMT'] = rn
+                    if rn > 0:
+                        record['WEATHER_CD'] = 'rainy'
+                        record['WEATHER_NM'] = '비'
+            except (ValueError, TypeError):
+                pass
+
+            # 습도
+            try:
+                if item.get('hm'):
+                    record['HUMIDITY'] = int(float(item['hm']))
+            except (ValueError, TypeError):
+                pass
+
+            # 풍속
+            try:
+                if item.get('ws'):
+                    record['WIND_SPEED'] = float(item['ws'])
+            except (ValueError, TypeError):
+                pass
+
+            # 풍향
+            try:
+                if item.get('wd'):
+                    record['WIND_DIR'] = int(float(item['wd']))
+            except (ValueError, TypeError):
+                pass
+
+            result.append(record)
+
+        return result
+
     def _get_target_grids(self) -> List[Tuple[int, int]]:
         """수집 대상 격자 목록 조회
 
-        TA_FARM의 WEATHER_NX, WEATHER_NY 기준으로 유니크한 격자 목록 반환
+        TA_FARM의 WEATHER_NX_N, WEATHER_NY_N 기준으로 유니크한 격자 목록 반환
         """
         sql = """
-            SELECT DISTINCT WEATHER_NX AS NX, WEATHER_NY AS NY
+            SELECT DISTINCT WEATHER_NX_N AS NX, WEATHER_NY_N AS NY
             FROM TA_FARM
             WHERE USE_YN = 'Y'
-              AND WEATHER_NX IS NOT NULL
-              AND WEATHER_NY IS NOT NULL
+              AND WEATHER_NX_N IS NOT NULL
+              AND WEATHER_NY_N IS NOT NULL
         """
         rows = self.db.fetch_dict(sql)
         return [(row['NX'], row['NY']) for row in rows]
 
     def _get_grids_from_mapxy(self) -> List[Tuple[int, int, float, float]]:
-        """MAP_X, MAP_Y로부터 격자 좌표 계산
+        """MAP_X_N, MAP_Y_N으로부터 격자 좌표 계산
 
-        WEATHER_NX, WEATHER_NY가 없는 경우 MAP_X, MAP_Y로 변환
+        WEATHER_NX_N, WEATHER_NY_N이 없는 경우 MAP_X_N, MAP_Y_N으로 변환
 
         Returns:
             [(nx, ny, map_x, map_y), ...]
         """
         sql = """
-            SELECT DISTINCT MAP_X, MAP_Y
+            SELECT DISTINCT MAP_X_N, MAP_Y_N
             FROM TA_FARM
             WHERE USE_YN = 'Y'
-              AND MAP_X IS NOT NULL
-              AND MAP_Y IS NOT NULL
-              AND WEATHER_NX IS NULL
+              AND MAP_X_N IS NOT NULL
+              AND MAP_Y_N IS NOT NULL
+              AND WEATHER_NX_N IS NULL
         """
         rows = self.db.fetch_dict(sql)
 
         result = []
         for row in rows:
             try:
-                lon = float(row['MAP_X'])  # 경도
-                lat = float(row['MAP_Y'])  # 위도
+                lon = float(row['MAP_X_N'])  # 경도 (읍면동 대표)
+                lat = float(row['MAP_Y_N'])  # 위도 (읍면동 대표)
                 nx, ny = latlon_to_grid(lat, lon)
                 result.append((nx, ny, lon, lat))
             except (ValueError, TypeError) as e:
-                self.logger.warning(f"좌표 변환 실패: MAP_X={row['MAP_X']}, MAP_Y={row['MAP_Y']}: {e}")
+                self.logger.warning(f"좌표 변환 실패: MAP_X_N={row['MAP_X_N']}, MAP_Y_N={row['MAP_Y_N']}: {e}")
 
         return result
 
+    def _get_grids_with_latlon(self) -> List[Tuple[int, int, float, float]]:
+        """격자와 위경도 정보를 함께 조회 (ASOS 관측소 매핑용)
+
+        Returns:
+            [(nx, ny, lat, lon), ...] 형태
+        """
+        sql = """
+            SELECT DISTINCT
+                WEATHER_NX_N AS NX,
+                WEATHER_NY_N AS NY,
+                MAP_Y_N AS LAT,
+                MAP_X_N AS LON
+            FROM TA_FARM
+            WHERE USE_YN = 'Y'
+              AND WEATHER_NX_N IS NOT NULL
+              AND WEATHER_NY_N IS NOT NULL
+              AND MAP_X_N IS NOT NULL
+              AND MAP_Y_N IS NOT NULL
+        """
+        rows = self.db.fetch_dict(sql)
+        result = []
+        for row in rows:
+            try:
+                result.append((
+                    int(row['NX']),
+                    int(row['NY']),
+                    float(row['LAT']),
+                    float(row['LON'])
+                ))
+            except (ValueError, TypeError):
+                pass
+        return result
+
     def collect(self, grids: Optional[List[Tuple[int, int]]] = None, **kwargs) -> Dict[str, List[Dict]]:
-        """날씨 데이터 수집
+        """날씨 데이터 수집 (예보 + 실측)
+
+        수집 전략:
+          [1] 단기예보 (getVilageFcst): 오늘~+3일 예보 (IS_FORECAST='Y')
+          [2] 초단기실황 (getUltraSrtNcst): 현재 시각 실측 (IS_FORECAST='N')
+          [3] ASOS 일자료: 어제까지 실측 (IS_FORECAST='N') - 옵션
 
         Args:
             grids: 격자 목록 [(nx, ny), ...]. None이면 DB에서 조회
 
         Returns:
-            {'daily': [...], 'hourly': [...]} 형태의 수집 결과
+            {'daily': [...], 'hourly': [...], 'ncst': [...]} 형태의 수집 결과
         """
         # API 키 로드
         self.key_manager.load_keys()
@@ -476,7 +1157,7 @@ class WeatherCollector(BaseCollector):
         if grids is None:
             grids = self._get_target_grids()
 
-            # WEATHER_NX/NY가 없는 농장은 MAP_X/Y로 변환
+            # WEATHER_NX_N/NY_N이 없는 농장은 MAP_X_N/Y_N으로 변환
             additional = self._get_grids_from_mapxy()
             for nx, ny, _, _ in additional:
                 if (nx, ny) not in grids:
@@ -484,13 +1165,19 @@ class WeatherCollector(BaseCollector):
 
         if not grids:
             self.logger.warning("수집 대상 격자가 없습니다.")
-            return {'daily': [], 'hourly': []}
+            return {'daily': [], 'hourly': [], 'ncst': []}
 
-        base_date, base_time = self._get_base_datetime()
-        self.logger.info(f"기준 날짜/시간: {base_date} {base_time}, 대상 격자: {len(grids)}개")
+        # 단기예보 기준 날짜/시간
+        fcst_base_date, fcst_base_time = self._get_base_datetime()
+        # 초단기실황 기준 날짜/시간
+        ncst_base_date, ncst_base_time = self._get_ncst_base_datetime()
+
+        self.logger.info(f"예보 기준: {fcst_base_date} {fcst_base_time}, 실황 기준: {ncst_base_date} {ncst_base_time}")
+        self.logger.info(f"대상 격자: {len(grids)}개")
 
         all_daily = []
         all_hourly = []
+        all_ncst = []
 
         # 중복 격자 제거
         unique_grids = list(set(grids))
@@ -502,63 +1189,243 @@ class WeatherCollector(BaseCollector):
                 break
 
             try:
-                items = self._fetch_forecast(nx, ny, base_date, base_time)
+                # [1] 단기예보 수집 (IS_FORECAST='Y')
+                items = self._fetch_forecast(nx, ny, fcst_base_date, fcst_base_time)
 
-                if not items:
-                    self.logger.warning(f"격자 ({nx}, {ny}): 데이터 없음")
-                    continue
+                if items:
+                    daily_data, hourly_data = self._parse_forecast_items(items, nx, ny)
 
-                daily_data, hourly_data = self._parse_forecast_items(items, nx, ny)
+                    daily_records = self._finalize_daily_data(daily_data)
+                    hourly_records = self._finalize_hourly_data(hourly_data)
 
-                daily_records = self._finalize_daily_data(daily_data)
-                hourly_records = self._finalize_hourly_data(hourly_data)
+                    # BASE_DATE, BASE_TIME, IS_FORECAST 추가
+                    for rec in daily_records:
+                        rec['BASE_DATE'] = fcst_base_date
+                        rec['BASE_TIME'] = fcst_base_time
+                        rec['IS_FORECAST'] = 'Y'
+                    for rec in hourly_records:
+                        rec['BASE_DATE'] = fcst_base_date
+                        rec['BASE_TIME'] = fcst_base_time
+                        rec['IS_FORECAST'] = 'Y'
 
-                # BASE_DATE, BASE_TIME 추가
-                for rec in daily_records:
-                    rec['BASE_DATE'] = base_date
-                    rec['BASE_TIME'] = base_time
-                for rec in hourly_records:
-                    rec['BASE_DATE'] = base_date
-                    rec['BASE_TIME'] = base_time
+                    all_daily.extend(daily_records)
+                    all_hourly.extend(hourly_records)
 
-                all_daily.extend(daily_records)
-                all_hourly.extend(hourly_records)
+                    self.logger.debug(f"격자 ({nx}, {ny}) 예보: 일별 {len(daily_records)}건, 시간별 {len(hourly_records)}건")
+                else:
+                    self.logger.warning(f"격자 ({nx}, {ny}): 예보 데이터 없음")
 
-                self.logger.info(f"격자 ({nx}, {ny}): 일별 {len(daily_records)}건, 시간별 {len(hourly_records)}건")
+                # [2] 초단기실황 수집 (IS_FORECAST='N')
+                ncst_items = self._fetch_ultra_srt_ncst(nx, ny, ncst_base_date, ncst_base_time)
+
+                if ncst_items:
+                    ncst_record = self._parse_ncst_items(ncst_items, nx, ny, ncst_base_date, ncst_base_time)
+                    ncst_record['BASE_DATE'] = ncst_base_date
+                    ncst_record['BASE_TIME'] = ncst_base_time
+                    all_ncst.append(ncst_record)
+                    self.logger.debug(f"격자 ({nx}, {ny}) 실황: 1건")
 
             except Exception as e:
                 self.logger.error(f"격자 ({nx}, {ny}) 수집 실패: {e}")
                 continue
 
+        self.logger.info(f"수집 완료: 예보 일별 {len(all_daily)}건, 시간별 {len(all_hourly)}건, 실황 {len(all_ncst)}건")
+
         return {
             'daily': all_daily,
             'hourly': all_hourly,
+            'ncst': all_ncst,
         }
+
+    def collect_asos_daily(self, days_back: int = 7,
+                            start_dt: Optional[str] = None,
+                            end_dt: Optional[str] = None) -> List[Dict]:
+        """ASOS 일자료 수집 (과거 일별 실측)
+
+        TA_FARM.ASOS_STN_ID 캐싱을 우선 활용하고, 없는 경우 Haversine 계산.
+        격자별로 중복 제거하여 관측소당 1회만 API 호출.
+
+        Args:
+            days_back: 몇 일 전까지 조회할지 (기본 7일, start_dt/end_dt 미지정시 사용)
+            start_dt: 시작일 (YYYYMMDD) - 지정시 days_back 무시
+            end_dt: 종료일 (YYYYMMDD) - 지정시 days_back 무시
+
+        Returns:
+            일별 실측 레코드 리스트
+        """
+        self.key_manager.load_keys()
+
+        # ASOS 관측소 로드 (캐시)
+        stations = load_asos_stations(self.db)
+        if not stations:
+            self.logger.warning("ASOS 관측소 정보가 없습니다. TM_WEATHER_ASOS 테이블을 확인하세요.")
+            return []
+
+        # 조회 기간 설정
+        now = now_kst()
+        if start_dt and end_dt:
+            # CLI 옵션으로 기간 지정
+            pass
+        else:
+            # 기본: 어제부터 days_back일 전까지
+            end_dt = (now - timedelta(days=1)).strftime('%Y%m%d')
+            start_dt = (now - timedelta(days=days_back)).strftime('%Y%m%d')
+
+        # 격자별 ASOS 관측소 매핑 조회 (캐싱된 ASOS_STN_ID 활용)
+        # 격자 중복 제거: 같은 (NX, NY)는 한 번만 수집
+        grid_asos_map = self._get_grid_asos_mapping(stations)
+
+        if not grid_asos_map:
+            self.logger.warning("ASOS 수집 대상 격자가 없습니다.")
+            return []
+
+        self.logger.info(f"ASOS 일자료 수집: {start_dt} ~ {end_dt}")
+        self.logger.info(f"  대상 격자: {len(grid_asos_map)}개 (중복 제거됨)")
+        self.logger.info(f"  대상 관측소: {len(set(v[0] for v in grid_asos_map.values()))}개")
+
+        all_asos_daily = []
+        processed_stations = set()
+
+        for (nx, ny), (stn_id, stn_name, dist) in grid_asos_map.items():
+            if not self.key_manager.has_available_key():
+                self.logger.error("모든 API 키가 limit 상태입니다. ASOS 수집 중단.")
+                break
+
+            # 이미 처리한 관측소는 스킵 (같은 관측소 중복 호출 방지)
+            if stn_id in processed_stations:
+                # 이미 수집한 데이터를 이 격자에도 매핑
+                continue
+            processed_stations.add(stn_id)
+
+            try:
+                items = self._fetch_asos_daily(stn_id, start_dt, end_dt)
+                if items:
+                    records = self._parse_asos_daily_items(items, nx, ny)
+                    all_asos_daily.extend(records)
+                    self.logger.debug(f"ASOS ({stn_id} {stn_name}, {dist:.1f}km): {len(records)}건 -> 격자({nx},{ny})")
+            except Exception as e:
+                self.logger.error(f"ASOS 관측소 {stn_id} 수집 실패: {e}")
+                continue
+
+        self.logger.info(f"ASOS 일자료 수집 완료: {len(all_asos_daily)}건")
+        return all_asos_daily
+
+    def _get_grid_asos_mapping(self, stations: List[Tuple[int, str, float, float]]) -> Dict[Tuple[int, int], Tuple[int, str, float]]:
+        """격자별 ASOS 관측소 매핑 조회
+
+        TA_FARM.ASOS_STN_ID 캐싱을 우선 활용하고, 없는 경우 Haversine 계산.
+        격자 중복 제거하여 (NX, NY) -> (STN_ID, STN_NM, DIST_KM) 매핑 반환.
+
+        Args:
+            stations: ASOS 관측소 리스트
+
+        Returns:
+            {(nx, ny): (stn_id, stn_nm, dist_km), ...}
+        """
+        # 1. ASOS_STN_ID가 캐싱된 농장 조회 (격자별 중복 제거)
+        sql_cached = """
+            SELECT DISTINCT
+                WEATHER_NX_N AS NX,
+                WEATHER_NY_N AS NY,
+                ASOS_STN_ID,
+                ASOS_STN_NM,
+                ASOS_DIST_KM
+            FROM TA_FARM
+            WHERE USE_YN = 'Y'
+              AND WEATHER_NX_N IS NOT NULL
+              AND WEATHER_NY_N IS NOT NULL
+              AND ASOS_STN_ID IS NOT NULL
+        """
+        cached_rows = self.db.fetch_dict(sql_cached)
+
+        result = {}
+        for row in cached_rows:
+            try:
+                nx = int(row['NX'])
+                ny = int(row['NY'])
+                stn_id = int(row['ASOS_STN_ID'])
+                stn_nm = row['ASOS_STN_NM'] or ''
+                dist = float(row['ASOS_DIST_KM']) if row['ASOS_DIST_KM'] else 0.0
+                result[(nx, ny)] = (stn_id, stn_nm, dist)
+            except (ValueError, TypeError):
+                pass
+
+        self.logger.debug(f"ASOS 캐싱된 격자: {len(result)}개")
+
+        # 2. ASOS_STN_ID가 없는 농장은 Haversine 계산
+        sql_uncached = """
+            SELECT DISTINCT
+                WEATHER_NX_N AS NX,
+                WEATHER_NY_N AS NY,
+                MAP_Y_N AS LAT,
+                MAP_X_N AS LON
+            FROM TA_FARM
+            WHERE USE_YN = 'Y'
+              AND WEATHER_NX_N IS NOT NULL
+              AND WEATHER_NY_N IS NOT NULL
+              AND MAP_X_N IS NOT NULL
+              AND MAP_Y_N IS NOT NULL
+              AND ASOS_STN_ID IS NULL
+        """
+        uncached_rows = self.db.fetch_dict(sql_uncached)
+
+        for row in uncached_rows:
+            try:
+                nx = int(row['NX'])
+                ny = int(row['NY'])
+
+                # 이미 매핑된 격자는 스킵
+                if (nx, ny) in result:
+                    continue
+
+                lat = float(row['LAT'])
+                lon = float(row['LON'])
+                stn_id, stn_nm, dist = find_nearest_asos_station(lat, lon, stations)
+                result[(nx, ny)] = (stn_id, stn_nm, dist)
+            except (ValueError, TypeError):
+                pass
+
+        self.logger.debug(f"ASOS 미캐싱 격자 계산: {len(uncached_rows)}개")
+
+        return result
 
     def save(self, data: Dict[str, List[Dict]]) -> Dict[str, int]:
         """날씨 데이터 저장
 
         Args:
-            data: {'daily': [...], 'hourly': [...]} 형태
+            data: {'daily': [...], 'hourly': [...], 'ncst': [...]} 형태
 
         Returns:
-            {'daily': 저장건수, 'hourly': 저장건수}
+            {'daily': 저장건수, 'hourly': 저장건수, 'ncst': 저장건수}
         """
         daily_data = data.get('daily', [])
         hourly_data = data.get('hourly', [])
+        ncst_data = data.get('ncst', [])
 
         daily_count = self._save_daily(daily_data)
         hourly_count = self._save_hourly(hourly_data)
+        ncst_count = self._save_ncst(ncst_data)
 
         return {
             'daily': daily_count,
             'hourly': hourly_count,
+            'ncst': ncst_count,
         }
 
     def _save_daily(self, data: List[Dict]) -> int:
-        """일별 날씨 저장 (TM_WEATHER)"""
+        """일별 날씨 저장 (TM_WEATHER)
+
+        IS_FORECAST 플래그에 따라 예보/실측 구분하여 저장
+        - IS_FORECAST='Y': 예보 데이터 (단기예보)
+        - IS_FORECAST='N': 실측 데이터 (ASOS)
+        """
         if not data:
             return 0
+
+        # SQL에서 사용하는 필드만 추출 (cx_Oracle executemany 호환)
+        required_fields = ['NX', 'NY', 'WK_DATE', 'TEMP_AVG', 'TEMP_HIGH', 'TEMP_LOW',
+                          'RAIN_PROB', 'WEATHER_CD', 'WEATHER_NM', 'SKY_CD', 'IS_FORECAST']
+        filtered_data = [{k: row.get(k) for k in required_fields} for row in data]
 
         sql = """
             MERGE INTO TM_WEATHER TGT
@@ -571,12 +1438,12 @@ class WeatherCollector(BaseCollector):
                     TEMP_AVG = :TEMP_AVG,
                     TEMP_HIGH = :TEMP_HIGH,
                     TEMP_LOW = :TEMP_LOW,
-                    RAIN_PROB = :RAIN_PROB,
+                    RAIN_PROB = NVL(:RAIN_PROB, RAIN_PROB),
                     WEATHER_CD = :WEATHER_CD,
                     WEATHER_NM = :WEATHER_NM,
                     SKY_CD = :SKY_CD,
                     FCST_DT = SYSDATE,
-                    IS_FORECAST = 'Y',
+                    IS_FORECAST = :IS_FORECAST,
                     LOG_UPT_DT = SYSDATE
             WHEN NOT MATCHED THEN
                 INSERT (SEQ, WK_DATE, NX, NY, TEMP_AVG, TEMP_HIGH, TEMP_LOW,
@@ -584,11 +1451,11 @@ class WeatherCollector(BaseCollector):
                         FCST_DT, IS_FORECAST, LOG_INS_DT)
                 VALUES (SEQ_TM_WEATHER.NEXTVAL, :WK_DATE, :NX, :NY, :TEMP_AVG, :TEMP_HIGH, :TEMP_LOW,
                         :RAIN_PROB, :WEATHER_CD, :WEATHER_NM, :SKY_CD,
-                        SYSDATE, 'Y', SYSDATE)
+                        SYSDATE, :IS_FORECAST, SYSDATE)
         """
 
         try:
-            self.db.execute_many(sql, data)
+            self.db.execute_many(sql, filtered_data)
             self.db.commit()
             self.logger.info(f"TM_WEATHER: {len(data)}건 저장 완료")
             return len(data)
@@ -598,9 +1465,15 @@ class WeatherCollector(BaseCollector):
             raise
 
     def _save_hourly(self, data: List[Dict]) -> int:
-        """시간별 날씨 저장 (TM_WEATHER_HOURLY)"""
+        """시간별 날씨 저장 (TM_WEATHER_HOURLY) - 예보 데이터"""
         if not data:
             return 0
+
+        # SQL에서 사용하는 필드만 추출 (cx_Oracle executemany 호환)
+        required_fields = ['NX', 'NY', 'WK_DATE', 'WK_TIME', 'TEMP', 'RAIN_PROB', 'RAIN_AMT',
+                          'HUMIDITY', 'WIND_SPEED', 'WIND_DIR', 'WEATHER_CD', 'WEATHER_NM',
+                          'SKY_CD', 'PTY_CD', 'BASE_DATE', 'BASE_TIME', 'IS_FORECAST']
+        filtered_data = [{k: row.get(k) for k in required_fields} for row in data]
 
         sql = """
             MERGE INTO TM_WEATHER_HOURLY TGT
@@ -622,18 +1495,20 @@ class WeatherCollector(BaseCollector):
                     PTY_CD = :PTY_CD,
                     FCST_DT = SYSDATE,
                     BASE_DATE = :BASE_DATE,
-                    BASE_TIME = :BASE_TIME
+                    BASE_TIME = :BASE_TIME,
+                    IS_FORECAST = :IS_FORECAST,
+                    LOG_UPT_DT = SYSDATE
             WHEN NOT MATCHED THEN
                 INSERT (SEQ, WK_DATE, WK_TIME, NX, NY, TEMP, RAIN_PROB, RAIN_AMT,
                         HUMIDITY, WIND_SPEED, WIND_DIR, WEATHER_CD, WEATHER_NM,
-                        SKY_CD, PTY_CD, FCST_DT, BASE_DATE, BASE_TIME, LOG_INS_DT)
+                        SKY_CD, PTY_CD, FCST_DT, BASE_DATE, BASE_TIME, IS_FORECAST, LOG_INS_DT)
                 VALUES (SEQ_TM_WEATHER_HOURLY.NEXTVAL, :WK_DATE, :WK_TIME, :NX, :NY, :TEMP, :RAIN_PROB, :RAIN_AMT,
                         :HUMIDITY, :WIND_SPEED, :WIND_DIR, :WEATHER_CD, :WEATHER_NM,
-                        :SKY_CD, :PTY_CD, SYSDATE, :BASE_DATE, :BASE_TIME, SYSDATE)
+                        :SKY_CD, :PTY_CD, SYSDATE, :BASE_DATE, :BASE_TIME, :IS_FORECAST, SYSDATE)
         """
 
         try:
-            self.db.execute_many(sql, data)
+            self.db.execute_many(sql, filtered_data)
             self.db.commit()
             self.logger.info(f"TM_WEATHER_HOURLY: {len(data)}건 저장 완료")
             return len(data)
@@ -642,15 +1517,115 @@ class WeatherCollector(BaseCollector):
             self.db.rollback()
             raise
 
-    def run(self) -> Dict[str, int]:
-        """날씨 수집 실행 (수집 + 저장)"""
+    def _save_ncst(self, data: List[Dict]) -> int:
+        """초단기실황 저장 (TM_WEATHER_HOURLY) - 실측 데이터
+
+        실측 데이터는 IS_FORECAST='N'으로 저장
+        기존 예보 데이터가 있으면 실측으로 덮어씀
+        """
+        if not data:
+            return 0
+
+        # SQL에서 사용하는 필드만 추출 (cx_Oracle executemany 호환)
+        required_fields = ['NX', 'NY', 'WK_DATE', 'WK_TIME', 'TEMP', 'RAIN_AMT',
+                          'HUMIDITY', 'WIND_SPEED', 'WIND_DIR', 'WEATHER_CD', 'WEATHER_NM',
+                          'SKY_CD', 'PTY_CD', 'BASE_DATE', 'BASE_TIME']
+        filtered_data = [{k: row.get(k) for k in required_fields} for row in data]
+
+        sql = """
+            MERGE INTO TM_WEATHER_HOURLY TGT
+            USING (
+                SELECT :NX AS NX, :NY AS NY, :WK_DATE AS WK_DATE, :WK_TIME AS WK_TIME FROM DUAL
+            ) SRC
+            ON (TGT.NX = SRC.NX AND TGT.NY = SRC.NY AND TGT.WK_DATE = SRC.WK_DATE AND TGT.WK_TIME = SRC.WK_TIME)
+            WHEN MATCHED THEN
+                UPDATE SET
+                    TEMP = :TEMP,
+                    RAIN_AMT = :RAIN_AMT,
+                    HUMIDITY = :HUMIDITY,
+                    WIND_SPEED = :WIND_SPEED,
+                    WIND_DIR = :WIND_DIR,
+                    WEATHER_CD = :WEATHER_CD,
+                    WEATHER_NM = :WEATHER_NM,
+                    SKY_CD = :SKY_CD,
+                    PTY_CD = :PTY_CD,
+                    FCST_DT = SYSDATE,
+                    BASE_DATE = :BASE_DATE,
+                    BASE_TIME = :BASE_TIME,
+                    IS_FORECAST = 'N',
+                    LOG_UPT_DT = SYSDATE
+            WHEN NOT MATCHED THEN
+                INSERT (SEQ, WK_DATE, WK_TIME, NX, NY, TEMP, RAIN_AMT,
+                        HUMIDITY, WIND_SPEED, WIND_DIR, WEATHER_CD, WEATHER_NM,
+                        SKY_CD, PTY_CD, FCST_DT, BASE_DATE, BASE_TIME, IS_FORECAST, LOG_INS_DT)
+                VALUES (SEQ_TM_WEATHER_HOURLY.NEXTVAL, :WK_DATE, :WK_TIME, :NX, :NY, :TEMP, :RAIN_AMT,
+                        :HUMIDITY, :WIND_SPEED, :WIND_DIR, :WEATHER_CD, :WEATHER_NM,
+                        :SKY_CD, :PTY_CD, SYSDATE, :BASE_DATE, :BASE_TIME, 'N', SYSDATE)
+        """
+
+        try:
+            self.db.execute_many(sql, filtered_data)
+            self.db.commit()
+            self.logger.info(f"TM_WEATHER_HOURLY (실황): {len(data)}건 저장 완료")
+            return len(data)
+        except Exception as e:
+            self.logger.error(f"TM_WEATHER_HOURLY (실황) 저장 실패: {e}")
+            self.db.rollback()
+            raise
+
+    def save_asos_daily(self, data: List[Dict]) -> int:
+        """ASOS 일자료 저장 (TM_WEATHER) - 실측 데이터
+
+        실측 데이터는 IS_FORECAST='N'으로 저장
+        """
+        if not data:
+            return 0
+
+        return self._save_daily(data)
+
+    def run(self, collect_asos: bool = False,
+            asos_days_back: int = 7,
+            asos_start_dt: Optional[str] = None,
+            asos_end_dt: Optional[str] = None) -> Dict[str, int]:
+        """날씨 수집 실행 (수집 + 저장)
+
+        Args:
+            collect_asos: ASOS 일자료도 수집할지 여부 (기본 False)
+            asos_days_back: ASOS 조회 일수 (기본 7일)
+            asos_start_dt: ASOS 시작일 (YYYYMMDD) - 지정시 days_back 무시
+            asos_end_dt: ASOS 종료일 (YYYYMMDD) - 지정시 days_back 무시
+
+        Returns:
+            {'daily': 건수, 'hourly': 건수, 'ncst': 건수, 'asos': 건수}
+        """
         self.logger.info("=== 기상청 날씨 데이터 수집 시작 ===")
 
         try:
+            # [1] 예보 + 초단기실황 수집
             data = self.collect()
             result = self.save(data)
 
-            self.logger.info(f"=== 수집 완료: 일별 {result['daily']}건, 시간별 {result['hourly']}건 ===")
+            # [2] ASOS 일자료 수집 (옵션)
+            asos_count = 0
+            if collect_asos:
+                asos_data = self.collect_asos_daily(
+                    days_back=asos_days_back,
+                    start_dt=asos_start_dt,
+                    end_dt=asos_end_dt
+                )
+                asos_count = self.save_asos_daily(asos_data)
+
+            result['asos'] = asos_count
+
+            self.logger.info("=" * 60)
+            self.logger.info(f"수집 완료:")
+            self.logger.info(f"  예보 일별: {result['daily']}건")
+            self.logger.info(f"  예보 시간별: {result['hourly']}건")
+            self.logger.info(f"  초단기실황: {result['ncst']}건")
+            if collect_asos:
+                self.logger.info(f"  ASOS 일자료: {result['asos']}건")
+            self.logger.info("=" * 60)
+
             return result
 
         except Exception as e:
@@ -659,20 +1634,21 @@ class WeatherCollector(BaseCollector):
 
 
 def update_farm_weather_grid(db: Database):
-    """TA_FARM의 WEATHER_NX, WEATHER_NY 업데이트
+    """TA_FARM의 WEATHER_NX_N, WEATHER_NY_N 업데이트
 
-    MAP_X, MAP_Y가 있고 WEATHER_NX, WEATHER_NY가 없는 농장의 격자 좌표 계산
+    MAP_X_N, MAP_Y_N이 있고 WEATHER_NX_N, WEATHER_NY_N이 없는 농장의 격자 좌표 계산
+    (읍면동 대표 좌표 기반)
     """
     logger.info("TA_FARM 격자 좌표 업데이트 시작")
 
-    # 업데이트 대상 조회
+    # 업데이트 대상 조회 (읍면동 대표 좌표 기준)
     sql = """
-        SELECT FARM_NO, MAP_X, MAP_Y
+        SELECT FARM_NO, MAP_X_N, MAP_Y_N
         FROM TA_FARM
         WHERE USE_YN = 'Y'
-          AND MAP_X IS NOT NULL
-          AND MAP_Y IS NOT NULL
-          AND (WEATHER_NX IS NULL OR WEATHER_NY IS NULL)
+          AND MAP_X_N IS NOT NULL
+          AND MAP_Y_N IS NOT NULL
+          AND (WEATHER_NX_N IS NULL OR WEATHER_NY_N IS NULL)
     """
     rows = db.fetch_dict(sql)
 
@@ -682,15 +1658,15 @@ def update_farm_weather_grid(db: Database):
 
     update_sql = """
         UPDATE TA_FARM
-        SET WEATHER_NX = :NX, WEATHER_NY = :NY, LOG_UPT_DT = SYSDATE
+        SET WEATHER_NX_N = :NX, WEATHER_NY_N = :NY, LOG_UPT_DT = SYSDATE
         WHERE FARM_NO = :FARM_NO
     """
 
     updates = []
     for row in rows:
         try:
-            lon = float(row['MAP_X'])
-            lat = float(row['MAP_Y'])
+            lon = float(row['MAP_X_N'])
+            lat = float(row['MAP_Y_N'])
             nx, ny = latlon_to_grid(lat, lon)
             updates.append({
                 'FARM_NO': row['FARM_NO'],
