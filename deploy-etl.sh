@@ -35,6 +35,7 @@ FILES=(
     "run_etl.py"
     "run_api.py"
     "run_weekly.sh"
+    "weather_etl.py"
     "requirements.txt"
     "config.ini.example"
     "inspig-etl-api.service"
