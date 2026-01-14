@@ -170,9 +170,10 @@ def run_weather_etl():
 
         logger.info("=" * 60)
         logger.info("Weather ETL 완료:")
-        logger.info(f"  예보 일별: {result['daily']}건")
-        logger.info(f"  예보 시간별: {result['hourly']}건")
+        logger.info(f"  단기 일별: {result['daily']}건")
+        logger.info(f"  단기 시간별: {result['hourly']}건")
         logger.info(f"  초단기실황: {result['ncst']}건")
+        logger.info(f"  중기 일별: {result.get('mid', 0)}건")
         if args.asos:
             logger.info(f"  ASOS 일자료: {result.get('asos', 0)}건")
         logger.info("=" * 60)

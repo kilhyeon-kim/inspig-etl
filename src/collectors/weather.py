@@ -33,6 +33,110 @@ logger = logging.getLogger(__name__)
 # ASOS 관측소 캐시 (DB에서 로드)
 _asos_stations_cache: List[Tuple[int, str, float, float]] = []
 
+# ============================================================================
+# 중기예보 지역코드 매핑
+# ============================================================================
+# 중기예보 API는 격자(NX, NY) 대신 지역코드(regId) 기반으로 조회
+# - getMidTa (중기기온): 시/군 단위 코드 (예: 서울 11B10101)
+# - getMidLandFcst (중기육상): 광역 단위 코드 (예: 서울/인천/경기 11B00000)
+#
+# 시군구코드(앞 2자리) → 중기예보 지역코드 매핑
+# 참고: https://www.data.go.kr/data/15059468/openapi.do
+
+# 중기기온예보 지역코드 (getMidTa)
+# 시도코드(앞 2자리) → 대표 지역 regId
+MID_TA_REG_IDS = {
+    # 서울/경기/인천
+    '11': '11B10101',  # 서울
+    '41': '11B20601',  # 수원 (경기 대표)
+    '28': '11B20201',  # 인천
+    # 강원
+    '42': '11D10301',  # 춘천 (강원영서 대표)
+    '43': '11D10401',  # 원주 (강원영서)
+    # 충청
+    '44': '11C20401',  # 대전 (충남권 대표)
+    '30': '11C20401',  # 대전광역시
+    '36': '11C20401',  # 세종
+    '45': '11C10301',  # 청주 (충북 대표)
+    # 전라
+    '46': '11F20501',  # 광주 (전남권 대표)
+    '29': '11F20501',  # 광주광역시
+    '47': '11F10201',  # 전주 (전북 대표)
+    # 경상
+    '48': '11H10701',  # 부산 (경남권 대표)
+    '26': '11H10701',  # 부산광역시
+    '31': '11H20101',  # 울산
+    '49': '11H10501',  # 창원 (경남)
+    '50': '11H20201',  # 대구 (경북권 대표)
+    '27': '11H20201',  # 대구광역시
+    # 제주
+    '51': '11G00201',  # 제주
+}
+
+# 중기육상예보 지역코드 (getMidLandFcst)
+# 시도코드(앞 2자리) → 광역 regId
+MID_LAND_REG_IDS = {
+    # 서울/경기/인천
+    '11': '11B00000',  # 서울, 인천, 경기도
+    '41': '11B00000',  # 경기도
+    '28': '11B00000',  # 인천
+    # 강원 (영서/영동 구분 필요 - 기본 영서)
+    '42': '11D10000',  # 강원도영서
+    '43': '11D10000',  # 강원도영서
+    # 충청
+    '44': '11C20000',  # 대전, 세종, 충청남도
+    '30': '11C20000',  # 대전광역시
+    '36': '11C20000',  # 세종
+    '45': '11C10000',  # 충청북도
+    # 전라
+    '46': '11F20000',  # 광주, 전라남도
+    '29': '11F20000',  # 광주광역시
+    '47': '11F10000',  # 전북자치도
+    # 경상
+    '48': '11H10000',  # 부산, 울산, 경상남도
+    '26': '11H10000',  # 부산광역시
+    '31': '11H10000',  # 울산
+    '49': '11H10000',  # 경남
+    '50': '11H20000',  # 대구, 경상북도
+    '27': '11H20000',  # 대구광역시
+    # 제주
+    '51': '11G00000',  # 제주도
+}
+
+# 기본값 (매핑되지 않는 지역)
+DEFAULT_MID_TA_REG_ID = '11B10101'  # 서울
+DEFAULT_MID_LAND_REG_ID = '11B00000'  # 서울/인천/경기
+
+
+def get_mid_ta_reg_id(sigun_cd: str) -> str:
+    """시군구코드에서 중기기온예보 지역코드 추출
+
+    Args:
+        sigun_cd: 시군구코드 (예: '4113510000')
+
+    Returns:
+        중기기온예보 regId (예: '11B20601')
+    """
+    if not sigun_cd or len(sigun_cd) < 2:
+        return DEFAULT_MID_TA_REG_ID
+    sido_cd = sigun_cd[:2]
+    return MID_TA_REG_IDS.get(sido_cd, DEFAULT_MID_TA_REG_ID)
+
+
+def get_mid_land_reg_id(sigun_cd: str) -> str:
+    """시군구코드에서 중기육상예보 지역코드 추출
+
+    Args:
+        sigun_cd: 시군구코드 (예: '4113510000')
+
+    Returns:
+        중기육상예보 regId (예: '11B00000')
+    """
+    if not sigun_cd or len(sigun_cd) < 2:
+        return DEFAULT_MID_LAND_REG_ID
+    sido_cd = sigun_cd[:2]
+    return MID_LAND_REG_IDS.get(sido_cd, DEFAULT_MID_LAND_REG_ID)
+
 
 def _haversine_distance(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     """Haversine 공식으로 두 좌표 간 거리 계산 (km)"""
@@ -282,6 +386,8 @@ class WeatherCollector(BaseCollector):
         self.base_url = self.weather_config.get('base_url', 'https://apis.data.go.kr/1360000/VilageFcstInfoService_2.0')
         self.asos_hourly_url = 'https://apis.data.go.kr/1360000/AsosHourlyInfoService/getWthrDataList'
         self.asos_daily_url = 'https://apis.data.go.kr/1360000/AsosDalyInfoService/getWthrDataList'
+        # 중기예보 API URL
+        self.mid_fcst_url = 'https://apis.data.go.kr/1360000/MidFcstInfoService'
 
         # API 키 관리자
         self.key_manager = ApiKeyManager(self.db)
@@ -767,6 +873,11 @@ class WeatherCollector(BaseCollector):
             temp_list = day.get('TMP_list', [])
             temp_avg = sum(temp_list) / len(temp_list) if temp_list else None
 
+            # 최저/최고 기온: 항상 시간별 예보(TMP_list)의 min/max 사용 (네이버 방식)
+            # 기상청 TMN/TMX는 특정 시간대 기준(03~09시/09~18시)이라 전체 min/max와 다를 수 있음
+            temp_high = max(temp_list) if temp_list else None
+            temp_low = min(temp_list) if temp_list else None
+
             # 날씨 코드 결정 (강수형태 > 하늘상태)
             pty_cd = day.get('PTY_CD', '0')
             sky_cd = day.get('SKY_CD', '1')
@@ -781,8 +892,8 @@ class WeatherCollector(BaseCollector):
                 'NX': day['NX'],
                 'NY': day['NY'],
                 'TEMP_AVG': round(temp_avg, 1) if temp_avg else None,
-                'TEMP_HIGH': day.get('TMX'),
-                'TEMP_LOW': day.get('TMN'),
+                'TEMP_HIGH': temp_high,
+                'TEMP_LOW': temp_low,
                 'RAIN_PROB': day.get('POP_max', 0),
                 'WEATHER_CD': weather_cd,
                 'WEATHER_NM': weather_nm,
@@ -1145,11 +1256,17 @@ class WeatherCollector(BaseCollector):
           [2] 초단기실황 (getUltraSrtNcst): 현재 시각 실측 (IS_FORECAST='N')
           [3] ASOS 일자료: 어제까지 실측 (IS_FORECAST='N') - 옵션
 
+        데이터 무결성 보장:
+          - 모든 격자 수집 완료 시에만 'is_complete': True 반환
+          - API limit 등으로 중단 시 'is_complete': False 반환
+          - 호출부(save)에서 is_complete=False일 경우 저장 스킵하여 기존 데이터 유지
+
         Args:
             grids: 격자 목록 [(nx, ny), ...]. None이면 DB에서 조회
 
         Returns:
-            {'daily': [...], 'hourly': [...], 'ncst': [...]} 형태의 수집 결과
+            {'daily': [...], 'hourly': [...], 'ncst': [...], 'is_complete': bool,
+             'total_grids': int, 'collected_grids': int, 'failed_grids': [(nx, ny), ...]}
         """
         # API 키 로드
         self.key_manager.load_keys()
@@ -1165,35 +1282,76 @@ class WeatherCollector(BaseCollector):
 
         if not grids:
             self.logger.warning("수집 대상 격자가 없습니다.")
-            return {'daily': [], 'hourly': [], 'ncst': []}
+            return {'daily': [], 'hourly': [], 'ncst': [], 'is_complete': True,
+                    'total_grids': 0, 'collected_grids': 0, 'failed_grids': []}
 
         # 단기예보 기준 날짜/시간
         fcst_base_date, fcst_base_time = self._get_base_datetime()
         # 초단기실황 기준 날짜/시간
         ncst_base_date, ncst_base_time = self._get_ncst_base_datetime()
 
+        # TMN/TMX 확보용 05:00 발표 데이터 조회 여부
+        # TMN(최저)과 TMX(최고)는 02:00, 05:00 발표에만 포함됨
+        need_tmn_tmx = fcst_base_time not in ('0200', '0500')
+        tmn_tmx_base_time = '0500'  # 05:00 발표 데이터 사용
+
         self.logger.info(f"예보 기준: {fcst_base_date} {fcst_base_time}, 실황 기준: {ncst_base_date} {ncst_base_time}")
+        if need_tmn_tmx:
+            self.logger.info(f"TMN/TMX 확보용 추가 조회: {fcst_base_date} {tmn_tmx_base_time}")
         self.logger.info(f"대상 격자: {len(grids)}개")
 
         all_daily = []
         all_hourly = []
         all_ncst = []
+        failed_grids = []  # 실패한 격자 목록
+        api_limit_reached = False  # API limit으로 인한 중단 여부
 
         # 중복 격자 제거
         unique_grids = list(set(grids))
+        total_grids = len(unique_grids)
+        collected_count = 0
 
         for nx, ny in unique_grids:
-            # 모든 키가 limit 상태면 중단
+            # 모든 키가 limit 상태면 중단 (무결성 보장을 위해 저장하지 않음)
             if not self.key_manager.has_available_key():
                 self.logger.error("모든 API 키가 limit 상태입니다. 수집 중단.")
+                api_limit_reached = True
+                # 남은 격자들을 실패 목록에 추가
+                remaining_idx = unique_grids.index((nx, ny))
+                failed_grids.extend(unique_grids[remaining_idx:])
                 break
 
             try:
                 # [1] 단기예보 수집 (IS_FORECAST='Y')
                 items = self._fetch_forecast(nx, ny, fcst_base_date, fcst_base_time)
 
+                # TMN/TMX 확보용 05:00 발표 데이터 조회
+                tmn_tmx_map = {}  # {날짜: {'TMN': val, 'TMX': val}}
+                if need_tmn_tmx and items:
+                    tmn_items = self._fetch_forecast(nx, ny, fcst_base_date, tmn_tmx_base_time)
+                    if tmn_items:
+                        for item in tmn_items:
+                            fcst_date = item.get('fcstDate')
+                            category = item.get('category')
+                            value = item.get('fcstValue')
+                            if fcst_date and category in ('TMN', 'TMX'):
+                                if fcst_date not in tmn_tmx_map:
+                                    tmn_tmx_map[fcst_date] = {}
+                                try:
+                                    tmn_tmx_map[fcst_date][category] = float(value)
+                                except (ValueError, TypeError):
+                                    pass
+
                 if items:
                     daily_data, hourly_data = self._parse_forecast_items(items, nx, ny)
+
+                    # TMN/TMX 병합 (05:00 발표 데이터에서 가져온 값)
+                    for wk_date, day in daily_data.items():
+                        if wk_date in tmn_tmx_map:
+                            if day.get('TMN') is None and 'TMN' in tmn_tmx_map[wk_date]:
+                                day['TMN'] = tmn_tmx_map[wk_date]['TMN']
+                            if day.get('TMX') is None and 'TMX' in tmn_tmx_map[wk_date]:
+                                day['TMX'] = tmn_tmx_map[wk_date]['TMX']
 
                     daily_records = self._finalize_daily_data(daily_data)
                     hourly_records = self._finalize_hourly_data(hourly_data)
@@ -1225,16 +1383,32 @@ class WeatherCollector(BaseCollector):
                     all_ncst.append(ncst_record)
                     self.logger.debug(f"격자 ({nx}, {ny}) 실황: 1건")
 
+                # 이 격자 수집 완료
+                collected_count += 1
+
             except Exception as e:
                 self.logger.error(f"격자 ({nx}, {ny}) 수집 실패: {e}")
+                failed_grids.append((nx, ny))
                 continue
 
+        # 수집 완료 여부 판단
+        is_complete = (collected_count == total_grids) and not api_limit_reached
+
         self.logger.info(f"수집 완료: 예보 일별 {len(all_daily)}건, 시간별 {len(all_hourly)}건, 실황 {len(all_ncst)}건")
+        self.logger.info(f"수집 현황: {collected_count}/{total_grids} 격자 완료, 실패 {len(failed_grids)}개")
+
+        if not is_complete:
+            self.logger.warning(f"⚠️ 수집 미완료 (is_complete=False): API limit 또는 오류로 인해 일부 격자 누락")
+            self.logger.warning(f"  → 데이터 무결성 보장을 위해 저장하지 않습니다. 기존 데이터 유지.")
 
         return {
             'daily': all_daily,
             'hourly': all_hourly,
             'ncst': all_ncst,
+            'is_complete': is_complete,
+            'total_grids': total_grids,
+            'collected_grids': collected_count,
+            'failed_grids': failed_grids,
         }
 
     def collect_asos_daily(self, days_back: int = 7,
@@ -1392,12 +1566,33 @@ class WeatherCollector(BaseCollector):
     def save(self, data: Dict[str, List[Dict]]) -> Dict[str, int]:
         """날씨 데이터 저장
 
+        데이터 무결성 보장:
+          - is_complete=False인 경우 저장하지 않고 기존 데이터 유지
+          - API limit 등으로 일부 격자만 수집된 경우 저장 스킵
+
         Args:
-            data: {'daily': [...], 'hourly': [...], 'ncst': [...]} 형태
+            data: {'daily': [...], 'hourly': [...], 'ncst': [...],
+                   'is_complete': bool, 'total_grids': int, 'collected_grids': int}
 
         Returns:
             {'daily': 저장건수, 'hourly': 저장건수, 'ncst': 저장건수}
         """
+        # 무결성 체크: is_complete=False면 저장하지 않음
+        is_complete = data.get('is_complete', True)
+        if not is_complete:
+            total = data.get('total_grids', 0)
+            collected = data.get('collected_grids', 0)
+            failed = len(data.get('failed_grids', []))
+            self.logger.warning(f"⚠️ 저장 스킵: 수집 미완료 ({collected}/{total} 격자, 실패 {failed}개)")
+            self.logger.warning(f"  → 기존 데이터를 유지합니다. 다음 ETL 실행 시 재시도됩니다.")
+            return {
+                'daily': 0,
+                'hourly': 0,
+                'ncst': 0,
+                'skipped': True,
+                'reason': 'incomplete_collection'
+            }
+
         daily_data = data.get('daily', [])
         hourly_data = data.get('hourly', [])
         ncst_data = data.get('ncst', [])
@@ -1584,6 +1779,7 @@ class WeatherCollector(BaseCollector):
         return self._save_daily(data)
 
     def run(self, collect_asos: bool = False,
+            collect_mid: bool = True,
             asos_days_back: int = 7,
             asos_start_dt: Optional[str] = None,
             asos_end_dt: Optional[str] = None) -> Dict[str, int]:
@@ -1591,21 +1787,30 @@ class WeatherCollector(BaseCollector):
 
         Args:
             collect_asos: ASOS 일자료도 수집할지 여부 (기본 False)
+            collect_mid: 중기예보도 수집할지 여부 (기본 True)
             asos_days_back: ASOS 조회 일수 (기본 7일)
             asos_start_dt: ASOS 시작일 (YYYYMMDD) - 지정시 days_back 무시
             asos_end_dt: ASOS 종료일 (YYYYMMDD) - 지정시 days_back 무시
 
         Returns:
-            {'daily': 건수, 'hourly': 건수, 'ncst': 건수, 'asos': 건수}
+            {'daily': 건수, 'hourly': 건수, 'ncst': 건수, 'asos': 건수, 'mid': 건수}
         """
         self.logger.info("=== 기상청 날씨 데이터 수집 시작 ===")
 
         try:
-            # [1] 예보 + 초단기실황 수집
+            # [1] 단기예보 + 초단기실황 수집
             data = self.collect()
             result = self.save(data)
 
-            # [2] ASOS 일자료 수집 (옵션)
+            # [2] 중기예보 수집 (기본 활성화)
+            mid_count = 0
+            if collect_mid:
+                mid_data = self.collect_mid_forecast()
+                mid_count = self.save_mid_forecast(mid_data)
+
+            result['mid'] = mid_count
+
+            # [3] ASOS 일자료 수집 (옵션)
             asos_count = 0
             if collect_asos:
                 asos_data = self.collect_asos_daily(
@@ -1618,12 +1823,18 @@ class WeatherCollector(BaseCollector):
             result['asos'] = asos_count
 
             self.logger.info("=" * 60)
-            self.logger.info(f"수집 완료:")
-            self.logger.info(f"  예보 일별: {result['daily']}건")
-            self.logger.info(f"  예보 시간별: {result['hourly']}건")
-            self.logger.info(f"  초단기실황: {result['ncst']}건")
-            if collect_asos:
-                self.logger.info(f"  ASOS 일자료: {result['asos']}건")
+            if result.get('skipped'):
+                self.logger.warning(f"⚠️ 저장 스킵됨: {result.get('reason', 'unknown')}")
+                self.logger.warning(f"  → 기존 데이터 유지, 다음 ETL 실행 시 재시도")
+            else:
+                self.logger.info(f"수집 완료:")
+                self.logger.info(f"  단기 일별: {result['daily']}건")
+                self.logger.info(f"  단기 시간별: {result['hourly']}건")
+                self.logger.info(f"  초단기실황: {result['ncst']}건")
+                if collect_mid:
+                    self.logger.info(f"  중기 일별: {result['mid']}건")
+                if collect_asos:
+                    self.logger.info(f"  ASOS 일자료: {result['asos']}건")
             self.logger.info("=" * 60)
 
             return result
@@ -1631,6 +1842,410 @@ class WeatherCollector(BaseCollector):
         except Exception as e:
             self.logger.error(f"날씨 수집 실패: {e}")
             raise
+
+    # ============================================================================
+    # 중기예보 수집 (getMidTa, getMidLandFcst)
+    # ============================================================================
+
+    def _get_mid_base_datetime(self) -> str:
+        """중기예보 API 호출용 발표시각 계산
+
+        중기예보: 일 2회 발표 (06:00, 18:00)
+        발표 후 약 30분 뒤 데이터 제공
+
+        Returns:
+            발표시각 (YYYYMMDDHHMM 형식, 예: 202501140600)
+        """
+        now = now_kst()
+        current_hour = now.hour
+
+        # 06:30 이전 → 전날 18:00 발표
+        # 06:30~18:30 → 당일 06:00 발표
+        # 18:30 이후 → 당일 18:00 발표
+        if current_hour < 6 or (current_hour == 6 and now.minute < 30):
+            # 전날 18:00
+            base_dt = (now - timedelta(days=1)).strftime('%Y%m%d') + '1800'
+        elif current_hour < 18 or (current_hour == 18 and now.minute < 30):
+            # 당일 06:00
+            base_dt = now.strftime('%Y%m%d') + '0600'
+        else:
+            # 당일 18:00
+            base_dt = now.strftime('%Y%m%d') + '1800'
+
+        return base_dt
+
+    def _fetch_mid_ta(self, reg_id: str, tm_fc: str) -> Optional[Dict]:
+        """중기기온예보 API 호출 (getMidTa)
+
+        Args:
+            reg_id: 예보구역코드 (예: '11B10101')
+            tm_fc: 발표시각 (YYYYMMDDHHMM)
+
+        Returns:
+            기온예보 데이터 dict 또는 None
+        """
+        url = f"{self.mid_fcst_url}/getMidTa"
+
+        while self.key_manager.has_available_key():
+            api_key = self.key_manager.get_current_key()
+            if not api_key:
+                break
+
+            params = {
+                'serviceKey': api_key,
+                'pageNo': 1,
+                'numOfRows': 10,
+                'dataType': 'JSON',
+                'regId': reg_id,
+                'tmFc': tm_fc,
+            }
+
+            try:
+                self.logger.debug(f"중기기온 API 호출: regId={reg_id}, tmFc={tm_fc}")
+                response = requests.get(url, params=params, timeout=30)
+
+                if response.status_code in (401, 403, 429):
+                    self.logger.warning(f"중기기온 API 키 인증/제한 오류 ({response.status_code})")
+                    self.key_manager.mark_key_exhausted(api_key)
+                    continue
+
+                response.raise_for_status()
+                data = response.json()
+
+                result_code = data.get('response', {}).get('header', {}).get('resultCode')
+                result_msg = data.get('response', {}).get('header', {}).get('resultMsg', '')
+
+                if result_code == '00':
+                    self.key_manager.increment_count(api_key)
+                    items = data.get('response', {}).get('body', {}).get('items', {}).get('item', [])
+                    if isinstance(items, list) and len(items) > 0:
+                        return items[0]
+                    elif isinstance(items, dict):
+                        return items
+                    return None
+
+                elif result_code in ApiKeyManager.LIMIT_ERROR_CODES:
+                    self.logger.warning(f"중기기온 API 호출 제한: {result_code} - {result_msg}")
+                    self.key_manager.mark_key_exhausted(api_key)
+                    continue
+
+                else:
+                    self.logger.error(f"중기기온 API 오류: {result_code} - {result_msg}")
+                    return None
+
+            except requests.RequestException as e:
+                self.logger.error(f"중기기온 API 호출 실패: {e}")
+                return None
+            except (KeyError, ValueError) as e:
+                self.logger.error(f"중기기온 API 응답 파싱 실패: {e}")
+                return None
+
+        self.logger.error("모든 API 키가 소진되었습니다. (중기기온)")
+        return None
+
+    def _fetch_mid_land_fcst(self, reg_id: str, tm_fc: str) -> Optional[Dict]:
+        """중기육상예보 API 호출 (getMidLandFcst)
+
+        Args:
+            reg_id: 예보구역코드 (예: '11B00000')
+            tm_fc: 발표시각 (YYYYMMDDHHMM)
+
+        Returns:
+            육상예보 데이터 dict 또는 None
+        """
+        url = f"{self.mid_fcst_url}/getMidLandFcst"
+
+        while self.key_manager.has_available_key():
+            api_key = self.key_manager.get_current_key()
+            if not api_key:
+                break
+
+            params = {
+                'serviceKey': api_key,
+                'pageNo': 1,
+                'numOfRows': 10,
+                'dataType': 'JSON',
+                'regId': reg_id,
+                'tmFc': tm_fc,
+            }
+
+            try:
+                self.logger.debug(f"중기육상 API 호출: regId={reg_id}, tmFc={tm_fc}")
+                response = requests.get(url, params=params, timeout=30)
+
+                if response.status_code in (401, 403, 429):
+                    self.logger.warning(f"중기육상 API 키 인증/제한 오류 ({response.status_code})")
+                    self.key_manager.mark_key_exhausted(api_key)
+                    continue
+
+                response.raise_for_status()
+                data = response.json()
+
+                result_code = data.get('response', {}).get('header', {}).get('resultCode')
+                result_msg = data.get('response', {}).get('header', {}).get('resultMsg', '')
+
+                if result_code == '00':
+                    self.key_manager.increment_count(api_key)
+                    items = data.get('response', {}).get('body', {}).get('items', {}).get('item', [])
+                    if isinstance(items, list) and len(items) > 0:
+                        return items[0]
+                    elif isinstance(items, dict):
+                        return items
+                    return None
+
+                elif result_code in ApiKeyManager.LIMIT_ERROR_CODES:
+                    self.logger.warning(f"중기육상 API 호출 제한: {result_code} - {result_msg}")
+                    self.key_manager.mark_key_exhausted(api_key)
+                    continue
+
+                else:
+                    self.logger.error(f"중기육상 API 오류: {result_code} - {result_msg}")
+                    return None
+
+            except requests.RequestException as e:
+                self.logger.error(f"중기육상 API 호출 실패: {e}")
+                return None
+            except (KeyError, ValueError) as e:
+                self.logger.error(f"중기육상 API 응답 파싱 실패: {e}")
+                return None
+
+        self.logger.error("모든 API 키가 소진되었습니다. (중기육상)")
+        return None
+
+    def _get_target_grids_with_sigun(self) -> List[Tuple[int, int, str]]:
+        """격자 목록을 시군구코드와 함께 조회 (중기예보용)
+
+        Returns:
+            [(nx, ny, sigun_cd), ...] 형태
+        """
+        sql = """
+            SELECT DISTINCT
+                WEATHER_NX_N AS NX,
+                WEATHER_NY_N AS NY,
+                SIGUN_CD
+            FROM TA_FARM
+            WHERE USE_YN = 'Y'
+              AND WEATHER_NX_N IS NOT NULL
+              AND WEATHER_NY_N IS NOT NULL
+              AND SIGUN_CD IS NOT NULL
+        """
+        rows = self.db.fetch_dict(sql)
+        result = []
+        for row in rows:
+            try:
+                nx = int(row['NX'])
+                ny = int(row['NY'])
+                sigun_cd = str(row['SIGUN_CD'] or '')
+                result.append((nx, ny, sigun_cd))
+            except (ValueError, TypeError):
+                pass
+        return result
+
+    def collect_mid_forecast(self) -> Dict[str, List[Dict]]:
+        """중기예보 수집 (+3일 ~ +10일)
+
+        중기기온예보(getMidTa)와 중기육상예보(getMidLandFcst)를 수집하여
+        격자별 일별 데이터로 변환
+
+        Returns:
+            {'daily': [일별 레코드 리스트], 'is_complete': bool}
+        """
+        self.key_manager.load_keys()
+
+        # 발표시각
+        tm_fc = self._get_mid_base_datetime()
+        self.logger.info(f"중기예보 수집 시작 (발표시각: {tm_fc})")
+
+        # 격자별 시군구코드 조회
+        grids_with_sigun = self._get_target_grids_with_sigun()
+        if not grids_with_sigun:
+            self.logger.warning("중기예보 수집 대상 격자가 없습니다.")
+            return {'daily': [], 'is_complete': True}
+
+        # 지역코드별로 그룹핑 (중복 API 호출 방지)
+        # {(ta_reg_id, land_reg_id): [(nx, ny), ...]}
+        reg_id_groups: Dict[Tuple[str, str], List[Tuple[int, int]]] = {}
+        for nx, ny, sigun_cd in grids_with_sigun:
+            ta_reg_id = get_mid_ta_reg_id(sigun_cd)
+            land_reg_id = get_mid_land_reg_id(sigun_cd)
+            key = (ta_reg_id, land_reg_id)
+            if key not in reg_id_groups:
+                reg_id_groups[key] = []
+            reg_id_groups[key].append((nx, ny))
+
+        self.logger.info(f"중기예보 대상: 격자 {len(grids_with_sigun)}개, 지역코드 {len(reg_id_groups)}개")
+
+        # 기준일 계산 (발표시각 기준)
+        base_date = datetime.strptime(tm_fc[:8], '%Y%m%d')
+
+        all_daily = []
+        failed_reg_ids = []
+        api_limit_reached = False
+
+        for (ta_reg_id, land_reg_id), grid_list in reg_id_groups.items():
+            if not self.key_manager.has_available_key():
+                self.logger.error("모든 API 키가 limit 상태입니다. 중기예보 수집 중단.")
+                api_limit_reached = True
+                failed_reg_ids.append((ta_reg_id, land_reg_id))
+                continue
+
+            try:
+                # [1] 중기기온예보 조회
+                ta_data = self._fetch_mid_ta(ta_reg_id, tm_fc)
+
+                # [2] 중기육상예보 조회
+                land_data = self._fetch_mid_land_fcst(land_reg_id, tm_fc)
+
+                if not ta_data and not land_data:
+                    self.logger.warning(f"중기예보 데이터 없음: ta={ta_reg_id}, land={land_reg_id}")
+                    continue
+
+                # [3] 격자별로 일별 레코드 생성 (+3일 ~ +10일)
+                for nx, ny in grid_list:
+                    for day_offset in range(3, 11):  # 3일 후 ~ 10일 후
+                        target_date = base_date + timedelta(days=day_offset)
+                        wk_date = target_date.strftime('%Y%m%d')
+
+                        record = {
+                            'NX': nx,
+                            'NY': ny,
+                            'WK_DATE': wk_date,
+                            'IS_FORECAST': 'Y',
+                        }
+
+                        # 기온 데이터 (taMin3~10, taMax3~10)
+                        if ta_data:
+                            ta_min_key = f'taMin{day_offset}'
+                            ta_max_key = f'taMax{day_offset}'
+                            record['TEMP_LOW'] = ta_data.get(ta_min_key)
+                            record['TEMP_HIGH'] = ta_data.get(ta_max_key)
+
+                            # 평균기온 계산 (최저+최고)/2
+                            if record['TEMP_LOW'] is not None and record['TEMP_HIGH'] is not None:
+                                try:
+                                    record['TEMP_AVG'] = round(
+                                        (float(record['TEMP_LOW']) + float(record['TEMP_HIGH'])) / 2, 1
+                                    )
+                                except (ValueError, TypeError):
+                                    record['TEMP_AVG'] = None
+
+                        # 날씨/강수확률 데이터 (wf3Am~10Am, rnSt3Am~10Am 등)
+                        if land_data:
+                            # 3~7일: AM/PM 구분, 8~10일: 하루 단위
+                            if day_offset <= 7:
+                                wf_key = f'wf{day_offset}Am'  # AM 기준
+                                rn_key_am = f'rnSt{day_offset}Am'
+                                rn_key_pm = f'rnSt{day_offset}Pm'
+                                # 강수확률: AM/PM 중 높은 값
+                                rn_am = land_data.get(rn_key_am)
+                                rn_pm = land_data.get(rn_key_pm)
+                                if rn_am is not None or rn_pm is not None:
+                                    rn_am = int(rn_am) if rn_am is not None else 0
+                                    rn_pm = int(rn_pm) if rn_pm is not None else 0
+                                    record['RAIN_PROB'] = max(rn_am, rn_pm)
+                            else:
+                                wf_key = f'wf{day_offset}'
+                                rn_key = f'rnSt{day_offset}'
+                                record['RAIN_PROB'] = land_data.get(rn_key)
+
+                            # 날씨상태 파싱
+                            wf_value = land_data.get(wf_key, '')
+                            weather_cd, weather_nm = self._parse_mid_weather(wf_value)
+                            record['WEATHER_CD'] = weather_cd
+                            record['WEATHER_NM'] = weather_nm
+                            record['SKY_CD'] = self._weather_cd_to_sky_cd(weather_cd)
+
+                        all_daily.append(record)
+
+                self.logger.debug(f"중기예보 처리: ta={ta_reg_id}, land={land_reg_id}, 격자 {len(grid_list)}개")
+
+            except Exception as e:
+                self.logger.error(f"중기예보 수집 오류 ({ta_reg_id}, {land_reg_id}): {e}")
+                failed_reg_ids.append((ta_reg_id, land_reg_id))
+                continue
+
+        is_complete = len(failed_reg_ids) == 0 and not api_limit_reached
+
+        self.logger.info(f"중기예보 수집 완료: 일별 {len(all_daily)}건")
+        if not is_complete:
+            self.logger.warning(f"⚠️ 중기예보 수집 미완료: 실패 {len(failed_reg_ids)}개 지역")
+
+        return {
+            'daily': all_daily,
+            'is_complete': is_complete,
+        }
+
+    def _parse_mid_weather(self, wf_value: str) -> Tuple[str, str]:
+        """중기예보 날씨상태 문자열 파싱
+
+        Args:
+            wf_value: 날씨상태 (예: '맑음', '구름많음', '흐리고 비', '흐림')
+
+        Returns:
+            (weather_cd, weather_nm) 튜플
+        """
+        if not wf_value:
+            return ('cloudy', '구름많음')
+
+        wf_lower = wf_value.strip()
+
+        # 강수형태 우선 체크
+        if '비' in wf_lower and '눈' in wf_lower:
+            return ('rain_snow', '비/눈')
+        elif '눈' in wf_lower:
+            return ('snow', '눈')
+        elif '비' in wf_lower or '소나기' in wf_lower:
+            return ('rainy', '비')
+
+        # 하늘상태
+        if '맑음' in wf_lower:
+            return ('sunny', '맑음')
+        elif '구름많음' in wf_lower or '구름 많음' in wf_lower:
+            return ('cloudy', '구름많음')
+        elif '흐림' in wf_lower or '흐리고' in wf_lower:
+            return ('overcast', '흐림')
+
+        return ('cloudy', '구름많음')
+
+    def _weather_cd_to_sky_cd(self, weather_cd: str) -> str:
+        """weather_cd를 SKY 코드로 변환
+
+        Args:
+            weather_cd: 날씨코드 (sunny, cloudy, overcast, rainy, snow 등)
+
+        Returns:
+            SKY 코드 (1: 맑음, 3: 구름많음, 4: 흐림)
+        """
+        mapping = {
+            'sunny': '1',
+            'cloudy': '3',
+            'overcast': '4',
+            'rainy': '4',
+            'rain_snow': '4',
+            'snow': '4',
+            'shower': '4',
+        }
+        return mapping.get(weather_cd, '3')
+
+    def save_mid_forecast(self, data: Dict[str, List[Dict]]) -> int:
+        """중기예보 데이터 저장 (TM_WEATHER)
+
+        Args:
+            data: {'daily': [...], 'is_complete': bool}
+
+        Returns:
+            저장 건수
+        """
+        is_complete = data.get('is_complete', True)
+        if not is_complete:
+            self.logger.warning("⚠️ 중기예보 저장 스킵: 수집 미완료")
+            return 0
+
+        daily_data = data.get('daily', [])
+        if not daily_data:
+            return 0
+
+        return self._save_daily(daily_data)
 
 
 def update_farm_weather_grid(db: Database):
