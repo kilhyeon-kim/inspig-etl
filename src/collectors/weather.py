@@ -2155,6 +2155,11 @@ class WeatherCollector(BaseCollector):
                             record['WEATHER_NM'] = weather_nm
                             record['SKY_CD'] = self._weather_cd_to_sky_cd(weather_cd)
 
+                        # 기온 데이터가 없는 날짜는 스킵 (단기예보 데이터 유지)
+                        if record.get('TEMP_LOW') is None and record.get('TEMP_HIGH') is None:
+                            self.logger.debug(f"중기예보 스킵: {wk_date} ({nx},{ny}) - 기온 데이터 없음")
+                            continue
+
                         all_daily.append(record)
 
                 self.logger.debug(f"중기예보 처리: ta={ta_reg_id}, land={land_reg_id}, 격자 {len(grid_list)}개")
@@ -2230,6 +2235,8 @@ class WeatherCollector(BaseCollector):
     def save_mid_forecast(self, data: Dict[str, List[Dict]]) -> int:
         """중기예보 데이터 저장 (TM_WEATHER)
 
+        단기예보 데이터가 없는 날짜에만 INSERT (기존 데이터 덮어쓰기 안함)
+
         Args:
             data: {'daily': [...], 'is_complete': bool}
 
@@ -2245,7 +2252,46 @@ class WeatherCollector(BaseCollector):
         if not daily_data:
             return 0
 
-        return self._save_daily(daily_data)
+        return self._save_mid_daily(daily_data)
+
+    def _save_mid_daily(self, data: List[Dict]) -> int:
+        """중기예보 일별 저장 (INSERT only, 기존 데이터 없는 경우만)
+
+        단기예보 데이터가 있는 날짜는 스킵하여 덮어쓰기 방지
+        """
+        if not data:
+            return 0
+
+        # SQL에서 사용하는 필드만 추출 (cx_Oracle executemany 호환)
+        required_fields = ['NX', 'NY', 'WK_DATE', 'TEMP_AVG', 'TEMP_HIGH', 'TEMP_LOW',
+                          'RAIN_PROB', 'WEATHER_CD', 'WEATHER_NM', 'SKY_CD', 'IS_FORECAST']
+        filtered_data = [{k: row.get(k) for k in required_fields} for row in data]
+
+        # 기존 데이터가 없는 경우에만 INSERT (MERGE의 WHEN NOT MATCHED만 사용)
+        sql = """
+            MERGE INTO TM_WEATHER TGT
+            USING (
+                SELECT :NX AS NX, :NY AS NY, :WK_DATE AS WK_DATE FROM DUAL
+            ) SRC
+            ON (TGT.NX = SRC.NX AND TGT.NY = SRC.NY AND TGT.WK_DATE = SRC.WK_DATE)
+            WHEN NOT MATCHED THEN
+                INSERT (SEQ, WK_DATE, NX, NY, TEMP_AVG, TEMP_HIGH, TEMP_LOW,
+                        RAIN_PROB, WEATHER_CD, WEATHER_NM, SKY_CD,
+                        FCST_DT, IS_FORECAST, LOG_INS_DT)
+                VALUES (SEQ_TM_WEATHER.NEXTVAL, :WK_DATE, :NX, :NY, :TEMP_AVG, :TEMP_HIGH, :TEMP_LOW,
+                        :RAIN_PROB, :WEATHER_CD, :WEATHER_NM, :SKY_CD,
+                        SYSDATE, :IS_FORECAST, SYSDATE)
+        """
+
+        try:
+            self.db.execute_many(sql, filtered_data)
+            self.db.commit()
+            self.logger.info(f"TM_WEATHER(중기): {len(data)}건 저장 시도 (기존 데이터 제외)")
+            return len(data)
+        except Exception as e:
+            self.logger.error(f"TM_WEATHER(중기) 저장 실패: {e}")
+            self.db.rollback()
+            raise
 
 
 def update_farm_weather_grid(db: Database):
