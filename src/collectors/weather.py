@@ -871,6 +871,13 @@ class WeatherCollector(BaseCollector):
         for wk_date, day in daily_data.items():
             # 평균 기온 계산
             temp_list = day.get('TMP_list', [])
+
+            # 시간별 데이터가 2개 미만이면 불완전한 데이터로 간주하여 스킵
+            # (단기예보 경계일에 1개 시간대만 있는 경우 min=max가 되어 부정확)
+            if len(temp_list) < 2:
+                self.logger.debug(f"단기예보 스킵: {wk_date} - 시간별 데이터 부족 ({len(temp_list)}개)")
+                continue
+
             temp_avg = sum(temp_list) / len(temp_list) if temp_list else None
 
             # 최저/최고 기온: 항상 시간별 예보(TMP_list)의 min/max 사용 (네이버 방식)
