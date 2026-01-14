@@ -22,6 +22,7 @@ ASOS 관측소:
 import logging
 import math
 import requests
+from collections import Counter
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -378,6 +379,17 @@ class WeatherCollector(BaseCollector):
         '2': ('rain_snow', '비/눈'),
         '3': ('snow', '눈'),
         '4': ('shower', '소나기'),
+    }
+
+    # 날씨 코드 → 이름 매핑 (역방향 조회용)
+    WEATHER_NAMES = {
+        'sunny': '맑음',
+        'cloudy': '구름많음',
+        'overcast': '흐림',
+        'rainy': '비',
+        'rain_snow': '비/눈',
+        'snow': '눈',
+        'shower': '소나기',
     }
 
     def __init__(self, config: Optional[Config] = None, db: Optional[Database] = None):
@@ -763,6 +775,7 @@ class WeatherCollector(BaseCollector):
                     'TMX': None,
                     'SKY_CD': None,
                     'PTY_CD': None,
+                    'WEATHER_LIST': [],  # 시간별 날씨코드 목록 (대표 날씨 결정용)
                 }
 
             day = daily_data[fcst_date]
@@ -855,7 +868,28 @@ class WeatherCollector(BaseCollector):
             elif category == 'PTY':
                 existing['PTY_CD'] = value
 
+        # 시간별 데이터에서 날씨 코드 목록 수집 (일별 대표 날씨 결정용)
+        for h in hourly_data:
+            fcst_date = h.get('WK_DATE')
+            if fcst_date not in daily_data:
+                continue
+
+            pty_cd = h.get('PTY_CD', '0')
+            sky_cd = h.get('SKY_CD', '1')
+
+            # PTY > SKY 우선순위로 날씨 코드 결정
+            if pty_cd and pty_cd != '0':
+                weather_cd, _ = self.PTY_CODES.get(pty_cd, ('unknown', '알수없음'))
+            else:
+                weather_cd, _ = self.SKY_CODES.get(sky_cd, ('unknown', '알수없음'))
+
+            daily_data[fcst_date]['WEATHER_LIST'].append(weather_cd)
+
         return daily_data, hourly_data
+
+    def _get_weather_name(self, weather_cd: str) -> str:
+        """날씨 코드에서 이름 조회"""
+        return self.WEATHER_NAMES.get(weather_cd, '알수없음')
 
     def _finalize_daily_data(self, daily_data: Dict) -> List[Dict]:
         """일별 데이터 최종 가공
@@ -865,11 +899,24 @@ class WeatherCollector(BaseCollector):
 
         Returns:
             TM_WEATHER 레코드 리스트
+
+        Note:
+            API는 현재 시점 이후의 예보만 반환하므로,
+            오늘 날짜의 경우 DB에 저장된 이전 시간대 데이터와 병합하여
+            min/max를 정확하게 계산합니다.
         """
         result = []
 
+        # 오늘 날짜 (KST)
+        today_str = now_kst().strftime('%Y%m%d')
+
         for wk_date, day in daily_data.items():
-            # 평균 기온 계산
+            nx = day['NX']
+            ny = day['NY']
+
+            # API에서 받은 시간별 기온 목록
+            # Note: 오늘 날짜의 min/max는 _save_daily_today_aggregated()에서
+            # TM_WEATHER_HOURLY DB 집계로 계산 (저장 시점에 정확한 값 사용)
             temp_list = day.get('TMP_list', [])
 
             # 시간별 데이터가 2개 미만이면 불완전한 데이터로 간주하여 스킵
@@ -880,19 +927,28 @@ class WeatherCollector(BaseCollector):
 
             temp_avg = sum(temp_list) / len(temp_list) if temp_list else None
 
-            # 최저/최고 기온: 항상 시간별 예보(TMP_list)의 min/max 사용 (네이버 방식)
+            # 최저/최고 기온: 시간별 예보(TMP_list)의 min/max 사용 (네이버 방식)
             # 기상청 TMN/TMX는 특정 시간대 기준(03~09시/09~18시)이라 전체 min/max와 다를 수 있음
             temp_high = max(temp_list) if temp_list else None
             temp_low = min(temp_list) if temp_list else None
 
-            # 날씨 코드 결정 (강수형태 > 하늘상태)
-            pty_cd = day.get('PTY_CD', '0')
+            # 날씨 코드 결정: 시간별 데이터에서 가장 빈번한 날씨를 대표로 사용
+            # (기존: 강수형태가 있으면 무조건 비/눈 → 1시간만 비여도 하루종일 비 표시)
+            weather_list = day.get('WEATHER_LIST', [])
             sky_cd = day.get('SKY_CD', '1')
 
-            if pty_cd and pty_cd != '0':
-                weather_cd, weather_nm = self.PTY_CODES.get(pty_cd, ('unknown', '알수없음'))
+            if weather_list:
+                # 빈도 계산
+                weather_counts = Counter(weather_list)
+                weather_cd = weather_counts.most_common(1)[0][0]
+                weather_nm = self._get_weather_name(weather_cd)
             else:
-                weather_cd, weather_nm = self.SKY_CODES.get(sky_cd, ('unknown', '알수없음'))
+                # fallback: 기존 방식
+                pty_cd = day.get('PTY_CD', '0')
+                if pty_cd and pty_cd != '0':
+                    weather_cd, weather_nm = self.PTY_CODES.get(pty_cd, ('unknown', '알수없음'))
+                else:
+                    weather_cd, weather_nm = self.SKY_CODES.get(sky_cd, ('unknown', '알수없음'))
 
             result.append({
                 'WK_DATE': wk_date,
@@ -993,12 +1049,15 @@ class WeatherCollector(BaseCollector):
                 record['PTY_CD'] = str(value)
 
         # 날씨 코드 결정
-        pty_cd = record.get('PTY_CD', '0')
-        sky_cd = record.get('SKY_CD', '1')
-        if pty_cd and pty_cd != '0':
+        # 초단기실황은 SKY(하늘상태) 없이 PTY(강수형태)만 제공
+        # PTY=0(강수없음)이면 맑음으로 처리
+        pty_cd = record.get('PTY_CD', '0') or '0'
+        sky_cd = record.get('SKY_CD') or '1'  # NULL이면 맑음(1)
+
+        if pty_cd != '0':
             record['WEATHER_CD'], record['WEATHER_NM'] = self.PTY_CODES.get(pty_cd, ('unknown', '알수없음'))
         else:
-            record['WEATHER_CD'], record['WEATHER_NM'] = self.SKY_CODES.get(sky_cd, ('unknown', '알수없음'))
+            record['WEATHER_CD'], record['WEATHER_NM'] = self.SKY_CODES.get(sky_cd, ('sunny', '맑음'))
 
         return record
 
@@ -1604,8 +1663,14 @@ class WeatherCollector(BaseCollector):
         hourly_data = data.get('hourly', [])
         ncst_data = data.get('ncst', [])
 
-        daily_count = self._save_daily(daily_data)
+        # [1] 시간별 데이터 먼저 저장 (TM_WEATHER_HOURLY)
         hourly_count = self._save_hourly(hourly_data)
+
+        # [2] 일별 데이터 저장 - DB 집계로 min/max 계산 (오늘 날짜만)
+        #     시간별 데이터가 먼저 저장되어야 정확한 집계 가능
+        daily_count = self._save_daily_with_aggregation(daily_data)
+
+        # [3] 초단기실황 저장
         ncst_count = self._save_ncst(ncst_data)
 
         return {
@@ -1665,6 +1730,83 @@ class WeatherCollector(BaseCollector):
             self.logger.error(f"TM_WEATHER 저장 실패: {e}")
             self.db.rollback()
             raise
+
+    def _save_daily_with_aggregation(self, data: List[Dict]) -> int:
+        """일별 날씨 저장 - DB 집계로 오늘 min/max 계산
+
+        단기예보는 현재 시점 이후 데이터만 반환하므로,
+        오늘 날짜의 경우 TM_WEATHER_HOURLY에서 전체 시간대를 집계하여
+        정확한 min/max를 계산합니다.
+
+        흐름:
+          1. 오늘 날짜: DB 집계 쿼리로 min/max 계산 후 MERGE
+          2. 미래 날짜: API 응답 데이터 그대로 MERGE
+        """
+        if not data:
+            return 0
+
+        today_str = now_kst().strftime('%Y%m%d')
+        today_records = []
+        future_records = []
+
+        for row in data:
+            if row.get('WK_DATE') == today_str:
+                today_records.append(row)
+            else:
+                future_records.append(row)
+
+        saved_count = 0
+
+        # [1] 오늘 날짜: DB 집계로 min/max 계산
+        if today_records:
+            saved_count += self._save_daily_today_aggregated(today_records)
+
+        # [2] 미래 날짜: API 응답 그대로 저장
+        if future_records:
+            saved_count += self._save_daily(future_records)
+
+        return saved_count
+
+    def _save_daily_today_aggregated(self, data: List[Dict]) -> int:
+        """오늘 날짜 일별 저장 - TM_WEATHER_HOURLY 집계 기반
+
+        TM_WEATHER_HOURLY에서 해당 격자의 전체 시간대 데이터를 집계하여
+        정확한 TEMP_LOW, TEMP_HIGH, TEMP_AVG를 계산합니다.
+        """
+        if not data:
+            return 0
+
+        today_str = now_kst().strftime('%Y%m%d')
+        updated_data = []
+
+        for row in data:
+            nx = row.get('NX')
+            ny = row.get('NY')
+
+            # DB에서 오늘 전체 시간대 집계
+            agg_sql = """
+                SELECT MIN(TEMP) AS TEMP_LOW,
+                       MAX(TEMP) AS TEMP_HIGH,
+                       ROUND(AVG(TEMP), 1) AS TEMP_AVG
+                FROM TM_WEATHER_HOURLY
+                WHERE NX = :NX AND NY = :NY AND WK_DATE = :WK_DATE
+                  AND TEMP IS NOT NULL
+            """
+            agg_result = self.db.fetch_dict(agg_sql, {'NX': nx, 'NY': ny, 'WK_DATE': today_str})
+
+            if agg_result and agg_result[0].get('TEMP_LOW') is not None:
+                # DB 집계 결과로 덮어쓰기
+                row['TEMP_LOW'] = agg_result[0]['TEMP_LOW']
+                row['TEMP_HIGH'] = agg_result[0]['TEMP_HIGH']
+                row['TEMP_AVG'] = agg_result[0]['TEMP_AVG']
+                self.logger.debug(
+                    f"오늘 {today_str} ({nx},{ny}): DB 집계 {row['TEMP_LOW']}~{row['TEMP_HIGH']}도"
+                )
+
+            updated_data.append(row)
+
+        # 기존 _save_daily 로직으로 저장
+        return self._save_daily(updated_data)
 
     def _save_hourly(self, data: List[Dict]) -> int:
         """시간별 날씨 저장 (TM_WEATHER_HOURLY) - 예보 데이터"""
