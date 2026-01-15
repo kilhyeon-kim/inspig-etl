@@ -18,7 +18,12 @@ SP_INS_WEEK_SCHEDULE_POPUP 프로시저 Python 전환
 - 150002: 분만예정 (임신돈)
 - 150003: 이유예정 (포유돈+대리모돈)
 - 150004: 백신예정 (전체)
+
+TS_INS_CONF 설정 지원:
+- method='farm': 농장 기본값 사용 (TC_FARM_CONFIG)
+- method='modon': 모돈 작업설정 사용 (TB_PLAN_MODON), tasks에 선택된 SEQ만 필터링
 """
+import json
 import logging
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
@@ -52,35 +57,38 @@ class ScheduleProcessor(BaseProcessor):
         # 1. 농장 설정값 조회 (CONFIG에서)
         config = self._get_config()
 
-        # 2. 기존 데이터 삭제
+        # 2. TS_INS_CONF 설정 조회 (금주 작업예정 산정방식)
+        ins_conf = self._get_ins_conf()
+
+        # 3. 기존 데이터 삭제
         self._delete_existing()
 
-        # 3. 요일별 날짜 배열 생성
+        # 4. 요일별 날짜 배열 생성
         dt_from_obj = datetime.strptime(dt_from, '%Y%m%d')
         dates = [dt_from_obj + timedelta(days=i) for i in range(7)]
 
-        # 4. FN_MD_SCHEDULE_BSE_2020 호출하여 예정 데이터 집계
-        schedule_counts = self._get_schedule_counts(v_sdt, v_edt, dates)
+        # 5. 예정 데이터 집계 (ins_conf 설정에 따라 farm/modon 분기)
+        schedule_counts = self._get_schedule_counts(v_sdt, v_edt, dates, ins_conf, config)
 
-        # 5. 재발확인 (3주/4주) 집계
-        imsin_counts = self._get_imsin_check_counts(dt_from_obj, dates)
+        # 6. 재발확인 (3주/4주) 집계 - ins_conf['pregnancy'] 설정에 따라 farm/modon 분기
+        imsin_counts = self._get_imsin_check_counts(v_sdt, v_edt, dt_from_obj, dates, ins_conf)
 
-        # 6. 출하예정 계산
+        # 7. 출하예정 계산
         ship_sum = self._get_ship_schedule(dt_from_obj, dates, config)
 
-        # 7. 요약 INSERT (SUB_GUBUN='-')
+        # 8. 요약 INSERT (SUB_GUBUN='-')
         stats = self._insert_summary(schedule_counts, imsin_counts, ship_sum, dt_from_obj)
 
-        # 8. 캘린더 그리드 INSERT (SUB_GUBUN='CAL')
+        # 9. 캘린더 그리드 INSERT (SUB_GUBUN='CAL')
         self._insert_calendar(schedule_counts, imsin_counts, dates)
 
-        # 9. 팝업 상세 INSERT (SUB_GUBUN='GB/BM/EU/VACCINE')
-        self._insert_popup_details(v_sdt, v_edt, dt_from_obj)
+        # 10. 팝업 상세 INSERT (SUB_GUBUN='GB/BM/EU/VACCINE')
+        self._insert_popup_details(v_sdt, v_edt, dt_from_obj, ins_conf)
 
-        # 10. HELP 정보 INSERT (SUB_GUBUN='HELP')
-        self._insert_help_info(config, dt_from_obj)
+        # 11. HELP 정보 INSERT (SUB_GUBUN='HELP')
+        self._insert_help_info(config, dt_from_obj, ins_conf)
 
-        # 11. TS_INS_WEEK 업데이트
+        # 12. TS_INS_WEEK 업데이트
         self._update_week(stats)
 
         self.logger.info(f"금주 예정 팝업 완료: 농장={self.farm_no}")
@@ -124,6 +132,80 @@ class ScheduleProcessor(BaseProcessor):
             'rate_to': '',
         }
 
+    def _get_ins_conf(self) -> Dict[str, Dict[str, Any]]:
+        """TS_INS_CONF에서 금주 작업예정 산정방식 설정 조회
+
+        Returns:
+            {
+                'mating': {'method': 'farm'|'modon', 'tasks': [], 'seq_filter': '-1'},
+                'farrowing': {...},
+                'pregnancy': {...},
+                'weaning': {...},
+                'vaccine': {...}
+            }
+        """
+        # 기본값: 교배/분만/이유/백신은 modon(전체), 임신감정은 farm
+        # seq_filter: ''=작업없음(0개), '1,2,3'=선택된 작업
+        default_conf = {
+            'mating': {'method': 'modon', 'tasks': None, 'seq_filter': ''},
+            'farrowing': {'method': 'modon', 'tasks': None, 'seq_filter': ''},
+            'pregnancy': {'method': 'farm', 'tasks': None, 'seq_filter': ''},
+            'weaning': {'method': 'modon', 'tasks': None, 'seq_filter': ''},
+            'vaccine': {'method': 'modon', 'tasks': None, 'seq_filter': ''},
+        }
+
+        sql = """
+        SELECT WEEK_TW_GY, WEEK_TW_BM, WEEK_TW_IM, WEEK_TW_EU, WEEK_TW_VC
+        FROM TS_INS_CONF
+        WHERE FARM_NO = :farm_no
+        """
+        result = self.fetch_one(sql, {'farm_no': self.farm_no})
+
+        if not result:
+            self.logger.info(f"TS_INS_CONF 설정 없음, 기본값 사용: farm_no={self.farm_no}")
+            return default_conf
+
+        # 컬럼 매핑: (인덱스, 키)
+        col_map = [
+            (0, 'mating'),      # WEEK_TW_GY
+            (1, 'farrowing'),   # WEEK_TW_BM
+            (2, 'pregnancy'),   # WEEK_TW_IM
+            (3, 'weaning'),     # WEEK_TW_EU
+            (4, 'vaccine'),     # WEEK_TW_VC
+        ]
+
+        for idx, key in col_map:
+            json_str = result[idx]
+            if json_str:
+                try:
+                    parsed = json.loads(json_str)
+                    method = parsed.get('method', 'modon')
+                    # tasks 키 존재 여부 확인: 키가 없으면 None, 있으면 값 (빈 배열 포함)
+                    tasks = parsed.get('tasks') if 'tasks' in parsed else None
+
+                    # tasks를 seq_filter 문자열로 변환
+                    # - tasks 키 없음(None) → '' (JSON 오류, 작업 없음)
+                    # - tasks=[] (빈 배열) → '' (작업 없음, 카운트 0)
+                    # - tasks=[1,2,3] → '1,2,3' (선택된 작업)
+                    if method == 'modon':
+                        if tasks is None or len(tasks) == 0:
+                            seq_filter = ''  # 작업 없음 (카운트 0)
+                        else:
+                            seq_filter = ','.join(str(t) for t in tasks)  # 선택된 작업
+                    else:
+                        seq_filter = '-1'  # farm 모드에서는 사용 안함
+
+                    default_conf[key] = {
+                        'method': method,
+                        'tasks': tasks,
+                        'seq_filter': seq_filter,
+                    }
+                except json.JSONDecodeError:
+                    self.logger.warning(f"JSON 파싱 실패: {key}={json_str}")
+
+        self.logger.info(f"TS_INS_CONF 설정 로드: farm_no={self.farm_no}, conf={default_conf}")
+        return default_conf
+
     def _delete_existing(self) -> None:
         """기존 SCHEDULE 데이터 삭제"""
         sql = """
@@ -132,8 +214,16 @@ class ScheduleProcessor(BaseProcessor):
         """
         self.execute(sql, {'master_seq': self.master_seq, 'farm_no': self.farm_no})
 
-    def _get_schedule_counts(self, v_sdt: str, v_edt: str, dates: List[datetime]) -> Dict[str, Dict]:
-        """FN_MD_SCHEDULE_BSE_2020 호출하여 예정 집계
+    def _get_schedule_counts(self, v_sdt: str, v_edt: str, dates: List[datetime],
+                              ins_conf: Dict[str, Dict[str, Any]], config: Dict[str, Any]) -> Dict[str, Dict]:
+        """예정 집계 (TS_INS_CONF 설정에 따라 분기)
+
+        Args:
+            v_sdt: 시작일 (yyyy-MM-dd)
+            v_edt: 종료일 (yyyy-MM-dd)
+            dates: 요일별 날짜 리스트
+            ins_conf: TS_INS_CONF 설정 (method, tasks, seq_filter)
+            config: 농장 설정값 (preg_period, wean_period 등)
 
         Returns:
             {
@@ -150,25 +240,97 @@ class ScheduleProcessor(BaseProcessor):
             'vaccine': {'sum': 0, 'daily': [0] * 7},
         }
 
-        # 교배예정 (150005) - Oracle과 동일: 기간 이전 데이터는 첫째 날에 합산
-        self._count_schedule('150005', None, v_sdt, v_edt, dates, result['gb'], add_early_to_first=True)
+        # 농장 기본값이 필요한지 확인
+        need_farm_config = (
+            ins_conf['mating']['method'] == 'farm' or
+            ins_conf['farrowing']['method'] == 'farm' or
+            ins_conf['weaning']['method'] == 'farm'
+        )
+
+        # TC_FARM_CONFIG 한 번만 조회 (농장 기본값이 필요한 경우만)
+        farm_config = None
+        if need_farm_config:
+            farm_config = self._get_farm_config_for_schedule()
+
+        # 교배예정 (150005)
+        if ins_conf['mating']['method'] == 'farm':
+            self._count_schedule_by_farm('mating', dates, result['gb'], config, farm_config, add_early_to_first=True)
+        else:
+            seq_filter = ins_conf['mating']['seq_filter']
+            self._count_schedule('150005', None, v_sdt, v_edt, dates, result['gb'],
+                                 seq_filter=seq_filter, add_early_to_first=True)
 
         # 분만예정 (150002)
-        self._count_schedule('150002', None, v_sdt, v_edt, dates, result['bm'])
+        if ins_conf['farrowing']['method'] == 'farm':
+            self._count_schedule_by_farm('farrowing', dates, result['bm'], config, farm_config)
+        else:
+            seq_filter = ins_conf['farrowing']['seq_filter']
+            self._count_schedule('150002', None, v_sdt, v_edt, dates, result['bm'], seq_filter=seq_filter)
 
         # 이유예정 (150003) - 포유돈 + 대리모돈
-        self._count_schedule('150003', '010003', v_sdt, v_edt, dates, result['eu'])
-        self._count_schedule('150003', '010004', v_sdt, v_edt, dates, result['eu'])
+        if ins_conf['weaning']['method'] == 'farm':
+            self._count_schedule_by_farm('weaning', dates, result['eu'], config, farm_config)
+        else:
+            seq_filter = ins_conf['weaning']['seq_filter']
+            self._count_schedule('150003', '010003', v_sdt, v_edt, dates, result['eu'], seq_filter=seq_filter)
+            self._count_schedule('150003', '010004', v_sdt, v_edt, dates, result['eu'], seq_filter=seq_filter)
 
-        # 백신예정 (150004)
-        self._count_schedule('150004', None, v_sdt, v_edt, dates, result['vaccine'])
+        # 백신예정 (150004) - 항상 modon (농장기본값 옵션 없음)
+        seq_filter = ins_conf['vaccine']['seq_filter']
+        self._count_schedule('150004', None, v_sdt, v_edt, dates, result['vaccine'], seq_filter=seq_filter)
 
         return result
 
+    def _get_farm_config_for_schedule(self) -> Dict[str, int]:
+        """TC_FARM_CONFIG에서 금주 예정 계산에 필요한 설정값 조회 (1회 호출)
+
+        Returns:
+            {
+                'avg_return_day': 평균재귀일 (901003, 기본 7일),
+                'first_mating_age': 초교배일령 (901007, 기본 240일),
+                'preg_period': 평균임신기간 (901001, 기본 115일),
+                'wean_period': 평균포유기간 (901002, 기본 21일)
+            }
+        """
+        sql = """
+        SELECT CODE, TO_NUMBER(NVL(CVALUE, DECODE(CODE, '901001', '115', '901002', '21', '901003', '7', '901007', '240')))
+        FROM TC_FARM_CONFIG
+        WHERE FARM_NO = :farm_no AND CODE IN ('901001', '901002', '901003', '901007')
+        """
+        cursor = self.conn.cursor()
+        try:
+            cursor.execute(sql, {'farm_no': self.farm_no})
+            rows = cursor.fetchall()
+
+            # 기본값 설정
+            config = {
+                'avg_return_day': 7,       # 901003
+                'first_mating_age': 240,   # 901007
+                'preg_period': 115,        # 901001
+                'wean_period': 21,         # 901002
+            }
+
+            # 조회 결과로 업데이트
+            code_map = {
+                '901001': 'preg_period',
+                '901002': 'wean_period',
+                '901003': 'avg_return_day',
+                '901007': 'first_mating_age',
+            }
+            for code, value in rows:
+                if code in code_map:
+                    config[code_map[code]] = int(value) if value else config[code_map[code]]
+
+            self.logger.info(f"TC_FARM_CONFIG 조회: farm_no={self.farm_no}, config={config}")
+            return config
+        finally:
+            cursor.close()
+
     def _count_schedule(self, job_gubun_cd: str, status_cd: Optional[str],
                         v_sdt: str, v_edt: str, dates: List[datetime],
-                        count_dict: Dict, add_early_to_first: bool = False) -> None:
-        """FN_MD_SCHEDULE_BSE_2020 호출하여 카운트
+                        count_dict: Dict, seq_filter: str = '-1',
+                        add_early_to_first: bool = False) -> None:
+        """FN_MD_SCHEDULE_BSE_2020 호출하여 카운트 (모돈 작업설정 기준)
 
         Args:
             job_gubun_cd: 작업구분코드
@@ -177,13 +339,19 @@ class ScheduleProcessor(BaseProcessor):
             v_edt: 종료일 (yyyy-MM-dd)
             dates: 요일별 날짜 리스트
             count_dict: 카운트 저장 딕셔너리
+            seq_filter: TB_PLAN_MODON.SEQ 필터 ('-1'=전체, ''=작업없음, '1,2,3'=선택)
             add_early_to_first: True면 기간 이전 데이터를 첫째 날에 합산 (교배예정만 해당)
         """
+        # seq_filter가 빈 문자열이면 선택된 작업이 없으므로 카운트 0
+        if seq_filter == '':
+            self.logger.info(f"작업 없음 (seq_filter=''), 카운트 생략: {job_gubun_cd}")
+            return
+
         sql = """
         SELECT TO_DATE(PASS_DT, 'YYYY-MM-DD') AS SCH_DT
         FROM TABLE(FN_MD_SCHEDULE_BSE_2020(
             :farm_no, 'JOB-DAJANG', :job_gubun_cd, :status_cd,
-            :v_sdt, :v_edt, NULL, 'ko', 'yyyy-MM-dd', '-1', NULL
+            :v_sdt, :v_edt, NULL, 'ko', 'yyyy-MM-dd', :seq_filter, NULL
         ))
         """
         cursor = self.conn.cursor()
@@ -194,6 +362,7 @@ class ScheduleProcessor(BaseProcessor):
                 'status_cd': status_cd,
                 'v_sdt': v_sdt,
                 'v_edt': v_edt,
+                'seq_filter': seq_filter,
             })
 
             for row in cursor.fetchall():
@@ -212,63 +381,308 @@ class ScheduleProcessor(BaseProcessor):
         finally:
             cursor.close()
 
-    def _get_imsin_check_counts(self, dt_from: datetime, dates: List[datetime]) -> Dict[str, Dict]:
+    def _count_schedule_by_farm(self, schedule_type: str, dates: List[datetime],
+                                 count_dict: Dict, config: Dict[str, Any],
+                                 farm_config: Dict[str, int],
+                                 add_early_to_first: bool = False) -> None:
+        """농장 기본값 기준으로 예정 카운트
+
+        TC_FARM_CONFIG 설정값을 사용하여 예정일 계산:
+        - 교배예정: 이유일 + 평균재귀일 (기본 7일)
+        - 분만예정: 교배일 + 평균임신기간 (기본 115일)
+        - 이유예정: 분만일 + 평균포유기간 (기본 21일)
+
+        Args:
+            schedule_type: 'mating', 'farrowing', 'weaning'
+            dates: 요일별 날짜 리스트
+            count_dict: 카운트 저장 딕셔너리
+            farm_config: TC_FARM_CONFIG 설정값 (avg_return_day, first_mating_age, preg_period, wean_period)
+            config: 농장 설정값
+            add_early_to_first: True면 기간 이전 데이터를 첫째 날에 합산
+        """
+        dt_from = dates[0]
+        dt_to = dates[6]
+
+        if schedule_type == 'mating':
+            # 교배예정: 이유돈/후보돈/재발돈/유산돈 중 예정일이 금주인 모돈
+            # TB_MODON_WK 마지막 작업은 금주 월요일(dt_from) 이전 데이터만 조회
+            # OUT_DT >= dt_from: 금주 월요일 이전까지 살아있던 모돈 (금주에 도폐사되어도 포함)
+            # 이유돈: 이유일 + 평균재귀일 (TC_FARM_CONFIG.901003, 기본 7일), DAERI_YN='N'만
+            # 후보돈: 생년월일(BIRTH_DT) + 초교배일령 (TC_FARM_CONFIG.901007, 기본 240일)
+            # 재발/유산돈: 사고일 + 1일 (피그플랜과 동일, 즉시 교배 가능)
+            # 성능: TC_FARM_CONFIG 사전 조회, WHERE 조건 컬럼 가공 없음 (인덱스 활용)
+            sql = """
+            WITH LAST_WK AS (
+                -- 금주 월요일 이전 마지막 작업 (금주 마침일까지 살아있는 모돈만 대상)
+                SELECT WK.FARM_NO, WK.PIG_NO, WK.WK_DT, WK.WK_GUBUN, WK.DAERI_YN
+                FROM (
+                    SELECT FARM_NO, PIG_NO, WK_DT, WK_GUBUN, DAERI_YN,
+                           ROW_NUMBER() OVER (PARTITION BY FARM_NO, PIG_NO ORDER BY SEQ DESC) AS RN
+                    FROM TB_MODON_WK
+                    WHERE FARM_NO = :farm_no
+                      AND USE_YN = 'Y'
+                      AND WK_DT < TO_CHAR(:dt_from, 'YYYYMMDD')
+                      AND PIG_NO IN (
+                          SELECT PIG_NO FROM TB_MODON
+                          WHERE FARM_NO = :farm_no AND USE_YN = 'Y' AND OUT_DT > :dt_to
+                      )
+                ) WK
+                WHERE WK.RN = 1
+            )
+            SELECT PASS_DT
+            FROM (
+                -- 1. 이유돈: 마지막 작업이 이유(E), 대리모 아님(DAERI_YN='N')
+                SELECT MD.PIG_NO,
+                       TO_DATE(WK.WK_DT, 'YYYYMMDD') + :avg_return_day AS PASS_DT
+                FROM TB_MODON MD
+                INNER JOIN LAST_WK WK ON MD.FARM_NO = WK.FARM_NO AND MD.PIG_NO = WK.PIG_NO
+                WHERE MD.FARM_NO = :farm_no
+                  AND MD.USE_YN = 'Y'
+                  AND MD.OUT_DT > :dt_to
+                  AND WK.WK_GUBUN = 'E'
+                  AND WK.DAERI_YN = 'N'
+                  AND WK.WK_DT <= TO_CHAR(:dt_to - :avg_return_day, 'YYYYMMDD')
+                UNION ALL
+                -- 2. 이유돈: TB_MODON_WK 없고 STATUS_CD='010005' (이유상태)
+                SELECT MD.PIG_NO,
+                       MD.LAST_WK_DT + :avg_return_day AS PASS_DT
+                FROM TB_MODON MD
+                WHERE MD.FARM_NO = :farm_no
+                  AND MD.USE_YN = 'Y'
+                  AND MD.OUT_DT > :dt_to
+                  AND MD.STATUS_CD = '010005'
+                  AND MD.LAST_WK_DT IS NOT NULL
+                  AND MD.LAST_WK_DT <= :dt_to - :avg_return_day
+                  AND NOT EXISTS (
+                      SELECT /*+ HASH_AJ */ 1 FROM TB_MODON_WK WK
+                      WHERE WK.FARM_NO = :farm_no AND WK.PIG_NO = MD.PIG_NO
+                        AND WK.USE_YN = 'Y' AND WK.WK_DT < TO_CHAR(:dt_from, 'YYYYMMDD')
+                  )
+                UNION ALL
+                -- 3. 후보돈: TB_MODON_WK 없고 STATUS_CD='010001' (후보상태)
+                SELECT MD.PIG_NO,
+                       MD.BIRTH_DT + :first_mating_age AS PASS_DT
+                FROM TB_MODON MD
+                WHERE MD.FARM_NO = :farm_no
+                  AND MD.USE_YN = 'Y'
+                  AND MD.OUT_DT > :dt_to
+                  AND MD.STATUS_CD = '010001'
+                  AND MD.BIRTH_DT IS NOT NULL
+                  AND MD.BIRTH_DT <= :dt_to - :first_mating_age
+                  AND NOT EXISTS (
+                      SELECT /*+ HASH_AJ */ 1 FROM TB_MODON_WK WK
+                      WHERE WK.FARM_NO = :farm_no AND WK.PIG_NO = MD.PIG_NO
+                        AND WK.USE_YN = 'Y' AND WK.WK_DT < TO_CHAR(:dt_from, 'YYYYMMDD')
+                  )
+                UNION ALL
+                -- 4. 재발/유산돈: 마지막 작업이 사고(F)
+                SELECT MD.PIG_NO,
+                       TO_DATE(WK.WK_DT, 'YYYYMMDD') + 1 AS PASS_DT
+                FROM TB_MODON MD
+                INNER JOIN LAST_WK WK ON MD.FARM_NO = WK.FARM_NO AND MD.PIG_NO = WK.PIG_NO
+                WHERE MD.FARM_NO = :farm_no
+                  AND MD.USE_YN = 'Y'
+                  AND MD.OUT_DT > :dt_to
+                  AND WK.WK_GUBUN = 'F'
+                  AND WK.WK_DT <= TO_CHAR(:dt_to - 1, 'YYYYMMDD')
+                UNION ALL
+                -- 5. 재발/유산돈: TB_MODON_WK 없고 STATUS_CD IN ('010006', '010007')
+                SELECT MD.PIG_NO,
+                       MD.LAST_WK_DT + 1 AS PASS_DT
+                FROM TB_MODON MD
+                WHERE MD.FARM_NO = :farm_no
+                  AND MD.USE_YN = 'Y'
+                  AND MD.OUT_DT > :dt_to
+                  AND MD.STATUS_CD IN ('010006', '010007')
+                  AND MD.LAST_WK_DT IS NOT NULL
+                  AND MD.LAST_WK_DT <= :dt_to - 1
+                  AND NOT EXISTS (
+                      SELECT /*+ HASH_AJ */ 1 FROM TB_MODON_WK WK
+                      WHERE WK.FARM_NO = :farm_no AND WK.PIG_NO = MD.PIG_NO
+                        AND WK.USE_YN = 'Y' AND WK.WK_DT < TO_CHAR(:dt_from, 'YYYYMMDD')
+                  )
+            )
+            WHERE PASS_DT <= :dt_to
+            """
+        elif schedule_type == 'farrowing':
+            # 분만예정: 임신돈 중 교배일 + 평균임신기간 (파라미터: preg_period)
+            # 금주 범위(dt_from ~ dt_to)에 해당하는 분만예정만 조회
+            sql = """
+            SELECT PASS_DT
+            FROM (
+                SELECT TO_DATE(WK.WK_DT, 'YYYYMMDD') + :preg_period AS PASS_DT
+                FROM TB_MODON MD
+                INNER JOIN VM_LAST_MODON_SEQ_WK WK
+                    ON MD.FARM_NO = WK.FARM_NO AND MD.PIG_NO = WK.PIG_NO
+                WHERE MD.FARM_NO = :farm_no
+                  AND MD.USE_YN = 'Y'
+                  AND MD.OUT_DT = TO_DATE('9999-12-31', 'YYYY-MM-DD')
+                  AND WK.WK_GUBUN = 'G'
+                  AND SF_GET_MODONGB_STATUS('CD', WK.WK_GUBUN, NULL, MD.OUT_DT, NULL, 'N', '') = '010002'
+                  AND WK.WK_DT BETWEEN TO_CHAR(:dt_from - :preg_period, 'YYYYMMDD')
+                                   AND TO_CHAR(:dt_to - :preg_period, 'YYYYMMDD')
+            )
+            WHERE PASS_DT BETWEEN :dt_from AND :dt_to
+            """
+        elif schedule_type == 'weaning':
+            # 이유예정: 포유돈/대리모 중 분만일 + 평균포유기간 (파라미터: wean_period)
+            # 금주 범위(dt_from ~ dt_to)에 해당하는 이유예정만 조회
+            # DAERI_YN은 TB_MODON_WK(VM_LAST_MODON_SEQ_WK)에 있음
+            sql = """
+            SELECT PASS_DT
+            FROM (
+                SELECT TO_DATE(WK.WK_DT, 'YYYYMMDD') + :wean_period AS PASS_DT
+                FROM TB_MODON MD
+                INNER JOIN VM_LAST_MODON_SEQ_WK WK
+                    ON MD.FARM_NO = WK.FARM_NO AND MD.PIG_NO = WK.PIG_NO
+                WHERE MD.FARM_NO = :farm_no
+                  AND MD.USE_YN = 'Y'
+                  AND MD.OUT_DT = TO_DATE('9999-12-31', 'YYYY-MM-DD')
+                  AND WK.WK_GUBUN = 'B'
+                  AND SF_GET_MODONGB_STATUS('CD', WK.WK_GUBUN, NULL, MD.OUT_DT, NULL, WK.DAERI_YN, '') IN ('010003', '010004')
+                  AND WK.WK_DT BETWEEN TO_CHAR(:dt_from - :wean_period, 'YYYYMMDD')
+                                   AND TO_CHAR(:dt_to - :wean_period, 'YYYYMMDD')
+            )
+            WHERE PASS_DT BETWEEN :dt_from AND :dt_to
+            """
+        else:
+            return
+
+        cursor = self.conn.cursor()
+        try:
+            params = {
+                'farm_no': self.farm_no,
+                'dt_from': dt_from,
+                'dt_to': dt_to,
+            }
+
+            # schedule_type별 farm_config 파라미터 추가
+            if schedule_type == 'mating':
+                params['avg_return_day'] = farm_config['avg_return_day']
+                params['first_mating_age'] = farm_config['first_mating_age']
+            elif schedule_type == 'farrowing':
+                params['preg_period'] = farm_config['preg_period']
+            elif schedule_type == 'weaning':
+                params['wean_period'] = farm_config['wean_period']
+
+            cursor.execute(sql, params)
+
+            for row in cursor.fetchall():
+                pass_dt = row[0]
+                if pass_dt:
+                    if add_early_to_first and pass_dt < dt_from:
+                        count_dict['sum'] += 1
+                        count_dict['daily'][0] += 1
+                    else:
+                        for i, dt in enumerate(dates):
+                            if pass_dt.date() == dt.date():
+                                count_dict['sum'] += 1
+                                count_dict['daily'][i] += 1
+                                break
+        finally:
+            cursor.close()
+
+    def _get_imsin_check_counts(self, v_sdt: str, v_edt: str, dt_from: datetime,
+                                  dates: List[datetime], ins_conf: Dict[str, Dict[str, Any]]) -> Dict[str, Dict]:
         """재발확인 (3주/4주) 집계
 
-        Oracle SP_INS_WEEK_SCHEDULE_POPUP과 동일한 로직:
-        - VM_LAST_MODON_SEQ_WK 뷰 사용 (마지막 작업이 교배인 모돈)
-        - 3주령: 교배일 + 21일 (정확히 21일째)
-        - 4주령: 교배일 + 28일 (정확히 28일째)
-        - 모돈당 해당 날짜에 1번만 카운트
+        ins_conf['pregnancy'] 설정에 따라 분기:
+        - method='farm': 농장기본값 (교배일 + 21일/28일 고정)
+        - method='modon': 모돈작업설정 (FN_MD_SCHEDULE_BSE_2020 호출)
+
+        Args:
+            v_sdt: 시작일 (yyyy-MM-dd)
+            v_edt: 종료일 (yyyy-MM-dd)
+            dt_from: 시작일 (datetime)
+            dates: 요일별 날짜 리스트
+            ins_conf: TS_INS_CONF 설정
         """
         result = {
             '3w': {'sum': 0, 'daily': [0] * 7},
             '4w': {'sum': 0, 'daily': [0] * 7},
         }
 
-        # Oracle 프로시저와 동일: VM_LAST_MODON_SEQ_WK 뷰 사용
-        sql = """
-        SELECT /*+ INDEX(WK IX_TB_MODON_WK_01) */
-               TO_DATE(WK.WK_DT, 'YYYYMMDD') AS GB_DT,
-               WK.PIG_NO
-        FROM VM_LAST_MODON_SEQ_WK WK
-        INNER JOIN TB_MODON MD
-            ON MD.FARM_NO = WK.FARM_NO AND MD.PIG_NO = WK.PIG_NO
-           AND MD.USE_YN = 'Y'
-           AND MD.OUT_DT = TO_DATE('9999-12-31', 'YYYY-MM-DD')
-        WHERE WK.FARM_NO = :farm_no
-          AND WK.WK_GUBUN = 'G'
-        """
+        pregnancy_conf = ins_conf['pregnancy']
 
-        cursor = self.conn.cursor()
-        try:
-            cursor.execute(sql, {'farm_no': self.farm_no})
+        if pregnancy_conf['method'] == 'modon':
+            # 모돈작업설정: FN_MD_SCHEDULE_BSE_2020 호출 (JOB_GUBUN_CD='150001')
+            seq_filter = pregnancy_conf['seq_filter']
+            if seq_filter == '':
+                # 선택된 작업이 없으면 카운트 0
+                self.logger.info("임신감정 작업 없음 (seq_filter=''), 카운트 생략")
+                return result
 
-            for row in cursor.fetchall():
-                gb_dt = row[0]
-                if not gb_dt:
-                    continue
+            sql = """
+            SELECT TO_DATE(PASS_DT, 'YYYY-MM-DD') AS SCH_DT
+            FROM TABLE(FN_MD_SCHEDULE_BSE_2020(
+                :farm_no, 'JOB-DAJANG', '150001', NULL,
+                :v_sdt, :v_edt, NULL, 'ko', 'yyyy-MM-dd', :seq_filter, NULL
+            ))
+            """
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute(sql, {
+                    'farm_no': self.farm_no,
+                    'v_sdt': v_sdt,
+                    'v_edt': v_edt,
+                    'seq_filter': seq_filter,
+                })
 
-                # 3주령: 교배일 + 21일 (정확히 21일째)
-                check_3w = gb_dt + timedelta(days=21)
-                for i, dt in enumerate(dates):
-                    if check_3w.date() == dt.date():
-                        result['3w']['daily'][i] += 1
-                        break
+                for row in cursor.fetchall():
+                    sch_dt = row[0]
+                    if sch_dt:
+                        for i, dt in enumerate(dates):
+                            if sch_dt.date() == dt.date():
+                                # 모돈작업설정은 3w/4w 구분 없이 합산 (3w에 집계)
+                                result['3w']['sum'] += 1
+                                result['3w']['daily'][i] += 1
+                                break
+            finally:
+                cursor.close()
+        else:
+            # 농장기본값: 교배일 + 21일/28일 고정
+            sql = """
+            SELECT /*+ INDEX(WK IX_TB_MODON_WK_01) */
+                   TO_DATE(WK.WK_DT, 'YYYYMMDD') AS GB_DT,
+                   WK.PIG_NO
+            FROM VM_LAST_MODON_SEQ_WK WK
+            INNER JOIN TB_MODON MD
+                ON MD.FARM_NO = WK.FARM_NO AND MD.PIG_NO = WK.PIG_NO
+               AND MD.USE_YN = 'Y'
+               AND MD.OUT_DT = TO_DATE('9999-12-31', 'YYYY-MM-DD')
+            WHERE WK.FARM_NO = :farm_no
+              AND WK.WK_GUBUN = 'G'
+            """
 
-                # 4주령: 교배일 + 28일 (정확히 28일째)
-                check_4w = gb_dt + timedelta(days=28)
-                for i, dt in enumerate(dates):
-                    if check_4w.date() == dt.date():
-                        result['4w']['daily'][i] += 1
-                        break
-        finally:
-            cursor.close()
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute(sql, {'farm_no': self.farm_no})
 
-        # 합계 계산 (Oracle과 동일: 기간 내 날짜만 합산)
-        for i in range(7):
-            result['3w']['sum'] += result['3w']['daily'][i]
-            result['4w']['sum'] += result['4w']['daily'][i]
+                for row in cursor.fetchall():
+                    gb_dt = row[0]
+                    if not gb_dt:
+                        continue
+
+                    # 3주령: 교배일 + 21일 (정확히 21일째)
+                    check_3w = gb_dt + timedelta(days=21)
+                    for i, dt in enumerate(dates):
+                        if check_3w.date() == dt.date():
+                            result['3w']['daily'][i] += 1
+                            break
+
+                    # 4주령: 교배일 + 28일 (정확히 28일째)
+                    check_4w = gb_dt + timedelta(days=28)
+                    for i, dt in enumerate(dates):
+                        if check_4w.date() == dt.date():
+                            result['4w']['daily'][i] += 1
+                            break
+            finally:
+                cursor.close()
+
+            # 합계 계산 (농장기본값만)
+            for i in range(7):
+                result['3w']['sum'] += result['3w']['daily'][i]
+                result['4w']['sum'] += result['4w']['daily'][i]
 
         return result
 
@@ -394,28 +808,62 @@ class ScheduleProcessor(BaseProcessor):
                 'cnt_7': daily[6],
             })
 
-    def _insert_popup_details(self, v_sdt: str, v_edt: str, dt_from: datetime) -> None:
+    def _insert_popup_details(self, v_sdt: str, v_edt: str, dt_from: datetime,
+                               ins_conf: Dict[str, Dict[str, Any]]) -> None:
         """팝업 상세 INSERT (SUB_GUBUN='GB/BM/EU/VACCINE')
 
         TB_PLAN_MODON 기준으로 작업명별 그룹화
+        ins_conf 설정에 따라 선택된 SEQ만 필터링
         """
         # GB, BM, EU는 공통 메소드 사용
+        # (sub_gubun, job_gubun_cd, ins_conf_key)
         popup_configs = [
-            ('GB', '150005'),
-            ('BM', '150002'),
-            ('EU', '150003'),
+            ('GB', '150005', 'mating'),
+            ('BM', '150002', 'farrowing'),
+            ('EU', '150003', 'weaning'),
         ]
 
-        for sub_gubun, job_gubun_cd in popup_configs:
-            self._insert_popup_by_job(sub_gubun, job_gubun_cd, v_sdt, v_edt, dt_from)
+        for sub_gubun, job_gubun_cd, conf_key in popup_configs:
+            conf = ins_conf[conf_key]
+            # method='farm'이면 팝업 상세 INSERT 생략 (농장기본값은 TB_PLAN_MODON 기반이 아님)
+            if conf['method'] == 'farm':
+                self.logger.info(f"팝업 상세 생략 (농장기본값): {sub_gubun}")
+                continue
+            seq_filter = conf['seq_filter']
+            # seq_filter=''이면 선택된 작업이 없으므로 팝업 상세 생략
+            if seq_filter == '':
+                self.logger.info(f"팝업 상세 생략 (선택 작업 없음): {sub_gubun}")
+                continue
+            self._insert_popup_by_job(sub_gubun, job_gubun_cd, v_sdt, v_edt, dt_from, seq_filter)
 
         # VACCINE은 ARTICLE_NM(백신명) 포함하므로 별도 처리
-        self._insert_vaccine_popup(v_sdt, v_edt, dt_from)
+        vaccine_seq_filter = ins_conf['vaccine']['seq_filter']
+        # seq_filter=''이면 선택된 작업이 없으므로 팝업 상세 생략
+        if vaccine_seq_filter == '':
+            self.logger.info("팝업 상세 생략 (선택 작업 없음): VACCINE")
+        else:
+            self._insert_vaccine_popup(v_sdt, v_edt, dt_from, vaccine_seq_filter)
 
     def _insert_popup_by_job(self, sub_gubun: str, job_gubun_cd: str,
-                              v_sdt: str, v_edt: str, dt_from: datetime) -> None:
-        """작업유형별 팝업 상세 INSERT"""
-        sql = """
+                              v_sdt: str, v_edt: str, dt_from: datetime,
+                              seq_filter: str = '-1') -> None:
+        """작업유형별 팝업 상세 INSERT (모돈 작업설정 기준)
+
+        Args:
+            sub_gubun: SUB_GUBUN 값 ('GB', 'BM', 'EU')
+            job_gubun_cd: 작업구분코드 ('150005', '150002', '150003')
+            v_sdt: 시작일 (yyyy-MM-dd)
+            v_edt: 종료일 (yyyy-MM-dd)
+            dt_from: 시작일 (datetime)
+            seq_filter: TB_PLAN_MODON.SEQ 필터 ('-1'=전체, '1,2,3'=선택)
+        """
+        # seq_filter가 특정 SEQ인 경우 해당 SEQ만 조회
+        seq_condition = ""
+        if seq_filter != '-1':
+            seq_list = seq_filter.split(',')
+            seq_condition = f"AND P.SEQ IN ({','.join(seq_list)})"
+
+        sql = f"""
         INSERT INTO TS_INS_WEEK_SUB (
             MASTER_SEQ, FARM_NO, GUBUN, SUB_GUBUN, SORT_NO,
             STR_1, STR_2, STR_3, STR_4, CNT_1,
@@ -441,13 +889,14 @@ class ScheduleProcessor(BaseProcessor):
                        SUM(CASE WHEN TRUNC(TO_DATE(PASS_DT, 'YYYY-MM-DD')) = :dt_from + 6 THEN 1 ELSE 0 END) AS D7
                 FROM TABLE(FN_MD_SCHEDULE_BSE_2020(
                     :farm_no, 'JOB-DAJANG', :job_gubun_cd, NULL,
-                    :v_sdt, :v_edt, NULL, 'ko', 'yyyy-MM-dd', '-1', NULL
+                    :v_sdt, :v_edt, NULL, 'ko', 'yyyy-MM-dd', :seq_filter, NULL
                 ))
                 GROUP BY WK_NM
             ) S ON P.WK_NM = S.WK_NM
             WHERE P.FARM_NO = :farm_no
               AND P.JOB_GUBUN_CD = :job_gubun_cd
               AND P.USE_YN = 'Y'
+              {seq_condition}
             ORDER BY P.WK_NM
         )
         """
@@ -459,14 +908,28 @@ class ScheduleProcessor(BaseProcessor):
             'v_sdt': v_sdt,
             'v_edt': v_edt,
             'dt_from': dt_from,
+            'seq_filter': seq_filter,
         })
 
-    def _insert_vaccine_popup(self, v_sdt: str, v_edt: str, dt_from: datetime) -> None:
+    def _insert_vaccine_popup(self, v_sdt: str, v_edt: str, dt_from: datetime,
+                               seq_filter: str = '-1') -> None:
         """백신예정 팝업 상세 INSERT (SUB_GUBUN='VACCINE')
 
         ARTICLE_NM(백신명) 포함하여 INSERT
+
+        Args:
+            v_sdt: 시작일 (yyyy-MM-dd)
+            v_edt: 종료일 (yyyy-MM-dd)
+            dt_from: 시작일 (datetime)
+            seq_filter: TB_PLAN_MODON.SEQ 필터 ('-1'=전체, '1,2,3'=선택)
         """
-        sql = """
+        # seq_filter가 특정 SEQ인 경우 해당 SEQ만 조회
+        seq_condition = ""
+        if seq_filter != '-1':
+            seq_list = seq_filter.split(',')
+            seq_condition = f"AND P.SEQ IN ({','.join(seq_list)})"
+
+        sql = f"""
         INSERT INTO TS_INS_WEEK_SUB (
             MASTER_SEQ, FARM_NO, GUBUN, SUB_GUBUN, SORT_NO,
             STR_1, STR_2, STR_3, STR_4, STR_5, CNT_1,
@@ -492,13 +955,14 @@ class ScheduleProcessor(BaseProcessor):
                        SUM(CASE WHEN TRUNC(TO_DATE(PASS_DT, 'YYYY-MM-DD')) = :dt_from + 6 THEN 1 ELSE 0 END) AS D7
                 FROM TABLE(FN_MD_SCHEDULE_BSE_2020(
                     :farm_no, 'JOB-DAJANG', '150004', NULL,
-                    :v_sdt, :v_edt, NULL, 'ko', 'yyyy-MM-dd', '-1', NULL
+                    :v_sdt, :v_edt, NULL, 'ko', 'yyyy-MM-dd', :seq_filter, NULL
                 ))
                 GROUP BY WK_NM, ARTICLE_NM
             ) S ON P.WK_NM = S.WK_NM
             WHERE P.FARM_NO = :farm_no
               AND P.JOB_GUBUN_CD = '150004'
               AND P.USE_YN = 'Y'
+              {seq_condition}
             ORDER BY P.WK_NM
         )
         """
@@ -508,14 +972,21 @@ class ScheduleProcessor(BaseProcessor):
             'v_sdt': v_sdt,
             'v_edt': v_edt,
             'dt_from': dt_from,
+            'seq_filter': seq_filter,
         })
 
-    def _insert_help_info(self, config: Dict[str, Any], dt_from: datetime) -> None:
+    def _insert_help_info(self, config: Dict[str, Any], dt_from: datetime,
+                          ins_conf: Dict[str, Dict[str, Any]]) -> None:
         """HELP 정보 INSERT (SUB_GUBUN='HELP')
 
-        출하예정 계산 안내:
+        출하예정 계산 안내 + 산정방식 정보 포함:
         - 출하예정두수 = N일전 이유두수 × 육성율
         - N = 기준출하일령 - 평균포유기간 (예: 180 - 25 = 155일)
+
+        Args:
+            config: 농장 설정값
+            dt_from: 시작일 (datetime)
+            ins_conf: TS_INS_CONF 설정 (산정방식 표시용)
         """
         ship_offset = config['ship_day'] - config['wean_period']
 
@@ -524,27 +995,67 @@ class ScheduleProcessor(BaseProcessor):
         wean_to = dt_from + timedelta(days=6) - timedelta(days=ship_offset)
         wean_period_str = f"{wean_from.strftime('%Y-%m-%d')} ~ {wean_to.strftime('%Y-%m-%d')}"
 
-        sql = """
+        # 산정방식 텍스트 생성
+        def get_method_text(conf_key: str, job_name: str) -> str:
+            method = ins_conf[conf_key]['method']
+            if method == 'farm':
+                return f'{job_name}: 농장기본값'
+            else:
+                seq_filter = ins_conf[conf_key]['seq_filter']
+                if seq_filter == '':
+                    return f'{job_name}: 모돈작업(없음)'
+                else:
+                    task_count = len(seq_filter.split(','))
+                    return f'{job_name}: 모돈작업({task_count}개)'
+
+        method_info = (
+            f"* 산정방식: {get_method_text('mating', '교배')}, "
+            f"{get_method_text('farrowing', '분만')}, "
+            f"{get_method_text('pregnancy', '임신감정')}, "
+            f"{get_method_text('weaning', '이유')}, "
+            f"{get_method_text('vaccine', '백신')}"
+        )
+
+        # seq_filter 조건 생성 (선택된 SEQ만 조회)
+        def get_seq_condition(conf_key: str, job_gubun_cd: str) -> str:
+            if ins_conf[conf_key]['method'] == 'farm':
+                return "'농장기본값'"
+            seq_filter = ins_conf[conf_key]['seq_filter']
+            if seq_filter == '':
+                return "'(선택된 작업 없음)'"
+            else:
+                return f"""(SELECT LISTAGG(WK_NM || '(' || PASS_DAY || '일)', ',') WITHIN GROUP (ORDER BY WK_NM)
+                           FROM TB_PLAN_MODON WHERE FARM_NO = :farm_no AND JOB_GUBUN_CD = '{job_gubun_cd}' AND USE_YN = 'Y'
+                           AND SEQ IN ({seq_filter}))"""
+
+        sql = f"""
         INSERT INTO TS_INS_WEEK_SUB (
             MASTER_SEQ, FARM_NO, GUBUN, SUB_GUBUN, SORT_NO,
             STR_1, STR_2, STR_3, STR_4, STR_5, STR_6
         )
         SELECT :master_seq, :farm_no, 'SCHEDULE', 'HELP', 1,
-               (SELECT LISTAGG(WK_NM || '(' || PASS_DAY || '일)', ',') WITHIN GROUP (ORDER BY WK_NM)
-                FROM TB_PLAN_MODON WHERE FARM_NO = :farm_no AND JOB_GUBUN_CD = '150005' AND USE_YN = 'Y'),
-               (SELECT LISTAGG(WK_NM || '(' || PASS_DAY || '일)', ',') WITHIN GROUP (ORDER BY WK_NM)
-                FROM TB_PLAN_MODON WHERE FARM_NO = :farm_no AND JOB_GUBUN_CD = '150002' AND USE_YN = 'Y'),
-               (SELECT LISTAGG(WK_NM || '(' || PASS_DAY || '일)', ',') WITHIN GROUP (ORDER BY WK_NM)
-                FROM TB_PLAN_MODON WHERE FARM_NO = :farm_no AND JOB_GUBUN_CD = '150003' AND USE_YN = 'Y'),
-               (SELECT LISTAGG(WK_NM || '(' || PASS_DAY || '일)', ',') WITHIN GROUP (ORDER BY WK_NM)
-                FROM TB_PLAN_MODON WHERE FARM_NO = :farm_no AND JOB_GUBUN_CD = '150004' AND USE_YN = 'Y'),
+               {get_seq_condition('mating', '150005')},
+               {get_seq_condition('farrowing', '150002')},
+               {get_seq_condition('weaning', '150003')},
+               {get_seq_condition('vaccine', '150004')},
                '* 육성율: ' || :rearing_rate || '% (' || :rate_from || '~' || :rate_to || ' 평균, 기본 90%)' || CHR(10) ||
                '* 공식: ' || :ship_offset || '일전 이유두수 × 육성율' || CHR(10) ||
                '  - 기준출하일령(' || :ship_day || '일) - 평균포유기간(' || :wean_period || '일) = ' || :ship_offset || '일' || CHR(10) ||
-               '* 이유기간: ' || :wean_period_str,
-               '(고정)교배후 3주(21일~27일), 4주(28일~35일) 대상모돈'
+               '* 이유기간: ' || :wean_period_str || CHR(10) ||
+               :method_info,
+               :pregnancy_help
         FROM DUAL
         """
+        # 임신감정 도움말 생성
+        if ins_conf['pregnancy']['method'] == 'farm':
+            pregnancy_help = '(농장기본값) 교배후 3주(21일), 4주(28일) 대상모돈'
+        else:
+            seq_filter = ins_conf['pregnancy']['seq_filter']
+            if seq_filter == '':
+                pregnancy_help = '(모돈작업설정) 선택된 작업 없음'
+            else:
+                pregnancy_help = '(모돈작업설정) TB_PLAN_MODON 기준'
+
         self.execute(sql, {
             'master_seq': self.master_seq,
             'farm_no': self.farm_no,
@@ -555,6 +1066,8 @@ class ScheduleProcessor(BaseProcessor):
             'rate_from': config['rate_from'],
             'rate_to': config['rate_to'],
             'wean_period_str': wean_period_str,
+            'method_info': method_info,
+            'pregnancy_help': pregnancy_help,
         })
 
     def _update_week(self, stats: Dict[str, int]) -> None:
