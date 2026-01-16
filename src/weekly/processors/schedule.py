@@ -1017,6 +1017,10 @@ class ScheduleProcessor(BaseProcessor):
             dt_from: 시작일 (datetime)
             ins_conf: TS_INS_CONF 설정 (산정방식 표시용)
         """
+        # 농장기본값 표시용 추가 설정 조회 (avg_return_day, first_mating_age)
+        farm_config = self._get_farm_config_for_schedule()
+        config = {**config, **farm_config}  # 기존 config에 farm_config 병합
+
         ship_offset = config['ship_day'] - config['wean_period']
 
         # 이유 기간 계산 (금주 출하예정 대상이 되는 이유일 범위)
@@ -1046,9 +1050,30 @@ class ScheduleProcessor(BaseProcessor):
         )
 
         # seq_filter 조건 생성 (선택된 SEQ만 조회)
+        # 농장기본값일 때 실제 설정값 포함하여 저장 (스냅샷)
+        # 형식: settings 페이지(WeeklyScheduleSettings.tsx)와 동일하게
         def get_seq_condition(conf_key: str, job_gubun_cd: str) -> str:
             if ins_conf[conf_key]['method'] == 'farm':
-                return "'농장기본값'"
+                # 농장기본값: 작업별 실제 설정값 포함 (settings 페이지 형식)
+                # 각 항목 별도 줄로 표시 (· 기호 사용)
+                if conf_key == 'mating':
+                    # 교배: 이유돈, 후보돈, 사고/재발돈 각각 한 줄씩
+                    return f"""'(농장기본값)' || CHR(10) ||
+                           '· 이유돈(평균재귀일) {config['avg_return_day']}일' || CHR(10) ||
+                           '· 후보돈(초교배일령) {config['first_mating_age']}일' || CHR(10) ||
+                           '· 사고/재발돈 즉시'"""
+                elif conf_key == 'farrowing':
+                    # 분만: 임신모돈(평균임신기간) 115일
+                    return f"""'(농장기본값)' || CHR(10) ||
+                           '· 임신모돈(평균임신기간) {config['preg_period']}일'"""
+                elif conf_key == 'weaning':
+                    # 이유: 포유모돈(평균포유기간) 21일
+                    return f"""'(농장기본값)' || CHR(10) ||
+                           '· 포유모돈(평균포유기간) {config['wean_period']}일'"""
+                elif conf_key == 'vaccine':
+                    return "'(농장기본값) 백신설정 기준'"
+                else:
+                    return "'농장기본값'"
             seq_filter = ins_conf[conf_key]['seq_filter']
             if seq_filter == '':
                 return "'(선택된 작업 없음)'"
@@ -1057,10 +1082,37 @@ class ScheduleProcessor(BaseProcessor):
                            FROM TB_PLAN_MODON WHERE FARM_NO = :farm_no AND JOB_GUBUN_CD = '{job_gubun_cd}' AND USE_YN = 'Y'
                            AND SEQ IN ({seq_filter}))"""
 
+        # 임신감정(pregnancy) 조건 생성 - JOB_GUBUN_CD='150001' 사용
+        # 재발확인(STR_6)과 임신진단(STR_7)을 분리하여 저장
+        def get_pregnancy_3w_condition() -> str:
+            """재발확인(3주) 조건"""
+            if ins_conf['pregnancy']['method'] == 'farm':
+                return "'(농장기본값) 교배 후 3주'"
+            seq_filter = ins_conf['pregnancy']['seq_filter']
+            if seq_filter == '':
+                return "'(모돈작업설정) 선택된 작업 없음'"
+            else:
+                return f"""(SELECT LISTAGG(WK_NM || '(' || PASS_DAY || '일)', ',') WITHIN GROUP (ORDER BY WK_NM)
+                           FROM TB_PLAN_MODON WHERE FARM_NO = :farm_no AND JOB_GUBUN_CD = '150001' AND USE_YN = 'Y'
+                           AND SEQ IN ({seq_filter}))"""
+
+        def get_pregnancy_4w_condition() -> str:
+            """임신진단(4주) 조건"""
+            if ins_conf['pregnancy']['method'] == 'farm':
+                return "'(농장기본값) 교배 후 4주'"
+            seq_filter = ins_conf['pregnancy']['seq_filter']
+            if seq_filter == '':
+                return "'(모돈작업설정) 선택된 작업 없음'"
+            else:
+                # 모돈작업설정일 때는 재발확인과 동일 (TB_PLAN_MODON에서 선택된 작업)
+                return f"""(SELECT LISTAGG(WK_NM || '(' || PASS_DAY || '일)', ',') WITHIN GROUP (ORDER BY WK_NM)
+                           FROM TB_PLAN_MODON WHERE FARM_NO = :farm_no AND JOB_GUBUN_CD = '150001' AND USE_YN = 'Y'
+                           AND SEQ IN ({seq_filter}))"""
+
         sql = f"""
         INSERT INTO TS_INS_WEEK_SUB (
             MASTER_SEQ, FARM_NO, GUBUN, SUB_GUBUN, SORT_NO,
-            STR_1, STR_2, STR_3, STR_4, STR_5, STR_6
+            STR_1, STR_2, STR_3, STR_4, STR_5, STR_6, STR_7
         )
         SELECT :master_seq, :farm_no, 'SCHEDULE', 'HELP', 1,
                {get_seq_condition('mating', '150005')},
@@ -1072,18 +1124,10 @@ class ScheduleProcessor(BaseProcessor):
                '  - 기준출하일령(' || :ship_day || '일) - 평균포유기간(' || :wean_period || '일) = ' || :ship_offset || '일' || CHR(10) ||
                '* 이유기간: ' || :wean_period_str || CHR(10) ||
                :method_info,
-               :pregnancy_help
+               {get_pregnancy_3w_condition()},
+               {get_pregnancy_4w_condition()}
         FROM DUAL
         """
-        # 임신감정 도움말 생성
-        if ins_conf['pregnancy']['method'] == 'farm':
-            pregnancy_help = '(농장기본값) 교배후 3주(21일), 4주(28일) 대상모돈'
-        else:
-            seq_filter = ins_conf['pregnancy']['seq_filter']
-            if seq_filter == '':
-                pregnancy_help = '(모돈작업설정) 선택된 작업 없음'
-            else:
-                pregnancy_help = '(모돈작업설정) TB_PLAN_MODON 기준'
 
         self.execute(sql, {
             'master_seq': self.master_seq,
@@ -1096,7 +1140,6 @@ class ScheduleProcessor(BaseProcessor):
             'rate_to': config['rate_to'],
             'wean_period_str': wean_period_str,
             'method_info': method_info,
-            'pregnancy_help': pregnancy_help,
         })
 
     def _update_week(self, stats: Dict[str, int]) -> None:
