@@ -289,16 +289,16 @@ class ScheduleProcessor(BaseProcessor):
 
         Returns:
             {
-                'avg_return_day': 평균재귀일 (901003, 기본 7일),
-                'first_mating_age': 초교배일령 (901007, 기본 240일),
-                'preg_period': 평균임신기간 (901001, 기본 115일),
-                'wean_period': 평균포유기간 (901002, 기본 21일)
+                'avg_return_day': 평균재귀일 (140008, 기본 7일),
+                'first_mating_age': 초교배일령 (140007, 기본 240일),
+                'preg_period': 평균임신기간 (140002, 기본 115일),
+                'wean_period': 평균포유기간 (140003, 기본 21일)
             }
         """
         sql = """
-        SELECT CODE, TO_NUMBER(NVL(CVALUE, DECODE(CODE, '901001', '115', '901002', '21', '901003', '7', '901007', '240')))
+        SELECT CODE, TO_NUMBER(NVL(CVALUE, DECODE(CODE, '140002', '115', '140003', '21', '140008', '7', '140007', '240')))
         FROM TC_FARM_CONFIG
-        WHERE FARM_NO = :farm_no AND CODE IN ('901001', '901002', '901003', '901007')
+        WHERE FARM_NO = :farm_no AND CODE IN ('140002', '140003', '140007', '140008')
         """
         cursor = self.conn.cursor()
         try:
@@ -307,18 +307,18 @@ class ScheduleProcessor(BaseProcessor):
 
             # 기본값 설정
             config = {
-                'avg_return_day': 7,       # 901003
-                'first_mating_age': 240,   # 901007
-                'preg_period': 115,        # 901001
-                'wean_period': 21,         # 901002
+                'avg_return_day': 7,       # 140008
+                'first_mating_age': 240,   # 140007
+                'preg_period': 115,        # 140002
+                'wean_period': 21,         # 140003
             }
 
             # 조회 결과로 업데이트
             code_map = {
-                '901001': 'preg_period',
-                '901002': 'wean_period',
-                '901003': 'avg_return_day',
-                '901007': 'first_mating_age',
+                '140002': 'preg_period',
+                '140003': 'wean_period',
+                '140007': 'first_mating_age',
+                '140008': 'avg_return_day',
             }
             for code, value in rows:
                 if code in code_map:
