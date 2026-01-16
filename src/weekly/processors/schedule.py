@@ -80,7 +80,7 @@ class ScheduleProcessor(BaseProcessor):
         stats = self._insert_summary(schedule_counts, imsin_counts, ship_sum, dt_from_obj)
 
         # 9. 캘린더 그리드 INSERT (SUB_GUBUN='CAL')
-        self._insert_calendar(schedule_counts, imsin_counts, dates)
+        self._insert_calendar(schedule_counts, imsin_counts, dates, ins_conf)
 
         # 10. 팝업 상세 INSERT (SUB_GUBUN='GB/BM/EU/VACCINE')
         self._insert_popup_details(v_sdt, v_edt, dt_from_obj, ins_conf)
@@ -88,7 +88,10 @@ class ScheduleProcessor(BaseProcessor):
         # 11. HELP 정보 INSERT (SUB_GUBUN='HELP')
         self._insert_help_info(config, dt_from_obj, ins_conf)
 
-        # 12. TS_INS_WEEK 업데이트
+        # 12. 산정방식 정보 INSERT (SUB_GUBUN='METHOD')
+        self._insert_method_info(ins_conf)
+
+        # 13. TS_INS_WEEK 업데이트
         self._update_week(stats)
 
         self.logger.info(f"금주 예정 팝업 완료: 농장={self.farm_no}")
@@ -763,16 +766,31 @@ class ScheduleProcessor(BaseProcessor):
         return stats
 
     def _insert_calendar(self, schedule_counts: Dict, imsin_counts: Dict,
-                         dates: List[datetime]) -> None:
-        """캘린더 그리드 INSERT (SUB_GUBUN='CAL')"""
+                         dates: List[datetime], ins_conf: Dict[str, Dict[str, Any]]) -> None:
+        """캘린더 그리드 INSERT (SUB_GUBUN='CAL')
+
+        임신감정 산정방식에 따라 캘린더 데이터 구성:
+        - 농장기본값: IMSIN_3W, IMSIN_4W 별도 표시
+        - 모돈작업설정: IMSIN (3w+4w 합산, 실제로는 3w에만 데이터)
+        """
         cal_data = [
             (1, 'GB', schedule_counts['gb']['daily']),
             (2, 'BM', schedule_counts['bm']['daily']),
-            (3, 'IMSIN_3W', imsin_counts['3w']['daily']),
-            (4, 'IMSIN_4W', imsin_counts['4w']['daily']),
-            (5, 'EU', schedule_counts['eu']['daily']),
-            (6, 'VACCINE', schedule_counts['vaccine']['daily']),
         ]
+
+        # 임신감정: 산정방식에 따라 다르게 처리
+        if ins_conf['pregnancy']['method'] == 'modon':
+            # 모돈작업설정: IMSIN 하나로 표시 (3w에 집계된 데이터 사용)
+            cal_data.append((3, 'IMSIN', imsin_counts['3w']['daily']))
+        else:
+            # 농장기본값: IMSIN_3W, IMSIN_4W 별도 표시
+            cal_data.append((3, 'IMSIN_3W', imsin_counts['3w']['daily']))
+            cal_data.append((4, 'IMSIN_4W', imsin_counts['4w']['daily']))
+
+        # EU, VACCINE 추가 (SORT_NO는 임신감정 방식에 따라 조정)
+        next_sort = 4 if ins_conf['pregnancy']['method'] == 'modon' else 5
+        cal_data.append((next_sort, 'EU', schedule_counts['eu']['daily']))
+        cal_data.append((next_sort + 1, 'VACCINE', schedule_counts['vaccine']['daily']))
 
         sql = """
         INSERT INTO TS_INS_WEEK_SUB (
@@ -835,6 +853,17 @@ class ScheduleProcessor(BaseProcessor):
                 self.logger.info(f"팝업 상세 생략 (선택 작업 없음): {sub_gubun}")
                 continue
             self._insert_popup_by_job(sub_gubun, job_gubun_cd, v_sdt, v_edt, dt_from, seq_filter)
+
+        # 임신감정(IMSIN)은 모돈작업설정일 때만 팝업 상세 INSERT
+        pregnancy_conf = ins_conf['pregnancy']
+        if pregnancy_conf['method'] == 'modon':
+            pregnancy_seq_filter = pregnancy_conf['seq_filter']
+            if pregnancy_seq_filter == '':
+                self.logger.info("팝업 상세 생략 (선택 작업 없음): IMSIN")
+            else:
+                self._insert_popup_by_job('IMSIN', '150001', v_sdt, v_edt, dt_from, pregnancy_seq_filter)
+        else:
+            self.logger.info("팝업 상세 생략 (농장기본값): IMSIN")
 
         # VACCINE은 ARTICLE_NM(백신명) 포함하므로 별도 처리
         vaccine_seq_filter = ins_conf['vaccine']['seq_filter']
@@ -1091,4 +1120,39 @@ class ScheduleProcessor(BaseProcessor):
             'eu_sum': stats.get('eu_sum', 0),
             'vaccine_sum': stats.get('vaccine_sum', 0),
             'ship_sum': stats.get('ship_sum', 0),
+        })
+
+    def _insert_method_info(self, ins_conf: Dict[str, Dict[str, Any]]) -> None:
+        """산정방식 정보 INSERT (SUB_GUBUN='METHOD')
+
+        각 예정별 산정방식(농장기본값/모돈작업설정)을 저장하여
+        웹에서 분기 처리에 활용할 수 있도록 함.
+
+        저장 컬럼:
+        - STR_1: 교배예정 산정방식 (farm/modon)
+        - STR_2: 분만예정 산정방식 (farm/modon)
+        - STR_3: 임신감정 산정방식 (farm/modon)
+        - STR_4: 이유예정 산정방식 (farm/modon)
+        - STR_5: 백신예정 산정방식 (farm/modon)
+
+        Args:
+            ins_conf: TS_INS_CONF 설정 (method, tasks, seq_filter)
+        """
+        sql = """
+        INSERT INTO TS_INS_WEEK_SUB (
+            MASTER_SEQ, FARM_NO, GUBUN, SUB_GUBUN, SORT_NO,
+            STR_1, STR_2, STR_3, STR_4, STR_5
+        ) VALUES (
+            :master_seq, :farm_no, 'SCHEDULE', 'METHOD', 1,
+            :mating_method, :farrowing_method, :pregnancy_method, :weaning_method, :vaccine_method
+        )
+        """
+        self.execute(sql, {
+            'master_seq': self.master_seq,
+            'farm_no': self.farm_no,
+            'mating_method': ins_conf['mating']['method'],
+            'farrowing_method': ins_conf['farrowing']['method'],
+            'pregnancy_method': ins_conf['pregnancy']['method'],
+            'weaning_method': ins_conf['weaning']['method'],
+            'vaccine_method': ins_conf['vaccine']['method'],
         })
